@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能选品决策引擎</title>
+    <!-- 引入外部字体，增强现代感 -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        :root {
+            --primary: #2563eb;         /* 现代感更强的深蓝 */
+            --primary-hover: #1d4ed8;
+            --primary-light: #eff6ff;
+            --bg-dark: #0f172a;         /* 极夜黑，用于侧边栏 */
+            --bg-darker: #020617;
+            --bg-body: #f8fafc;         /* 极浅冷灰，作为主背景 */
+            --surface: #ffffff;
+            --text-main: #0f172a;
+            --text-muted: #64748b;
+            --text-light: #94a3b8;
+            --border: #e2e8f0;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --success: #10b981;
+            --radius-md: 12px;
+            --radius-lg: 16px;
+            --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+            --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -2px rgb(0 0 0 / 0.05);
+            --shadow-xl: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+            --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+        body { background: var(--bg-body); color: var(--text-main); min-height: 100vh; -webkit-font-smoothing: antialiased; }
+        .app-container { display: flex; min-height: 100vh; }
+
+        .sidebar { width: 280px; background: var(--bg-dark); color: #fff; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid rgba(255,255,255,0.05); }
+        .logo { padding: 24px; font-size: 20px; font-weight: 700; letter-spacing: -0.5px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 12px; }
+        .logo-icon { width: 36px; height: 36px; background: linear-gradient(135deg, var(--primary), #3b82f6); border-radius: 8px; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3); }
+        .nav-menu { padding: 16px 0; flex: 1; overflow-y: auto; }
+        .nav-item-title { padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; color: var(--text-light); transition: var(--transition); cursor: pointer; user-select: none; }
+        .nav-item-title:hover { color: #fff; background: rgba(255,255,255,0.02); }
+        .nav-item-title.level-1 { font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+        .nav-item-title.level-2 { padding-left: 52px; font-size: 14px; font-weight: 500; border-left: 3px solid transparent; }
+        .nav-item-title.active { color: #fff; background: rgba(37, 99, 235, 0.15); border-left-color: var(--primary); }
+        .nav-arrow { transition: transform 0.3s; font-size: 12px; opacity: 0.7; }
+        .nav-arrow.expanded { transform: rotate(90deg); }
+        .submenu { background: var(--bg-darker); max-height: 0; overflow: hidden; transition: max-height 0.4s ease-in-out; }
+        .submenu.open { max-height: 1000px; }
+
+        .add-strategy-btn { margin: 24px; padding: 14px; background: linear-gradient(135deg, var(--primary), #3b82f6); border: none; color: #fff; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; transition: var(--transition); box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2); }
+        .add-strategy-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(37, 99, 235, 0.3); }
+        .add-strategy-btn:active { transform: translateY(1px); }
+        
+        .btn { padding: 8px 20px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; font-size: 14px; font-weight: 500; transition: var(--transition); display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .btn-primary { background: var(--primary); color: #fff; box-shadow: var(--shadow-sm); }
+        .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+        .btn-default { background: var(--surface); border-color: var(--border); color: var(--text-main); }
+        .btn-default:hover:not(:disabled) { border-color: var(--text-muted); color: #000; }
+        .btn-danger { background: #fee2e2; color: var(--danger); border-color: transparent; }
+        .btn-danger:hover:not(:disabled) { background: var(--danger); color: #fff; }
+        .btn-sm { padding: 6px 14px; font-size: 13px; border-radius: 6px; }
+
+        .main-content { flex: 1; padding: 32px 40px; overflow-y: auto; }
+        .page-header { margin-bottom: 32px; display: flex; justify-content: space-between; align-items: flex-end; }
+        .page-title { font-size: 28px; font-weight: 700; color: var(--text-main); letter-spacing: -0.5px; margin-bottom: 6px; }
+        .page-desc { color: var(--text-muted); font-size: 15px; }
+        .card { background: var(--surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-md); border: 1px solid rgba(226, 232, 240, 0.8); padding: 24px; margin-bottom: 24px; }
+
+        .ranking-list { display: flex; flex-direction: column; gap: 16px; }
+        .ranking-item { display: flex; align-items: center; padding: 20px; border-radius: var(--radius-md); border: 1px solid var(--border); transition: var(--transition); background: #fff; }
+        .ranking-item:hover { border-color: #cbd5e1; box-shadow: var(--shadow-md); transform: translateY(-2px); }
+        
+        /* 排名数字徽章 */
+        .rank-number { width: 48px; height: 48px; border-radius: 12px; background: #f1f5f9; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; margin-right: 24px; color: var(--text-muted); border: 1px solid #e2e8f0; }
+        .rank-number.top-1 { background: linear-gradient(135deg, #fef08a, #fbbf24); color: #854d0e; border: none; box-shadow: 0 4px 10px rgba(251, 191, 36, 0.3); }
+        .rank-number.top-2 { background: linear-gradient(135deg, #e2e8f0, #cbd5e1); color: #334155; border: none; box-shadow: 0 4px 10px rgba(148, 163, 184, 0.2); }
+        .rank-number.top-3 { background: linear-gradient(135deg, #fed7aa, #f4a361); color: #9a3412; border: none; box-shadow: 0 4px 10px rgba(244, 163, 97, 0.2); }
+        
+        .product-info { flex: 1; }
+        .product-title { font-size: 16px; font-weight: 600; color: var(--text-main); margin-bottom: 10px; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+        .product-meta { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--text-muted); align-items: center; }
+        
+        /* 数据项微高亮 */
+        .data-item { display: inline-flex; align-items: center; background: #f8fafc; padding: 4px 10px; border-radius: 6px; border: 1px solid #e2e8f0; }
+        .data-label { color: var(--text-light); margin-right: 6px; font-size: 12px; }
+        .data-value { color: var(--text-main); font-weight: 600; }
+        .data-value.price { color: var(--danger); font-size: 14px; }
+        
+        /* 状态徽章 */
+        .badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; gap: 4px; }
+        .badge::before { content: ''; display: block; width: 6px; height: 6px; border-radius: 50%; }
+        .badge-new { background: #fce7f3; color: #be185d; border: 1px solid #fbcfe8; }
+        .badge-new::before { background: #be185d; }
+        .badge-hot { background: #fff7ed; color: #c2410c; border: 1px solid #ffedd5; }
+        .badge-hot::before { background: #c2410c; }
+        
+        /* 分数展示 */
+        .match-score { text-align: right; margin-left: 20px; min-width: 100px; }
+        .match-score .val { font-size: 24px; font-weight: 700; color: var(--primary); font-variant-numeric: tabular-nums; line-height: 1; }
+        .match-score .lbl { font-size: 12px; color: var(--text-light); font-weight: 500; text-transform: uppercase; margin-top: 4px; display: block; }
+
+        table { width: 100%; border-collapse: separate; border-spacing: 0; }
+        th { text-align: left; padding: 16px; font-weight: 600; color: var(--text-muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 2px solid var(--border); }
+        td { padding: 16px; font-size: 14px; color: var(--text-main); border-bottom: 1px solid var(--border); vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: #f8fafc; }
+        
+        .form-group { margin-bottom: 24px; }
+        .form-label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 600; color: var(--text-main); }
+        .form-input, .form-textarea, .form-select { width: 100%; padding: 12px 16px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; color: var(--text-main); transition: var(--transition); background: #fff; }
+        .form-input:focus, .form-textarea:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px var(--primary-light); }
+        .form-textarea { min-height: 120px; resize: vertical; line-height: 1.5; }
+        
+        .checkbox-group { display: flex; gap: 20px; margin-top: 12px; background: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid #e2e8f0; }
+        .checkbox-label { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; color: var(--text-main); font-weight: 500; user-select: none; }
+        .checkbox-label input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-color: var(--primary); }
+
+        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.6); display: flex; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(4px); animation: fadeIn 0.2s ease-out; }
+        .modal { background: var(--surface); border-radius: var(--radius-lg); width: 680px; max-width: 90%; max-height: 85vh; display: flex; flex-direction: column; box-shadow: var(--shadow-xl); border: 1px solid rgba(255,255,255,0.1); animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1); }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        
+        .modal-header { padding: 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+        .modal-title { font-size: 18px; font-weight: 700; color: var(--text-main); }
+        .modal-close { background: none; border: none; font-size: 24px; color: var(--text-light); cursor: pointer; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; transition: var(--transition); }
+        .modal-close:hover { background: #f1f5f9; color: var(--text-main); }
+        .modal-body { padding: 24px; overflow-y: auto; flex: 1; }
+        .modal-footer { padding: 20px 24px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 12px; background: #f8fafc; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
+        
+        /* 辅助组件 */
+        .pagination { display: flex; justify-content: center; gap: 8px; margin-top: 32px; }
+        .page-btn { padding: 8px 16px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; border-radius: 8px; font-size: 14px; font-weight: 500; transition: var(--transition); color: var(--text-main); }
+        .page-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+        .page-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+        
+        .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 80px 20px; color: var(--text-muted); }
+        .empty-state-icon { font-size: 64px; margin-bottom: 24px; opacity: 0.3; filter: grayscale(1); }
+        .empty-text { font-size: 16px; font-weight: 500; }
+        
+        .file-drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 32px 20px; text-align: center; cursor: pointer; transition: var(--transition); background: #f8fafc; }
+        .file-drop-zone:hover { border-color: var(--primary); background: var(--primary-light); }
+        .file-drop-zone .icon { font-size: 24px; margin-bottom: 8px; display: block; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="app-container">
+            <div class="sidebar">
+                <div class="logo">
+                    <div class="logo-icon">✨</div>
+                    <span>AI 决策引擎</span>
+                </div>
+
+                <div class="nav-menu">
+                    <div class="nav-item">
+                        <div class="nav-item-title level-1" @click="toggleMenu('productSelection')">
+                            <span>📦 策略中心</span>
+                            <span class="nav-arrow" :class="{expanded: menus.productSelection}">▶</span>
+                        </div>
+                        <div class="submenu" :class="{open: menus.productSelection}">
+                            <div v-for="strategy in strategies" :key="strategy.id"
+                                 class="nav-item-title level-2"
+                                 :class="{active: currentView === 'ranking' && currentStrategyId === strategy.id}"
+                                 @click="viewRanking(strategy.id)">
+                                ⚡ {{ strategy.name }}
+                            </div>
+                            <div v-if="strategies.length === 0" style="padding: 12px 52px; color: var(--text-muted); font-size: 13px;">
+                                暂无激活策略
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="add-strategy-btn" @click="openStrategyModal()">
+                    ➕ 部署新策略模型
+                </button>
+            </div>
+
+            <div class="main-content">
+                <div v-if="currentView === 'strategies'">
+                    <div class="page-header">
+                        <div>
+                            <h1 class="page-title">大盘策略看板</h1>
+                            <p class="page-desc">管理系统底层 SQL 编译规则，实时驱动数据引擎进行算力调度。</p>
+                        </div>
+                        <div style="display: flex; gap: 12px;">
+                            <button class="btn btn-default" @click="exportStrategies()">📤 导出大盘数据</button>
+                        </div>
+                    </div>
+                    <div class="card" style="padding: 0; overflow: hidden;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>架构代号</th>
+                                    <th>语义约束/目标</th>
+                                    <th>运行状态</th>
+                                    <th style="text-align: right;">操作指令</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="s in strategies" :key="s.id">
+                                    <td style="font-weight: 600;">{{ s.name }}</td>
+                                    <td style="color: var(--text-muted);">{{ s.description || '——' }}</td>
+                                    <td>
+                                        <span class="badge" :class="s.is_active ? 'badge-new' : ''" 
+                                              :style="{background: s.is_active ? 'var(--primary-light)': '#f1f5f9', color: s.is_active ? 'var(--primary)' : 'var(--text-muted)', border: s.is_active ? '1px solid #bfdbfe' : '1px solid #e2e8f0'}">
+                                            {{ s.is_active ? '🟢 引擎在线' : '⚪ 节点休眠' }}
+                                        </span>
+                                    </td>
+                                    <td style="text-align: right;">
+                                        <button class="btn btn-sm btn-primary" @click="viewRanking(s.id)">启动测算</button>
+                                        <button class="btn btn-sm btn-default" style="margin-left: 8px;" @click="openStrategyModal(s)">编辑</button>
+                                        <button class="btn btn-sm btn-danger" style="margin-left: 8px;" @click="deleteStrategy(s.id)">抹除</button>
+                                    </td>
+                                </tr>
+                                <tr v-if="strategies.length === 0">
+                                    <td colspan="4">
+                                        <div class="empty-state" style="padding: 40px 0;">
+                                            <div class="empty-text">当前空间未部署任何策略模型</div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div v-if="currentView === 'ranking'">
+                    <div class="page-header">
+                        <div>
+                            <h1 class="page-title">{{ currentStrategy?.name || '底层算力结果' }}</h1>
+                            <p class="page-desc">自然语言已编译为 B+ 树索引查询，当前依据生命周期因子加权降序。</p>
+                        </div>
+                        <div style="display: flex; gap: 12px;">
+                            <button class="btn btn-default" @click="currentView = 'strategies'">← 撤回看板</button>
+                            <button class="btn btn-default" @click="exportRankings()">📤 导出排产表</button>
+                            <button class="btn btn-primary" @click="loadRankings(true)" :disabled="loading">
+                                ↻ 强制重排
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card" v-if="rankingData.list && rankingData.list.length > 0">
+                        <div style="margin-bottom: 24px; font-size: 14px; color: var(--text-main); font-weight: 600; display: flex; align-items: center; gap: 8px;">
+                            <span style="color: var(--success);">●</span> 算力输出完毕：成功锁定 {{ rankingData.total }} 个高潜 SKU
+                        </div>
+
+                        <div class="ranking-list">
+                            <div class="ranking-item" v-for="(item, index) in rankingData.list" :key="item.product_id">
+                                <div class="rank-number" :class="{'top-1': index === 0, 'top-2': index === 1, 'top-3': index === 2}">
+                                    {{ item.rank_position }}
+                                </div>
+                                <div class="product-info">
+                                    <div class="product-title">{{ item.product_data?.title || '未命名数据块' }}</div>
+                                    <div class="product-meta">
+                                        <span class="badge" :class="item.lifecycle_stage === 'NEW_ARRIVAL' ? 'badge-new' : 'badge-hot'">
+                                            {{ item.lifecycle_stage === 'NEW_ARRIVAL' ? '新品扶持期' : '成熟利润期' }}
+                                        </span>
+                                        <div class="data-item">
+                                            <span class="data-label">ID</span>
+                                            <span class="data-value">{{ item.product_id }}</span>
+                                        </div>
+                                        <div class="data-item">
+                                            <span class="data-label">类目</span>
+                                            <span class="data-value">{{ item.product_data?.category_l1 || 'Uncategorized' }}</span>
+                                        </div>
+                                        <div class="data-item">
+                                            <span class="data-label">大盘基价</span>
+                                            <span class="data-value price">¥{{ item.product_data?.base_price || '-' }}</span>
+                                        </div>
+                                        <div class="data-item">
+                                            <span class="data-label">实时流转</span>
+                                            <span class="data-value">{{ formatNumber(item.product_data?.sold_count) }} 件</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="match-score">
+                                    <div class="val">{{ item.match_score }}</div>
+                                    <div class="lbl">算法定级分</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="pagination">
+                            <button class="page-btn" :disabled="currentPage <= 1" @click="changePage(currentPage - 1)">上一页</button>
+                            <button class="page-btn" :class="{active: p === currentPage}"
+                                    v-for="p in totalPages" :key="p" @click="changePage(p)">{{ p }}</button>
+                            <button class="page-btn" :disabled="currentPage >= totalPages" @click="changePage(currentPage + 1)">下一页</button>
+                        </div>
+                    </div>
+
+                    <div v-else-if="loading" class="empty-state">
+                        <div class="empty-state-icon">⚡</div>
+                        <div class="empty-text">SQL 引擎高负载解算中...</div>
+                    </div>
+                    <div v-else class="empty-state">
+                        <div class="empty-state-icon">🏜️</div>
+                        <div class="empty-text">未能穿越数值拦截墙</div>
+                        <p style="margin-top: 8px; color: var(--text-light); font-size: 14px;">建议放宽 WHERE 数值边界或调整文本容错度</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="showStrategyModal" class="modal-overlay" @click.self="closeStrategyModal">
+            <div class="modal">
+                <div class="modal-header">
+                    <h3 class="modal-title">{{ editingId ? '编辑策略约束模型' : '构建策略约束模型' }}</h3>
+                    <button class="modal-close" @click="closeStrategyModal">×</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label class="form-label">架构代号 *</label>
+                        <input type="text" class="form-input" v-model="strategyForm.name" placeholder="例如：高毛利蓝海流 / 低价起量矩阵">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">运行注释</label>
+                        <input type="text" class="form-input" v-model="strategyForm.description" placeholder="该算法模型的商业目的">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">强制投影约束 (指定 LIKE 检索层)</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox-label"><input type="checkbox" value="title" v-model="strategyForm.match_fields"> 主标题权重区</label>
+                            <label class="checkbox-label"><input type="checkbox" value="category" v-model="strategyForm.match_fields"> 类目树过滤区</label>
+                            <label class="checkbox-label"><input type="checkbox" value="other" v-model="strategyForm.match_fields"> 扩展信息面 (含评价)</label>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">数据源选择 (留空则两张全取)</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox-label" v-for="ds in dataSourceOptions" :key="ds.table">
+                                <input type="checkbox" :value="ds.table" v-model="strategyForm.data_sources">
+                                {{ ds.label }} <span style="color: var(--text-light); font-size: 12px; margin-left: 4px;">({{ ds.table }})</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">NLP 意图捕获层</label>
+                        <textarea class="form-textarea" v-model="strategyForm.keywords_text"
+                                  placeholder=">> 输入自然语言指令（引擎自动解析为 SQL）&#10;&#10;[软性打分因子]：&#10;防摔, 极简, 商务男士&#10;&#10;[硬性 WHERE 拦截墙]：&#10;销量 大于 1w&#10;价格 小于 199&#10;评分 >= 4.8"></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">语料库导入</label>
+                        <div class="file-drop-zone" @click="$refs.fileInput.click()">
+                            <input type="file" ref="fileInput" @change="handleFileSelect" accept=".docx,.xlsx,.txt" style="display: none;">
+                            <span class="icon">📥</span>
+                            <div v-if="selectedFile" style="color: var(--primary); font-weight: 600;">已锁定资源：{{ selectedFile.name }}</div>
+                            <div v-else style="color: var(--text-muted);">点击装载外部字典 (.docx / .xlsx)</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-default" @click="closeStrategyModal">销毁草稿</button>
+                    <button class="btn btn-primary" @click="saveStrategy" :disabled="saving">
+                        {{ saving ? '引擎编译中...' : '提交至 DB 核心' }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+        const API_BASE_URL = 'http://127.0.0.1:5001'; 
+
+        async function fetchEngine(url, options = {}) {
+            try {
+                const res = await fetch(url, options);
+                const contentType = res.headers.get("content-type");
+                
+                if (contentType && contentType.includes("application/json")) {
+                    return await res.json();
+                } else {
+                    const text = await res.text();
+                    console.error('Core Engine Exception Intercepted:', text.substring(0, 300));
+                    alert(`后端响应结构异常。通常是 SQL 构建出错或引擎内部崩溃，详情请见控制台日志。\nHTTP 状态码: ${res.status}`);
+                    return { code: -1, message: '系统引擎层面抛出崩溃' };
+                }
+            } catch (error) {
+                console.error('Network Bridge Failure:', error);
+                alert('微服务连接失败，请确认底层 API 服务运行于 5001 端口且未被防火墙阻断。');
+                return { code: -1, message: '通信链路阻断' };
+            }
+        }
+
+        createApp({
+            data() {
+                return {
+                    currentView: 'strategies',
+                    menus: { productSelection: true },
+                    strategies: [],
+                    currentStrategyId: null,
+                    currentStrategy: null,
+                    rankingData: { list: [], total: 0 },
+                    currentPage: 1,
+                    loading: false,
+                    saving: false,
+                    showStrategyModal: false,
+                    editingId: null,
+                    dataSourceOptions: [],
+                    strategyForm: { name: '', description: '', keywords_text: '', match_fields: ['title'], data_sources: [] },
+                    selectedFile: null
+                }
+            },
+            computed: {
+                totalPages() { return Math.ceil(this.rankingData.total / 20) || 1; }
+            },
+            mounted() { this.loadStrategies(); this.loadDataSources(); },
+            methods: {
+                async loadStrategies() {
+                    const data = await fetchEngine(`${API_BASE_URL}/api/strategies`);
+                    if (data && data.code === 0) this.strategies = data.data;
+                },
+                async loadDataSources() {
+                    const data = await fetchEngine(`${API_BASE_URL}/api/data-sources`);
+                    if (data && data.code === 0) this.dataSourceOptions = data.data;
+                },
+                toggleMenu(menu) { this.menus[menu] = !this.menus[menu]; },
+                viewRanking(strategyId) {
+                    this.currentStrategyId = strategyId;
+                    this.currentStrategy = this.strategies.find(s => s.id === strategyId);
+                    this.currentView = 'ranking';
+                    this.currentPage = 1;
+                    this.loadRankings(true);
+                },
+                async loadRankings(forceRefresh = false) {
+                    if (!this.currentStrategyId) return;
+                    this.loading = true;
+                    if(forceRefresh) this.rankingData.list = []; 
+                    
+                    const data = await fetchEngine(`${API_BASE_URL}/api/strategies/${this.currentStrategyId}/rankings?page=${this.currentPage}&page_size=20`);
+                    if (data && data.code === 0) {
+                        this.rankingData = data.data;
+                    }
+                    this.loading = false;
+                },
+                changePage(page) {
+                    if (page >= 1 && page <= this.totalPages) {
+                        this.currentPage = page;
+                        this.loadRankings(); 
+                    }
+                },
+                openStrategyModal(strategy = null) {
+                    if (strategy) {
+                        const kws = Array.isArray(strategy.keywords) ? strategy.keywords : [];
+                        this.strategyForm = {
+                            name: strategy.name || '',
+                            description: strategy.description || '',
+                            keywords_text: kws.join('\n'),
+                            match_fields: Array.isArray(strategy.match_fields) ? [...strategy.match_fields] : [],
+                            data_sources: Array.isArray(strategy.data_sources) ? [...strategy.data_sources] : []
+                        };
+                        this.editingId = strategy.id;
+                    } else {
+                        this.strategyForm = { name: '', description: '', keywords_text: '', match_fields: ['title', 'category'], data_sources: [] };
+                        this.editingId = null;
+                    }
+                    this.selectedFile = null;
+                    this.showStrategyModal = true;
+                },
+                closeStrategyModal() {
+                    this.showStrategyModal = false;
+                    this.editingId = null;
+                },
+                handleFileSelect(e) {
+                    this.selectedFile = e.target.files[0];
+                },
+                async saveStrategy() {
+                    if (!this.strategyForm.name) { alert('架构代号为必填项！'); return; }
+                    this.saving = true;
+
+                    const formData = new FormData();
+                    formData.append('name', this.strategyForm.name);
+                    formData.append('description', this.strategyForm.description);
+                    formData.append('keywords_text', this.strategyForm.keywords_text);
+                    formData.append('match_fields', JSON.stringify(this.strategyForm.match_fields));
+                    formData.append('data_sources', JSON.stringify(this.strategyForm.data_sources));
+                    if (this.selectedFile) formData.append('file', this.selectedFile);
+
+                    const url = this.editingId
+                        ? `${API_BASE_URL}/api/strategies/${this.editingId}`
+                        : `${API_BASE_URL}/api/strategies`;
+                    const method = this.editingId ? 'PUT' : 'POST';
+                    const data = await fetchEngine(url, { method, body: formData });
+
+                    if (data && data.code === 0) {
+                        this.closeStrategyModal();
+                        this.loadStrategies();
+                    } else if (data) {
+                        alert('编译阻断：' + data.message);
+                    }
+                    this.saving = false;
+                },
+                async deleteStrategy(id) {
+                    if (!confirm('【危险操作】该动作将物理抹除策略节点且不可逆。确认继续？')) return;
+                    const data = await fetchEngine(`${API_BASE_URL}/api/strategies/${id}`, { method: 'DELETE' });
+                    if (data && data.code === 0) {
+                        if (this.currentStrategyId === id) this.currentView = 'strategies';
+                        this.loadStrategies();
+                    }
+                },
+                formatNumber(num) {
+                    if (num == null) return '-';
+                    return num >= 10000 ? (num / 10000).toFixed(2) + 'w' : num.toLocaleString();
+                },
+                async exportStrategies() {
+                    window.open(`${API_BASE_URL}/api/strategies/export`, '_blank');
+                },
+                async exportRankings() {
+                    if (!this.currentStrategyId) return;
+                    window.open(`${API_BASE_URL}/api/strategies/${this.currentStrategyId}/export`, '_blank');
+                }
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
