@@ -1,567 +1,981 @@
-# -*- coding: utf-8 -*-
-"""
-智能选品系统 - 核心决策引擎
-功能：动态 SQL 编译、多维度加权排序、生命周期引擎
-"""
-import os
-import re
+import base64
+import io
 import json
-import uuid
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-import pymysql
-from docx import Document
-import openpyxl
+import os
+import sys
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
 
-app = Flask(__name__, static_folder='static', static_url_path='')
-CORS(app)
+import pymysql
+from dotenv import load_dotenv
+from flask import Flask, jsonify, redirect, render_template, request, send_file
+from flask_cors import CORS
+from openpyxl import Workbook
+
+
+load_dotenv()
+
+TOOLS_DIR = Path(__file__).resolve().parent / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from analyze_single_product import (  # noqa: E402
+    PRODUCT_SOURCES as AI_PRODUCT_SOURCES,
+    build_input_snapshot,
+    load_product as load_ai_product,
+    run_analysis,
+    run_material_prefilter,
+)
+
 
 DB_CONFIG = {
-    'host': '192.168.0.168',
-    'port': 3306,
-    'user': 'ITaimysql',
-    'password': 'Ai12345678@',
-    'database': 'ecommerce_workflow',
-    'charset': 'utf8mb4'
+    "host": os.getenv("DB_HOST", "192.168.0.168"),
+    "port": int(os.getenv("DB_PORT", "3306")),
+    "user": os.getenv("DB_USER", "ITaimysql"),
+    "password": os.getenv("DB_PASSWORD", "Ai12345678@"),
+    "database": os.getenv("DB_NAME", "ecommerce_workflow"),
+    "charset": "utf8mb4",
+    "cursorclass": pymysql.cursors.DictCursor,
 }
 
-# 数据源白名单：仅这两张表字段完整兼容引擎 schema
-DATA_SOURCE_REGISTRY = {
-    'fastmoss_product':       {'stage': 'NEW_ARRIVAL', 'weight': 1.2, 'label': '商品热推榜'},
-    'fastmoss_sales_product': {'stage': 'MATURITY',    'weight': 1.0, 'label': '商品热销榜'},
+STATUS_VALUES = {"PENDING", "REVIEWING", "READY", "PUBLISHED", "OTHER"}
+IP_GRADES = ["E", "D", "C", "B", "A", "S"]
+AI_DAEMON_ENABLED = os.getenv("AI_DAEMON_ENABLED", "false").strip().lower() == "true"
+AI_DAEMON_SOURCE = os.getenv("AI_DAEMON_SOURCE", "fastmoss").strip()
+AI_DAEMON_SOURCES = [
+    item.strip()
+    for item in os.getenv("AI_DAEMON_SOURCES", AI_DAEMON_SOURCE).split(",")
+    if item.strip()
+]
+AI_DAEMON_ANALYSIS = os.getenv("AI_DAEMON_ANALYSIS", "both").strip().lower()
+AI_DAEMON_INTERVAL_SECONDS = int(os.getenv("AI_DAEMON_INTERVAL_SECONDS", "300"))
+AI_DAEMON_BATCH_SIZE = int(os.getenv("AI_DAEMON_BATCH_SIZE", "5"))
+AI_DAEMON_CONCURRENCY = max(1, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "5"))))
+AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false"
+_ai_daemon_started = False
+_ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
+
+SOURCES = {
+    "unified": {
+        "label": "统一表",
+        "table": "fastmoss_product_aggregate",
+        "id": "product_id",
+        "date": "date_record",
+        "title": "title",
+        "image": "image_base64",
+        "price": "real_price",
+        "rating": "rating",
+        "commission": "commission_rate",
+        "sold": "rank_sold_count",
+        "total_sold": "sold_count",
+        "sale_amount": "sale_amount",
+        "author_count": "author_count",
+        "base_price": "base_price",
+        "transport_fee": "transport_fee",
+        "video_ratio": None,
+        "product_card_ratio": None,
+        "distribution_30d": "content_ratio",
+        "distribution_7d": "distribution_7d",
+        "distribution_90d": "distribution_90d",
+        "distribution_180d": "distribution_180d",
+        "overview_30d": "sales_overview",
+        "overview_7d": "overview_7d",
+        "overview_90d": "overview_90d",
+        "overview_180d": "overview_180d",
+        "detail_url": "detail_url",
+        "platform": "fastmoss",
+        "selling_points": "selling_points",
+        "attributes": "attributes",
+    },
+    "fastmoss": {
+        "label": "FastMoss",
+        "table": "fastmoss_product_rank_aggregate",
+        "id": "product_id",
+        "date": "date_record",
+        "title": "title",
+        "image": "image_base64",
+        "price": "real_price",
+        "rating": "rating",
+        "commission": "commission_rate",
+        "sold": "rank_sold_count",
+        "total_sold": "sold_count",
+        "sale_amount": "sale_amount",
+        "author_count": "author_count",
+        "base_price": "base_price",
+        "transport_fee": "transport_fee",
+        "video_ratio": None,
+        "product_card_ratio": None,
+        "distribution_30d": "content_ratio",
+        "distribution_7d": "distribution_7d",
+        "distribution_90d": "distribution_90d",
+        "distribution_180d": "distribution_180d",
+        "overview_30d": "sales_overview",
+        "overview_7d": "overview_7d",
+        "overview_90d": "overview_90d",
+        "overview_180d": "overview_180d",
+        "detail_url": "detail_url",
+        "platform": "fastmoss",
+        "selling_points": None,
+        "attributes": None,
+    },
+    "kalodata": {
+        "label": "Kalodata",
+        "table": "kalodata_youwei_product",
+        "id": "商品ID",
+        "date": "date_record",
+        "title": "商品标题",
+        "image": "商品主图",
+        "price": "价格",
+        "rating": "商品评分",
+        "commission": "佣金比例",
+        "sold": "总销量",
+        "total_sold": "all_solds",
+        "sale_amount": "总成交额",
+        "author_count": "关联达人数",
+        "base_price": None,
+        "transport_fee": None,
+        "video_ratio": "近28天视频占比",
+        "product_card_ratio": "近28天商品卡占比",
+        "distribution_30d": "distribution_7d",
+        "distribution_7d": "distribution_7d",
+        "distribution_90d": "distribution_90d",
+        "distribution_180d": "distribution_180d",
+        "overview_30d": None,
+        "overview_7d": "overview_7d",
+        "overview_90d": "overview_90d",
+        "overview_180d": "overview_180d",
+        "detail_url": "商品链接",
+        "platform": "kalodata",
+        "selling_points": "卖点",
+        "attributes": "属性信息",
+    },
 }
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+SORT_FIELDS = {
+    "date_record": "date_record",
+    "sold": "sold_count_view",
+    "sale_amount": "sale_amount_view",
+    "rating": "rating_view",
+    "price": "price_view",
+    "author_count": "author_count_view",
+    "launch_time": "launch_time",
+}
 
-def get_db_connection():
+
+def create_app():
+    app = Flask(__name__, static_folder="static", template_folder="static")
+    CORS(app)
+
+    @app.get("/")
+    def index():
+        return render_template("index.html")
+
+    @app.get("/api/products")
+    def products():
+        source = normalize_source(request.args.get("source"))
+        period = normalize_period(request.args.get("period"))
+        sales_period = build_sales_period(
+            period,
+            request.args.get("sales_start"),
+            request.args.get("sales_end"),
+        )
+        page = clamp_int(request.args.get("page"), 1, 1, 100000)
+        page_size = clamp_int(request.args.get("page_size"), 30, 10, 100)
+        meta = SOURCES[source]
+        where, params = build_filters(meta, request.args, latest_by_default=True)
+        order_sql = build_order(request.args.get("sort_by"), request.args.get("sort_order"))
+        offset = (page - 1) * page_size
+
+        select_sql = build_product_select(source, meta)
+        sql = f"""
+            SELECT {select_sql}
+            FROM `{meta["table"]}`
+            WHERE {" AND ".join(where)}
+            {order_sql}
+            LIMIT %s OFFSET %s
+        """
+        count_sql = f"""
+            SELECT COUNT(*) AS total
+            FROM `{meta["table"]}`
+            WHERE {" AND ".join(where)}
+        """
+
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(count_sql, params)
+            total = int(cursor.fetchone()["total"])
+            cursor.execute(sql, [*params, page_size, offset])
+            raw_rows = cursor.fetchall()
+            attach_runtime_metrics(
+                cursor,
+                meta,
+                raw_rows,
+                sales_period,
+                request.args.get("date_start"),
+                request.args.get("date_end"),
+            )
+            rows = [normalize_product_row(source, row, sales_period) for row in raw_rows]
+
+        return api_ok({
+            "source": source,
+            "period": sales_period["period"],
+            "period_label": sales_period["label"],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "items": rows,
+        })
+
+    @app.get("/api/products/stats")
+    def stats():
+        source = normalize_source(request.args.get("source"))
+        meta = SOURCES[source]
+        where, params = build_filters(meta, request.args, latest_by_default=True)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) AS total FROM `{meta['table']}` WHERE {' AND '.join(where)}", params)
+            total = int(cursor.fetchone()["total"])
+            cursor.execute(
+                f"""
+                SELECT audit_status, COUNT(*) AS count
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)}
+                GROUP BY audit_status
+                """,
+                params,
+            )
+            statuses = {row["audit_status"] or "PENDING": int(row["count"]) for row in cursor.fetchall()}
+            cursor.execute(
+                f"""
+                SELECT ip_grade, COUNT(*) AS count
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)} AND ip_grade IS NOT NULL AND ip_grade <> ''
+                GROUP BY ip_grade
+                """,
+                params,
+            )
+            grades = {row["ip_grade"]: int(row["count"]) for row in cursor.fetchall()}
+            material_counts = count_material_types(cursor, meta["table"], where, params)
+        return api_ok({
+            "source": source,
+            "total": total,
+            "statuses": statuses,
+            "ip_grades": grades,
+            "materials": material_counts,
+        })
+
+    @app.get("/api/products/<source>/<product_id>")
+    def product_detail(source, product_id):
+        source = normalize_source(source)
+        meta = SOURCES[source]
+        date_record = request.args.get("date_record")
+        where = [f"`{meta['id']}` = %s"]
+        params = [product_id]
+        if date_record:
+            where.append(f"`{meta['date']}` = %s")
+            params.append(date_record)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)}
+                ORDER BY `{meta['date']}` DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            row = cursor.fetchone()
+        if not row:
+            return api_error("商品不存在", 404)
+        return api_ok(normalize_detail(source, row))
+
+    @app.patch("/api/products/<source>/<product_id>/status")
+    def update_status(source, product_id):
+        source = normalize_source(source)
+        payload = request.get_json(silent=True) or {}
+        audit_status = payload.get("audit_status")
+        date_record = payload.get("date_record")
+        if audit_status not in STATUS_VALUES:
+            return api_error("audit_status 非法", 400)
+        if not date_record:
+            return api_error("date_record 不能为空", 400)
+
+        meta = SOURCES[source]
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE `{meta['table']}`
+                SET audit_status = %s
+                WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                """,
+                (audit_status, product_id, date_record),
+            )
+            conn.commit()
+            affected = cursor.rowcount
+        if affected == 0:
+            return api_error("未找到需要修改的商品", 404)
+        return api_ok({"updated": affected, "audit_status": audit_status})
+
+    @app.get("/api/products/<source>/ready-links")
+    def ready_links(source):
+        source = normalize_source(source)
+        links = fetch_ready_links(source)
+        return api_ok({"source": source, "count": len(links), "links": links})
+
+    @app.get("/api/products/<source>/export-ready-links")
+    def export_ready_links(source):
+        source = normalize_source(source)
+        links = fetch_ready_links(source)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ready_links"
+        ws.append(["link"])
+        for link in links:
+            ws.append([link])
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=f"{source}_ready_links.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    @app.get("/api/products/<source>/<product_id>/image")
+    def product_image(source, product_id):
+        source = normalize_source(source)
+        meta = SOURCES[source]
+        date_record = request.args.get("date_record")
+        where = [f"`{meta['id']}` = %s"]
+        params = [product_id]
+        if date_record:
+            where.append(f"`{meta['date']}` = %s")
+            params.append(date_record)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT `{meta['image']}` AS image_value
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)}
+                ORDER BY `{meta['date']}` DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            row = cursor.fetchone()
+        if not row or not row.get("image_value"):
+            return api_error("图片不存在", 404)
+        return serve_image_value(row["image_value"])
+
+    return app
+
+
+def db():
     return pymysql.connect(**DB_CONFIG)
 
-def ensure_schema():
-    """启动时自动补齐 data_sources 列，幂等可重复执行。"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA=%s AND TABLE_NAME='product_strategies' AND COLUMN_NAME='data_sources'
-            """, (DB_CONFIG['database'],))
-            if cur.fetchone()[0] == 0:
-                cur.execute(
-                    "ALTER TABLE product_strategies "
-                    "ADD COLUMN data_sources JSON COMMENT '数据源表名 JSON 数组' AFTER match_fields"
-                )
-                conn.commit()
-                print("[schema] product_strategies.data_sources 列已补齐")
-    finally:
-        conn.close()
 
-def filter_data_sources(raw):
-    """白名单过滤；空/全部非法时回退到全量。"""
-    valid = [t for t in (raw or []) if t in DATA_SOURCE_REGISTRY]
-    return valid if valid else list(DATA_SOURCE_REGISTRY.keys())
+def api_ok(data):
+    return jsonify({"ok": True, "data": data})
 
-def decimal_to_float(obj):
-    from decimal import Decimal
-    return float(obj) if isinstance(obj, Decimal) else obj
 
-def extract_text_from_file(file_path, file_type):
-    if file_type == 'word':
-        doc = Document(file_path)
-        return '\n'.join([p.text for p in doc.paragraphs if p.text.strip()])
-    elif file_type == 'excel':
-        wb = openpyxl.load_workbook(file_path)
-        texts = []
-        for sheet in wb.worksheets:
-            for row in sheet.iter_rows(values_only=True):
-                texts.extend([str(cell) for cell in row if cell])
-        return '\n'.join(texts)
-    else: 
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
+def api_error(message, status):
+    return jsonify({"ok": False, "error": message}), status
 
-def extract_keywords(text):
-    text = re.sub(r'[^\w\s一-鿿,.]', ' ', text)
-    parts = re.split(r'[,\n。]', text)
-    keywords = [p.strip() for p in parts if 2 <= len(p.strip()) <= 20]
-    return list(set(keywords))[:50]
 
-def parse_strategy_keywords(keywords_list):
-    text_keywords = []
-    conditions = []
-    numeric_fields = {
-        'sold_count': ['销量', '销售数量', '已售', '成交数量'],
-        'sale_amount': ['销售额', '成交金额', 'GMV'],
-        'base_price': ['价格', '原价', '标价'],
-        'real_price': ['实价', '实际价格', '售价'],
-        'rating': ['评分', '星级', '分数'],
-        'review_count': ['评论数', '评价数量', '评价']
-    }
-    operators = {
-        '大于': '>', '超过': '>', '多于': '>', '以上': '>=', '不低于': '>=',
-        '小于': '<', '低于': '<', '少于': '<', '不超过': '<=', '不高于': '<=',
-        '等于': '=', '是': '=', '为': '='
-    }
+def normalize_source(source):
+    source = source or "unified"
+    if source not in SOURCES:
+        raise ValueError(f"未知数据源：{source}")
+    return source
 
-    if not keywords_list: return text_keywords, conditions
 
-    for kw in keywords_list:
-        if not kw: continue
-        kw_str = str(kw).strip()
-        parsed = False
+def normalize_period(period):
+    period = period or "30d"
+    return period if period in {"7d", "30d", "90d", "180d", "custom"} else "7d"
 
-        for field_en, field_cn_list in numeric_fields.items():
-            for field_cn in field_cn_list:
-                if field_cn in kw_str:
-                    for op_cn, op_sym in operators.items():
-                        if op_cn in kw_str:
-                            parts = kw_str.split(op_cn)
-                            if len(parts) == 2:
-                                try:
-                                    value_str = parts[1].strip().lower()
-                                    if '万' in value_str or value_str.endswith('w'):
-                                        value = float(re.sub(r'[万 w]', '', value_str)) * 10000
-                                    elif '千' in value_str or value_str.endswith('k'):
-                                        value = float(re.sub(r'[千 k]', '', value_str)) * 1000
-                                    else:
-                                        value = float(re.sub(r'[^0-9.]', '', value_str))
-                                    conditions.append({'field': field_en, 'operator': op_sym, 'value': value})
-                                    parsed = True; break
-                                except Exception: pass
-                    if parsed: break
-            if parsed: break
 
-        if not parsed:
-            for op in ['>=', '<=', '>', '<', '=']:
-                if op in kw_str:
-                    parts = kw_str.split(op)
-                    if len(parts) == 2:
-                        field_part, value_part = parts[0].strip().lower(), parts[1].strip().lower()
-                        if field_part in numeric_fields.keys():
-                            try:
-                                value = float(re.sub(r'[^0-9.]', '', value_part))
-                                if '万' in value_part or value_part.endswith('w'): value *= 10000
-                                elif '千' in value_part or value_part.endswith('k'): value *= 1000
-                                conditions.append({'field': field_part, 'operator': op, 'value': value})
-                                parsed = True; break
-                            except Exception: pass
-
-        if not parsed and kw_str.strip():
-            text_keywords.append(kw_str)
-
-    return text_keywords, conditions
-
-def build_dynamic_sql(conditions, text_keywords, match_fields, data_sources, limit, offset):
-    """
-    数据驱动引擎：编译 WHERE 过滤与 SELECT 动态权重，注入生命周期乘数。
-    data_sources: 白名单表名列表，决定参与 UNION 的子查询。
-    """
-    where_clauses = []
-    params = []
-
-    # 1. 严格数值边界拦截 (WHERE)
-    allowed_fields = ['sold_count', 'sale_amount', 'base_price', 'real_price', 'rating', 'review_count']
-    allowed_ops = ['>', '>=', '<', '<=', '=']
-
-    for cond in conditions:
-        field, operator, value = cond['field'], cond['operator'], cond['value']
-        if field in allowed_fields and operator in allowed_ops:
-            where_clauses.append(f"{field} {operator} %s")
-            params.append(value)
-
-    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
-
-    # 2. 文本权重矩阵编译
-    score_exprs = []
-    score_exprs.append("(IFNULL(sold_count,0) * 0.01 + IFNULL(rating,0) * 5)")
-
-    if text_keywords:
-        search_all = not match_fields or len(match_fields) == 0
-        for kw in text_keywords:
-            safe_kw = f"%{kw}%"
-            if search_all or 'title' in match_fields:
-                score_exprs.append("(IF(title LIKE %s, 60, 0))")
-                params.append(safe_kw)
-            if search_all or 'category' in match_fields:
-                score_exprs.append("(IF(CONCAT_WS(',', category_l1, category_l2, category_l3) LIKE %s, 30, 0))")
-                params.append(safe_kw)
-            if search_all or 'other' in match_fields:
-                # 必须确保外层 combined_data 中存在 comments 字段
-                score_exprs.append("(IF(IFNULL(comments,'') LIKE %s, 10, 0))")
-                params.append(safe_kw)
-
-    if not score_exprs: score_exprs.append("100")
-    base_score_sql = " + ".join(score_exprs)
-
-    # 3. 联合表构建与生命周期加权（按 data_sources 动态拼装）
-    # 表名来自服务端白名单 DATA_SOURCE_REGISTRY，非用户输入，拼接安全
-    valid_tables = filter_data_sources(data_sources)
-    union_parts = []
-    for tbl in valid_tables:
-        meta = DATA_SOURCE_REGISTRY[tbl]
-        union_parts.append(
-            "SELECT product_id, title, category_l1, category_l2, category_l3, "
-            "base_price, sold_count, rating, review_count, comments, "
-            f"'{meta['stage']}' AS lifecycle_stage, {meta['weight']} AS lifecycle_weight "
-            f"FROM {tbl}"
-        )
-    base_select = " UNION ALL ".join(union_parts)
-    
-    # 核心聚合：基础得分 * 生命周期系数
-    query = f"""
-        SELECT *, (({base_score_sql}) * lifecycle_weight) AS dynamic_match_score
-        FROM ({base_select}) AS combined_data
-        WHERE {where_sql}
-        HAVING dynamic_match_score > 0
-        ORDER BY dynamic_match_score DESC, sold_count DESC
-        LIMIT %s OFFSET %s
-    """
-    
-    count_query = f"""
-        SELECT COUNT(*) as total
-        FROM (
-            SELECT *, (({base_score_sql}) * lifecycle_weight) AS dynamic_match_score
-            FROM ({base_select}) AS combined_data
-            WHERE {where_sql}
-            HAVING dynamic_match_score > 0
-        ) AS filtered_data
-    """
-    
-    count_params = params.copy()
-    params.extend([limit, offset])
-    
-    return query, count_query, tuple(params), tuple(count_params)
-
-@app.route('/api/strategies', methods=['GET'])
-def get_strategies():
-    conn = get_db_connection()
-    try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT * FROM product_strategies ORDER BY created_at DESC")
-            strategies = cursor.fetchall()
-            for s in strategies:
-                for fld in ('keywords', 'match_fields', 'data_sources'):
-                    val = s.get(fld)
-                    if isinstance(val, str):
-                        try: s[fld] = json.loads(val)
-                        except Exception: s[fld] = []
-                    elif val is None:
-                        s[fld] = []
-            return jsonify({'code': 0, 'data': strategies})
-    finally: conn.close()
-
-@app.route('/api/strategies/export', methods=['GET'])
-def export_strategies():
-    conn = get_db_connection()
-    try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT * FROM product_strategies ORDER BY created_at DESC")
-            strategies = cursor.fetchall()
-            
-            from io import BytesIO
-            from flask import send_file
-            
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "大盘策略看板"
-            
-            headers = ['架构代号', '语义约束/目标', '运行状态', '创建时间']
-            ws.append(headers)
-            
-            for s in strategies:
-                ws.append([
-                    s['name'],
-                    s['description'] or '',
-                    '引擎在线' if s.get('is_active', 1) else '节点休眠',
-                    str(s['created_at'])
-                ])
-            
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
-            
-            return send_file(
-                output,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name='strategies_export.xlsx'
-            )
-    finally: conn.close()
-
-def _process_strategy_payload():
-    """从 request.form/files 抽取并加工策略字段。返回 dict（可能含 None 表示不变）。"""
-    name = request.form.get('name', '').strip()
-    description = request.form.get('description', '')
-    keywords_text = request.form.get('keywords_text', '')
-    match_fields_str = request.form.get('match_fields', '[]')
-    data_sources_str = request.form.get('data_sources', '[]')
-
-    try: match_fields = json.loads(match_fields_str) if match_fields_str else []
-    except Exception: match_fields = []
-    try: data_sources_raw = json.loads(data_sources_str) if data_sources_str else []
-    except Exception: data_sources_raw = []
-    data_sources = [t for t in data_sources_raw if t in DATA_SOURCE_REGISTRY]
-
-    file_path, file_type = None, None
-    keywords = None
-    content = None
-    has_new_file = 'file' in request.files and request.files['file'].filename
-
-    if has_new_file:
-        file = request.files['file']
-        ext = os.path.splitext(file.filename)[1].lower()
-        file_type = 'word' if ext in ['.docx', '.doc'] else ('excel' if ext in ['.xlsx', '.xls'] else 'text')
-        unique_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-        file_path = os.path.join(UPLOAD_FOLDER, unique_name)
-        file.save(file_path)
-        extracted_text = extract_text_from_file(file_path, file_type)
-        keywords = extract_keywords(extracted_text)
-        content = extracted_text
-    elif keywords_text:
-        extracted = extract_keywords(keywords_text)
-        text_kws, conditions = parse_strategy_keywords(extracted)
-        keywords = text_kws + [f"{c['field']}{c['operator']}{c['value']}" for c in conditions]
-        content = keywords_text
-
-    if keywords is not None and not keywords and keywords_text:
-        keywords = [keywords_text]
-
+def build_sales_period(period, sales_start=None, sales_end=None):
+    period = normalize_period(period)
+    if period == "custom" and sales_start and sales_end:
+        return {
+            "period": "custom",
+            "label": f"{sales_start} 至 {sales_end}",
+            "days": None,
+            "start": sales_start,
+            "end": sales_end,
+        }
+    days = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}.get(period, 7)
     return {
-        'name': name,
-        'description': description,
-        'keywords_text': keywords_text,
-        'match_fields': match_fields,
-        'data_sources': data_sources,
-        'keywords': keywords,
-        'content': content,
-        'file_path': file_path,
-        'file_type': file_type,
-        'has_new_file': has_new_file,
+        "period": period,
+        "label": f"近{days}天",
+        "days": days,
+        "start": None,
+        "end": None,
     }
 
-@app.route('/api/strategies', methods=['POST'])
-def create_strategy():
-    payload = _process_strategy_payload()
-    if not payload['name']:
-        return jsonify({'code': 1, 'message': '策略名称不能为空'}), 400
 
-    keywords = payload['keywords'] or []
-    content = payload['content'] if payload['content'] is not None else payload['keywords_text']
-
-    conn = get_db_connection()
+def clamp_int(value, default, minimum, maximum):
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO product_strategies (name, description, keywords, content, file_path, file_type, match_fields, data_sources)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                payload['name'], payload['description'],
-                json.dumps(keywords, ensure_ascii=False), content,
-                payload['file_path'], payload['file_type'],
-                json.dumps(payload['match_fields']),
-                json.dumps(payload['data_sources']),
-            ))
-            conn.commit()
-            return jsonify({'code': 0, 'message': '策略创建成功'})
-    finally: conn.close()
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
-@app.route('/api/strategies/<int:strategy_id>', methods=['PUT', 'DELETE'])
-def modify_strategy(strategy_id):
-    conn = get_db_connection()
+
+def sql_alias(field, alias):
+    if field:
+        return f"`{field}` AS {alias}"
+    return f"NULL AS {alias}"
+
+
+def build_product_select(source, meta):
+    image_url_expr = (
+        f"CONCAT('/api/products/{source}/', `{meta['id']}`, '/image?date_record=', `{meta['date']}`) AS image_url"
+    )
+    platform_url_expr = (
+        f"`{meta['detail_url']}` AS platform_url"
+        if meta["detail_url"]
+        else "NULL AS platform_url"
+    )
+    return ", ".join([
+        f"`{meta['id']}` AS product_id",
+        f"`{meta['date']}` AS date_record",
+        sql_alias(meta["title"], "title"),
+        sql_alias(meta["price"], "price_view"),
+        sql_alias(meta["rating"], "rating_view"),
+        sql_alias(meta["commission"], "commission_rate_view"),
+        sql_alias(meta["sold"], "sold_count_view"),
+        sql_alias(meta["total_sold"], "total_sold_count_view"),
+        sql_alias(meta["sale_amount"], "sale_amount_view"),
+        sql_alias(meta["author_count"], "author_count_view"),
+        sql_alias(meta["base_price"], "base_price_view"),
+        sql_alias(meta["transport_fee"], "transport_fee_view"),
+        sql_alias(meta["video_ratio"], "video_ratio_view"),
+        sql_alias(meta["product_card_ratio"], "product_card_ratio_view"),
+        sql_alias(meta["distribution_30d"], "distribution_30d"),
+        sql_alias(meta["distribution_7d"], "distribution_7d"),
+        sql_alias(meta["distribution_90d"], "distribution_90d"),
+        sql_alias(meta["distribution_180d"], "distribution_180d"),
+        sql_alias(meta["overview_30d"], "overview_30d"),
+        sql_alias(meta["overview_7d"], "overview_7d"),
+        sql_alias(meta["overview_90d"], "overview_90d"),
+        sql_alias(meta["overview_180d"], "overview_180d"),
+        "`audit_status`",
+        "`ip_grade`",
+        "`ip_reason`",
+        "`ip_tags`",
+        "`material_analysis`",
+        "`ai_analysis_error`",
+        "`launch_time`" if has_launch_time(meta) else "NULL AS launch_time",
+        platform_url_expr,
+        image_url_expr,
+    ])
+
+
+def has_launch_time(meta):
+    return meta["table"] in {"fastmoss_product_aggregate", "fastmoss_product_rank_aggregate"}
+
+
+def build_filters(meta, args, latest_by_default=False):
+    where = ["1=1"]
+    params = []
+    date_start = args.get("date_start")
+    date_end = args.get("date_end")
+    if latest_by_default and not date_start and not date_end:
+        where.append(f"`{meta['date']}` = (SELECT MAX(latest_source.`{meta['date']}`) FROM `{meta['table']}` AS latest_source)")
+    else:
+        add_range_filter(where, params, meta["date"], date_start, date_end)
+    add_eq_filter(where, params, "audit_status", args.get("audit_status"))
+    add_grade_filter(where, params, args.get("ip_grade_min"), args.get("ip_grade_max"))
+    add_material_filter(where, params, args.get("material_type"), args.get("material_categories"), args.get("exclude_material_categories"))
+    add_number_range_filter(where, params, meta.get("commission"), args.get("commission_min"), args.get("commission_max"))
+    add_number_range_filter(where, params, meta.get("author_count"), args.get("author_min"), args.get("author_max"))
+    add_number_range_filter(where, params, meta.get("sold"), args.get("sold_min"), args.get("sold_max"))
+    add_number_range_filter(where, params, meta.get("sale_amount"), args.get("sale_amount_min"), args.get("sale_amount_max"))
+    add_number_range_filter(where, params, meta.get("rating"), args.get("rating_min"), args.get("rating_max"))
+    add_number_range_filter(where, params, meta.get("price"), args.get("price_min"), args.get("price_max"))
+    add_number_range_filter(where, params, meta.get("base_price"), args.get("base_price_min"), args.get("base_price_max"))
+    add_number_range_filter(where, params, meta.get("transport_fee"), args.get("transport_fee_min"), args.get("transport_fee_max"))
+    add_range_filter(where, params, "launch_time", args.get("launch_start"), args.get("launch_end")) if has_launch_time(meta) else None
+    keyword = (args.get("keyword") or "").strip()
+    if keyword:
+        where.append(f"`{meta['title']}` LIKE %s")
+        params.append(f"%{keyword}%")
+    return where, params
+
+
+def add_range_filter(where, params, field, start, end):
+    if start:
+        where.append(f"`{field}` >= %s")
+        params.append(start)
+    if end:
+        where.append(f"`{field}` <= %s")
+        params.append(end)
+
+
+def add_number_range_filter(where, params, field, start, end):
+    if not field:
+        return
+    expr = f"CAST(REPLACE(REPLACE(`{field}`, '$', ''), '%%', '') AS DECIMAL(20,4))"
+    if start:
+        where.append(f"{expr} >= %s")
+        params.append(start)
+    if end:
+        where.append(f"{expr} <= %s")
+        params.append(end)
+
+
+def add_eq_filter(where, params, field, value):
+    if value:
+        where.append(f"`{field}` = %s")
+        params.append(value)
+
+
+def add_grade_filter(where, params, grade_min, grade_max):
+    if not grade_min and not grade_max:
+        return
+    min_index = IP_GRADES.index(grade_min) if grade_min in IP_GRADES else 0
+    max_index = IP_GRADES.index(grade_max) if grade_max in IP_GRADES else len(IP_GRADES) - 1
+    if min_index > max_index:
+        min_index, max_index = max_index, min_index
+    grades = IP_GRADES[min_index:max_index + 1]
+    where.append("ip_grade IN (" + ",".join(["%s"] * len(grades)) + ")")
+    params.extend(grades)
+
+
+def add_material_filter(where, params, material_type, categories, exclude_categories):
+    if material_type:
+        where.append("JSON_VALID(material_analysis) AND JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.material_type')) = %s")
+        params.append(material_type)
+    category_list = split_csv(categories)
+    if category_list:
+        where.append("JSON_VALID(material_analysis) AND JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.material_category')) IN (" + ",".join(["%s"] * len(category_list)) + ")")
+        params.extend(category_list)
+    excluded = split_csv(exclude_categories)
+    if excluded:
+        where.append("(NOT JSON_VALID(material_analysis) OR JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.material_category')) NOT IN (" + ",".join(["%s"] * len(excluded)) + "))")
+        params.extend(excluded)
+
+
+def split_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def build_order(sort_by, sort_order):
+    field = SORT_FIELDS.get(sort_by or "date_record", "date_record")
+    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+    return f"ORDER BY {field} {direction}"
+
+
+def normalize_product_row(source, row, sales_period):
+    material = parse_json(row.get("material_analysis")) or {}
+    tags = parse_json(row.get("ip_tags")) or {}
+    field_period = sales_period["period"] if sales_period["period"] != "custom" else "7d"
+    overview = parse_json(row.get(f"overview_{field_period}")) or {}
+    distribution = parse_json(row.get(f"distribution_{field_period}")) or []
+    sold_count = row.get("runtime_sold_count") if row.get("runtime_sold_count") is not None else overview.get("销量") or row.get("sold_count_view")
+    sale_amount = overview.get("销售额") or row.get("sale_amount_view")
+    author_count = overview.get("带货达人数") or row.get("author_count_view")
+    video_ratio = row.get("video_ratio_view") or ratio_from_distribution(distribution, "视频")
+    product_card_ratio = row.get("product_card_ratio_view") or ratio_from_distribution(distribution, "商品卡")
+    return {
+        "source": source,
+        "product_id": stringify(row.get("product_id")),
+        "date_record": row.get("date_record"),
+        "title": row.get("title") or "",
+        "image_url": row.get("image_url"),
+        "price": stringify(row.get("price_view")),
+        "base_price": stringify(row.get("base_price_view")),
+        "rating": stringify(row.get("rating_view")),
+        "commission_rate": stringify(row.get("commission_rate_view")),
+        "sold_count": stringify(sold_count),
+        "total_sold_count": stringify(row.get("total_sold_count_view") or row.get("sold_count_view")),
+        "sale_amount": stringify(sale_amount),
+        "sales_growth": row.get("sales_growth_view") or "N/A",
+        "author_count": stringify(author_count),
+        "video_ratio": stringify(video_ratio),
+        "product_card_ratio": stringify(product_card_ratio),
+        "transport_fee": stringify(row.get("transport_fee_view")),
+        "launch_time": stringify(row.get("launch_time")),
+        "audit_status": row.get("audit_status") or "PENDING",
+        "ip_grade": row.get("ip_grade"),
+        "ip_reason": row.get("ip_reason"),
+        "ip_tags": tags,
+        "material_type": material.get("material_type"),
+        "material_category": material.get("material_category"),
+        "material_confidence": material.get("confidence"),
+        "material_reason": material.get("material_reason"),
+        "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
+        "platform_url": row.get("platform_url") or build_platform_url(source, row.get("product_id")),
+    }
+
+
+def attach_runtime_metrics(cursor, meta, rows, sales_period, collection_start=None, collection_end=None):
+    if meta.get("sold") != "rank_sold_count":
+        for row in rows:
+            row["sales_growth_view"] = "N/A"
+            row["runtime_sold_count"] = None
+        return
+    for row in rows:
+        metrics = calculate_runtime_sales_metrics(
+            cursor,
+            meta,
+            row,
+            sales_period,
+            collection_start,
+            collection_end,
+        )
+        row["runtime_sold_count"] = metrics["current_sum"]
+        row["sales_growth_view"] = metrics["growth"]
+
+
+def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_start=None, collection_end=None):
+    product_id = row.get("product_id")
+    date_record = row.get("date_record")
+    if not product_id or not date_record:
+        return {"current_sum": None, "growth": "N/A"}
+    table = meta["table"]
+    id_field = meta["id"]
+    date_field = meta["date"]
+    sold_field = meta["sold"]
+
+    if collection_start and collection_end:
+        current_start = collection_start
+        current_end = collection_end
+    elif sales_period["period"] == "custom" and sales_period["start"] and sales_period["end"]:
+        current_start = sales_period["start"]
+        current_end = sales_period["end"]
+    else:
+        days = sales_period["days"] or 7
+        cursor.execute(
+            f"""
+            SELECT
+              SUM(CASE
+                WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY) AND CAST(%s AS DATE)
+                THEN COALESCE(`{sold_field}`, 0) ELSE 0
+              END) AS current_sum,
+              SUM(CASE
+                WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY)
+                                     AND DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY)
+                THEN COALESCE(`{sold_field}`, 0) ELSE 0
+              END) AS previous_sum
+            FROM `{table}`
+            WHERE `{id_field}` = %s
+            """,
+            (
+                date_record,
+                days - 1,
+                date_record,
+                date_record,
+                (days * 2) - 1,
+                date_record,
+                days,
+                product_id,
+            ),
+        )
+        result = cursor.fetchone() or {}
+        return format_runtime_sales_result(result)
+
+    cursor.execute(
+        f"""
+        SELECT
+          SUM(CASE
+            WHEN `{date_field}` BETWEEN CAST(%s AS DATE) AND CAST(%s AS DATE)
+            THEN COALESCE(`{sold_field}`, 0) ELSE 0
+          END) AS current_sum,
+          SUM(CASE
+            WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL DATEDIFF(CAST(%s AS DATE), CAST(%s AS DATE)) + 1 DAY)
+                                 AND DATE_SUB(CAST(%s AS DATE), INTERVAL 1 DAY)
+            THEN COALESCE(`{sold_field}`, 0) ELSE 0
+          END) AS previous_sum
+        FROM `{table}`
+        WHERE `{id_field}` = %s
+        """,
+        (
+            current_start,
+            current_end,
+            current_start,
+            current_end,
+            current_start,
+            current_start,
+            product_id,
+        ),
+    )
+    result = cursor.fetchone() or {}
+    return format_runtime_sales_result(result)
+
+
+def format_runtime_sales_result(result):
+    current_sum = float(result.get("current_sum") or 0)
+    previous_sum = float(result.get("previous_sum") or 0)
+    if previous_sum <= 0:
+        return {"current_sum": current_sum, "growth": "N/A"}
+    return {"current_sum": current_sum, "growth": f"{((current_sum / previous_sum) - 1) * 100:.1f}%"}
+
+
+def ratio_from_distribution(distribution, name):
+    if not isinstance(distribution, list):
+        return ""
+    for item in distribution:
+        if str(item.get("name")) == name:
+            return item.get("percentage") or item.get("ratio") or ""
+    return ""
+
+
+def normalize_detail(source, row):
+    meta = SOURCES[source]
+    product_id = stringify(row.get(meta["id"]))
+    date_record = row.get(meta["date"])
+    raw = {}
+    for key, value in row.items():
+        if key == meta["image"]:
+            raw[key] = "[图片字段已隐藏，可通过 image_url 查看]"
+        else:
+            raw[key] = serialize_value(value)
+    return {
+        "source": source,
+        "product_id": product_id,
+        "date_record": date_record,
+        "title": row.get(meta["title"]),
+        "image_url": f"/api/products/{source}/{product_id}/image?date_record={date_record}",
+        "platform_url": row.get(meta["detail_url"]) or build_platform_url(source, product_id),
+        "audit_status": row.get("audit_status") or "PENDING",
+        "ip_grade": row.get("ip_grade"),
+        "ip_reason": row.get("ip_reason"),
+        "ip_tags": parse_json(row.get("ip_tags")),
+        "material_analysis": parse_json(row.get("material_analysis")),
+        "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
+        "raw_fields": raw,
+    }
+
+
+def build_platform_url(source, product_id):
+    if source in {"unified", "fastmoss"}:
+        return f"https://www.fastmoss.com/zh/e-commerce/detail/{product_id}"
+    return f"https://www.kalodata.com/product/detail?id={product_id}"
+
+
+def fetch_ready_links(source):
+    meta = SOURCES[source]
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT `{meta['id']}` AS product_id, `{meta['detail_url']}` AS detail_url
+            FROM `{meta['table']}`
+            WHERE audit_status = 'READY'
+            ORDER BY `{meta['date']}` DESC
+            """,
+        )
+        rows = cursor.fetchall()
+    return [row.get("detail_url") or build_platform_url(source, row["product_id"]) for row in rows]
+
+
+def count_material_types(cursor, table, where=None, params=None):
+    where = list(where or ["1=1"])
+    params = list(params or [])
+    where.append("JSON_VALID(material_analysis)")
+    cursor.execute(
+        f"""
+        SELECT JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.material_type')) AS material_type,
+               COUNT(*) AS count
+        FROM `{table}`
+        WHERE {" AND ".join(where)}
+        GROUP BY JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.material_type'))
+        """,
+        params,
+    )
+    return {row["material_type"] or "未知": int(row["count"]) for row in cursor.fetchall()}
+
+
+def serve_image_value(value):
+    value = str(value).strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        return redirect(value)
+    mime = "image/jpeg"
+    payload = value
+    if value.startswith("data:image/"):
+        header, payload = value.split(",", 1)
+        mime = header.split(";")[0].replace("data:", "")
     try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            if request.method == 'DELETE':
-                cursor.execute("SELECT file_path FROM product_strategies WHERE id = %s", (strategy_id,))
-                res = cursor.fetchone()
-                cursor.execute("DELETE FROM product_strategies WHERE id = %s", (strategy_id,))
-                conn.commit()
-                if res and res.get('file_path') and os.path.exists(res['file_path']):
-                    os.remove(res['file_path'])
-                return jsonify({'code': 0, 'message': '策略删除成功'})
+        data = base64.b64decode(payload, validate=False)
+    except Exception:
+        return api_error("图片 base64 无法解码", 422)
+    return send_file(io.BytesIO(data), mimetype=mime)
 
-            # PUT：编辑现有策略
-            payload = _process_strategy_payload()
-            if not payload['name']:
-                return jsonify({'code': 1, 'message': '策略名称不能为空'}), 400
 
-            cursor.execute("SELECT keywords, content, file_path, file_type FROM product_strategies WHERE id = %s", (strategy_id,))
-            old = cursor.fetchone()
-            if not old:
-                return jsonify({'code': 1, 'message': '策略不存在'}), 404
-
-            # 合并字段：新文件 > 新关键词文本 > 保留旧值
-            if payload['has_new_file']:
-                new_keywords = payload['keywords']
-                new_content = payload['content']
-                new_file_path = payload['file_path']
-                new_file_type = payload['file_type']
-                # 删除旧文件
-                if old.get('file_path') and os.path.exists(old['file_path']):
-                    try: os.remove(old['file_path'])
-                    except Exception: pass
-            elif payload['keywords_text']:
-                new_keywords = payload['keywords']
-                new_content = payload['content']
-                new_file_path = old.get('file_path')
-                new_file_type = old.get('file_type')
-            else:
-                # 既没传新文件也没填关键词文本：保留旧的 keywords/content/file
-                new_keywords = None
-                new_content = old.get('content')
-                new_file_path = old.get('file_path')
-                new_file_type = old.get('file_type')
-
-            keywords_json = (json.dumps(new_keywords, ensure_ascii=False)
-                             if new_keywords is not None else old.get('keywords'))
-
-            cursor.execute("""
-                UPDATE product_strategies
-                SET name=%s, description=%s, keywords=%s, content=%s,
-                    file_path=%s, file_type=%s, match_fields=%s, data_sources=%s
-                WHERE id=%s
-            """, (
-                payload['name'], payload['description'],
-                keywords_json, new_content,
-                new_file_path, new_file_type,
-                json.dumps(payload['match_fields']),
-                json.dumps(payload['data_sources']),
-                strategy_id,
-            ))
-            conn.commit()
-            return jsonify({'code': 0, 'message': '策略更新成功'})
-    finally: conn.close()
-
-@app.route('/api/strategies/<int:strategy_id>/rankings', methods=['GET'])
-def get_rankings(strategy_id):
-    page = request.args.get('page', 1, type=int)
-    page_size = request.args.get('page_size', 20, type=int)
-    offset = (page - 1) * page_size
-    
-    conn = get_db_connection()
+def parse_json(value):
+    if not value:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
     try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT * FROM product_strategies WHERE id = %s", (strategy_id,))
-            strategy = cursor.fetchone()
-            if not strategy: return jsonify({'code': 1, 'message': '策略不存在'}), 404
+        return json.loads(value)
+    except Exception:
+        return None
 
-            keywords_raw = json.loads(strategy['keywords']) if isinstance(strategy['keywords'], str) else (strategy['keywords'] or [])
-            match_fields = json.loads(strategy['match_fields']) if isinstance(strategy['match_fields'], str) else (strategy['match_fields'] or [])
-            data_sources = json.loads(strategy['data_sources']) if isinstance(strategy.get('data_sources'), str) else (strategy.get('data_sources') or [])
 
-            text_keywords, conditions = parse_strategy_keywords(keywords_raw)
+def stringify(value):
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return str(value.normalize())
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(value, datetime) else value.isoformat()
+    return str(value)
 
-            # 调用底层引擎
-            query, count_query, params, count_params = build_dynamic_sql(
-                conditions, text_keywords, match_fields, data_sources, page_size, offset
+
+def serialize_value(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return stringify(value)
+    parsed = parse_json(value)
+    return parsed if parsed is not None else value
+
+
+def start_ai_daemon_if_enabled():
+    global _ai_daemon_started
+    if _ai_daemon_started or not AI_DAEMON_ENABLED:
+        return
+    if os.getenv("WERKZEUG_RUN_MAIN") == "false":
+        return
+    invalid_sources = [source for source in AI_DAEMON_SOURCES if source not in AI_PRODUCT_SOURCES]
+    if invalid_sources:
+        print(f"[AI_DAEMON] AI_DAEMON_SOURCES invalid: {invalid_sources}", flush=True)
+        return
+    if AI_DAEMON_ANALYSIS not in {"ip", "material", "both"}:
+        print(f"[AI_DAEMON] AI_DAEMON_ANALYSIS invalid: {AI_DAEMON_ANALYSIS}", flush=True)
+        return
+
+    thread = threading.Thread(target=ai_daemon_loop, name="cp-ai-analysis-daemon", daemon=True)
+    thread.start()
+    _ai_daemon_started = True
+    print(
+        "[AI_DAEMON] started "
+        f"sources={','.join(AI_DAEMON_SOURCES)} analysis={AI_DAEMON_ANALYSIS} "
+        f"batch_size={AI_DAEMON_BATCH_SIZE} interval={AI_DAEMON_INTERVAL_SECONDS}s "
+        f"write={AI_DAEMON_WRITE}",
+        flush=True,
+    )
+
+
+def ai_daemon_loop():
+    while True:
+        try:
+            processed = run_ai_daemon_once()
+            print(f"[AI_DAEMON] cycle finished, processed={processed}", flush=True)
+        except Exception:
+            print("[AI_DAEMON] cycle failed", flush=True)
+            traceback.print_exc()
+        time.sleep(max(10, AI_DAEMON_INTERVAL_SECONDS))
+
+
+def run_ai_daemon_once():
+    processed = 0
+    for source in AI_DAEMON_SOURCES:
+        keys = fetch_ai_daemon_product_keys(source, AI_DAEMON_ANALYSIS, AI_DAEMON_BATCH_SIZE)
+        for key in keys:
+            conn = db()
+            try:
+                with conn.cursor() as cursor:
+                    product = load_ai_product(cursor, source, key["product_id"], key["date_record"])
+                    print(
+                        "[AI_DAEMON] analyzing "
+                        f"source={source} product_id={product['product_id']} "
+                        f"date_record={product.get('date_record')}",
+                        flush=True,
+                    )
+                    run_ai_product_flow(cursor, source, product, AI_DAEMON_ANALYSIS, AI_DAEMON_WRITE)
+                    conn.commit()
+                    processed += 1
+            except Exception:
+                conn.rollback()
+                print(
+                    "[AI_DAEMON] item failed "
+                    f"source={source} product_id={key.get('product_id')} "
+                    f"date_record={key.get('date_record')}",
+                    flush=True,
+                )
+                traceback.print_exc()
+            finally:
+                conn.close()
+    return processed
+
+
+def run_ai_product_flow(cursor, source, product, analysis, write):
+    if analysis == "both":
+        prefilter_result = run_material_prefilter(cursor, source, product, write=write)
+        if prefilter_result:
+            print(
+                "[AI_DAEMON] material prefilter hit, skip IP and material AI "
+                f"product_id={product['product_id']}",
+                flush=True,
             )
+            return
+        run_analysis(cursor, source, product, "IP", write=write)
+        run_analysis(cursor, source, product, "MATERIAL", write=write)
+        return
 
-            # 执行查询
-            cursor.execute(count_query, count_params)
-            total_count = cursor.fetchone()['total']
+    if analysis == "material":
+        run_analysis(cursor, source, product, "MATERIAL", write=write)
+        return
 
-            cursor.execute(query, params)
-            results = cursor.fetchall()
+    run_analysis(cursor, source, product, "IP", write=write)
 
-            rankings = []
-            for i, row in enumerate(results):
-                rankings.append({
-                    # product_id 为 18 位 BIGINT，超过 JS Number.MAX_SAFE_INTEGER，必须字符串化避免前端精度丢失
-                    'product_id': str(row['product_id']),
-                    'match_score': round(float(row['dynamic_match_score']), 1),
-                    'rank_position': offset + i + 1,
-                    'lifecycle_stage': row['lifecycle_stage'],
-                    'product_data': {
-                        'title': row['title'],
-                        'base_price': decimal_to_float(row['base_price']),
-                        'sold_count': row['sold_count'],
-                        'rating': decimal_to_float(row['rating']),
-                        'category_l1': row['category_l1']
-                    }
-                })
 
-            return jsonify({'code': 0, 'data': {'list': rankings, 'total': total_count, 'page': page}})
-    except Exception as e:
-        print(f"SQL Engine Error: {e}")
-        return jsonify({'code': -1, 'message': f'底层引擎运算异常: {str(e)}'}), 500
-    finally:
-        conn.close()
+def fetch_ai_daemon_product_keys(source, analysis, limit):
+    meta = AI_PRODUCT_SOURCES[source]
+    table = meta["table"]
+    id_field = meta["id_field"]
+    date_field = meta["date_field"]
+    image_field = meta["image_field"]
+    where = [f"`{image_field}` IS NOT NULL", f"`{image_field}` <> ''"]
 
-@app.route('/api/strategies/<int:strategy_id>/export', methods=['GET'])
-def export_rankings(strategy_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT * FROM product_strategies WHERE id = %s", (strategy_id,))
-            strategy = cursor.fetchone()
-            if not strategy: return jsonify({'code': 1, 'message': '策略不存在'}), 404
+    prefilter_hit_sql = (
+        "JSON_VALID(material_analysis) "
+        "AND JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.pre_filter.hit')) = 'true'"
+    )
+    if analysis == "both":
+        where.append(
+            "("
+            "material_analysis IS NULL OR material_analysis = '' "
+            "OR ((ip_grade IS NULL OR ip_grade = '') AND NOT (" + prefilter_hit_sql + "))"
+            ")"
+        )
+    elif analysis == "material":
+        where.append("(material_analysis IS NULL OR material_analysis = '')")
+    else:
+        where.append("(ip_grade IS NULL OR ip_grade = '')")
+        where.append(f"NOT ({prefilter_hit_sql})")
 
-            keywords_raw = json.loads(strategy['keywords']) if isinstance(strategy['keywords'], str) else (strategy['keywords'] or [])
-            match_fields = json.loads(strategy['match_fields']) if isinstance(strategy['match_fields'], str) else (strategy['match_fields'] or [])
-            data_sources = json.loads(strategy['data_sources']) if isinstance(strategy.get('data_sources'), str) else (strategy.get('data_sources') or [])
+    sql = f"""
+        SELECT `{id_field}` AS product_id, `{date_field}` AS date_record
+        FROM `{table}`
+        WHERE {" AND ".join(where)}
+        ORDER BY `{date_field}` DESC, `id`
+        LIMIT %s
+    """
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(sql, (limit,))
+        return cursor.fetchall()
 
-            text_keywords, conditions = parse_strategy_keywords(keywords_raw)
 
-            # 导出全量数据，不分页 (或者设置一个较大的限制)
-            query, _, params, _ = build_dynamic_sql(
-                conditions, text_keywords, match_fields, data_sources, 1000, 0
-            )
+app = create_app()
 
-            cursor.execute(query, params)
-            results = cursor.fetchall()
 
-            from io import BytesIO
-            from flask import send_file
-            
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = f"排名 - {strategy['name']}"
-            
-            headers = ['排名', '算法定级分', '生命周期阶段', '商品ID', '商品标题', '一级类目', '大盘基价', '销量', '评分', '评价数']
-            ws.append(headers)
-            
-            for i, row in enumerate(results):
-                ws.append([
-                    i + 1,
-                    round(float(row['dynamic_match_score']), 1),
-                    '新品扶持期' if row['lifecycle_stage'] == 'NEW_ARRIVAL' else '成熟利润期',
-                    str(row['product_id']),
-                    row['title'],
-                    row['category_l1'],
-                    float(row['base_price']) if row['base_price'] else 0,
-                    row['sold_count'],
-                    float(row['rating']) if row['rating'] else 0,
-                    row['review_count']
-                ])
-            
-            output = BytesIO()
-            wb.save(output)
-            output.seek(0)
-            
-            filename = f"ranking_export_{strategy['name']}.xlsx"
-            return send_file(
-                output,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name=filename
-            )
-    except Exception as e:
-        print(f"Export Error: {e}")
-        return jsonify({'code': -1, 'message': f'导出异常: {str(e)}'}), 500
-    finally:
-        conn.close()
-
-@app.route('/api/data-sources', methods=['GET'])
-def list_data_sources():
-    return jsonify({'code': 0, 'data': [
-        {'table': k, 'label': v['label'], 'stage': v['stage'], 'weight': v['weight']}
-        for k, v in DATA_SOURCE_REGISTRY.items()
-    ]})
-
-@app.route('/')
-def index():
-    return send_from_directory('static', 'index.html')
-
-if __name__ == '__main__':
-    print("AI 驱动：智能选品决策引擎已启动...")
-    ensure_schema()
-    app.run(host='0.0.0.0', port=5001, debug=True)
+if __name__ == "__main__":
+    start_ai_daemon_if_enabled()
+    debug_enabled = os.getenv("FLASK_DEBUG", "true").strip().lower() == "true"
+    app.run(
+        host="127.0.0.1",
+        port=int(os.getenv("PORT", "5000")),
+        debug=debug_enabled,
+        use_reloader=False,
+    )

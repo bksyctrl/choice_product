@@ -1,0 +1,11 @@
+# 忽略虚拟环境
+.venv/
+venv/
+
+# 忽略导致报错的大文件
+*.xlsx
+*.xls
+*.csv
+
+# 忽略 Python 缓存
+**/__pycache__/
