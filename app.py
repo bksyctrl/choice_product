@@ -59,6 +59,7 @@ AI_DAEMON_CONCURRENCY = max(1, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "5"
 AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false"
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
+FASTMOSS_ANALYSIS_REUSE_SOURCES = ("fastmoss", "fastmoss_rank")
 
 SOURCES = {
     "unified": {
@@ -265,6 +266,18 @@ def create_app():
             "statuses": statuses,
             "ip_grades": grades,
             "materials": material_counts,
+        })
+
+    @app.get("/api/products/latest-date")
+    def latest_date():
+        source = normalize_source(request.args.get("source"))
+        meta = SOURCES[source]
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(f"SELECT MAX(`{meta['date']}`) AS latest_date FROM `{meta['table']}`")
+            row = cursor.fetchone()
+        return api_ok({
+            "source": source,
+            "latest_date": stringify(row.get("latest_date") if row else None),
         })
 
     @app.get("/api/products/<source>/<product_id>")
@@ -569,9 +582,18 @@ def split_csv(value):
 
 
 def build_order(sort_by, sort_order):
-    field = SORT_FIELDS.get(sort_by or "date_record", "date_record")
+    raw_field = SORT_FIELDS.get(sort_by or "date_record", "date_record")
     direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
-    return f"ORDER BY {field} {direction}"
+
+    # 针对数值字段，强制进行数值转换排序，处理可能存在的 $ % , 等符号
+    # 防止出现字符串排序导致的 "84 > 658" 错误
+    numeric_keys = {"sold", "sale_amount", "rating", "price", "author_count"}
+    if sort_by in numeric_keys:
+        # 移除常见非数字符号并转换为 DECIMAL 排序
+        clean_expr = f"REPLACE(REPLACE(REPLACE({raw_field}, '$', ''), '%', ''), ',', '')"
+        return f"ORDER BY CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4)) {direction}"
+
+    return f"ORDER BY {raw_field} {direction}"
 
 
 def normalize_product_row(source, row, sales_period):
@@ -613,7 +635,7 @@ def normalize_product_row(source, row, sales_period):
         "material_confidence": material.get("confidence"),
         "material_reason": material.get("material_reason"),
         "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
-        "platform_url": row.get("platform_url") or build_platform_url(source, row.get("product_id")),
+        "platform_url": resolve_platform_url(source, row.get("product_id"), row.get("platform_url")),
     }
 
 
@@ -745,7 +767,7 @@ def normalize_detail(source, row):
         "date_record": date_record,
         "title": row.get(meta["title"]),
         "image_url": f"/api/products/{source}/{product_id}/image?date_record={date_record}",
-        "platform_url": row.get(meta["detail_url"]) or build_platform_url(source, product_id),
+        "platform_url": resolve_platform_url(source, product_id, row.get(meta["detail_url"])),
         "audit_status": row.get("audit_status") or "PENDING",
         "ip_grade": row.get("ip_grade"),
         "ip_reason": row.get("ip_reason"),
@@ -759,7 +781,18 @@ def normalize_detail(source, row):
 def build_platform_url(source, product_id):
     if source in {"unified", "fastmoss"}:
         return f"https://www.fastmoss.com/zh/e-commerce/detail/{product_id}"
-    return f"https://www.kalodata.com/product/detail?id={product_id}"
+    return build_tiktok_shop_url(product_id)
+
+
+def resolve_platform_url(source, product_id, detail_url=None):
+    if source == "kalodata":
+        return build_tiktok_shop_url(product_id)
+    return detail_url or build_platform_url(source, product_id)
+
+
+def build_tiktok_shop_url(product_id):
+    slug = "mens-athletic-t-shirt-by-brand-lightweight-quick-dry-crew-neck-tops"
+    return f"https://www.tiktok.com/shop/pdp/{slug}/{product_id}?source=ecommerce_store&region=US"
 
 
 def fetch_ready_links(source):
@@ -774,7 +807,7 @@ def fetch_ready_links(source):
             """,
         )
         rows = cursor.fetchall()
-    return [row.get("detail_url") or build_platform_url(source, row["product_id"]) for row in rows]
+    return [resolve_platform_url(source, row["product_id"], row.get("detail_url")) for row in rows]
 
 
 def count_material_types(cursor, table, where=None, params=None):
@@ -881,32 +914,165 @@ def run_ai_daemon_once():
     processed = 0
     for source in AI_DAEMON_SOURCES:
         keys = fetch_ai_daemon_product_keys(source, AI_DAEMON_ANALYSIS, AI_DAEMON_BATCH_SIZE)
-        for key in keys:
-            conn = db()
-            try:
-                with conn.cursor() as cursor:
-                    product = load_ai_product(cursor, source, key["product_id"], key["date_record"])
-                    print(
-                        "[AI_DAEMON] analyzing "
-                        f"source={source} product_id={product['product_id']} "
-                        f"date_record={product.get('date_record')}",
-                        flush=True,
-                    )
-                    run_ai_product_flow(cursor, source, product, AI_DAEMON_ANALYSIS, AI_DAEMON_WRITE)
-                    conn.commit()
-                    processed += 1
-            except Exception:
-                conn.rollback()
+        if not keys:
+            continue
+
+        with ThreadPoolExecutor(max_workers=AI_DAEMON_CONCURRENCY) as executor:
+            futures = {
+                executor.submit(process_single_ai_task, source, key): key
+                for key in keys
+            }
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        processed += 1
+                except Exception:
+                    traceback.print_exc()
+    return processed
+
+
+def process_single_ai_task(source, key):
+    conn = db()
+    try:
+        with conn.cursor() as cursor:
+            product = load_ai_product(cursor, source, key["product_id"], key["date_record"])
+            reused_fields = reuse_existing_product_analysis(cursor, source, product, AI_DAEMON_ANALYSIS)
+            if reused_fields and not needs_ai_analysis(cursor, source, product, AI_DAEMON_ANALYSIS):
                 print(
-                    "[AI_DAEMON] item failed "
-                    f"source={source} product_id={key.get('product_id')} "
-                    f"date_record={key.get('date_record')}",
+                    f"[AI_DAEMON][{threading.current_thread().name}] reused "
+                    f"{','.join(reused_fields)} source={source} "
+                    f"product_id={product['product_id']} date_record={product.get('date_record')}",
                     flush=True,
                 )
-                traceback.print_exc()
-            finally:
-                conn.close()
-    return processed
+                conn.commit()
+                return True
+            print(
+                f"[AI_DAEMON][{threading.current_thread().name}] analyzing "
+                f"source={source} product_id={product['product_id']} "
+                f"date_record={product.get('date_record')}",
+                flush=True,
+            )
+            run_ai_product_flow(cursor, source, product, AI_DAEMON_ANALYSIS, AI_DAEMON_WRITE)
+            conn.commit()
+            return True
+    except Exception:
+        conn.rollback()
+        print(
+            f"[AI_DAEMON][{threading.current_thread().name}] item failed "
+            f"source={source} product_id={key.get('product_id')} "
+            f"date_record={key.get('date_record')}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return False
+    finally:
+        conn.close()
+
+
+def reuse_existing_product_analysis(cursor, source, product, analysis):
+    if not AI_DAEMON_WRITE or source not in FASTMOSS_ANALYSIS_REUSE_SOURCES:
+        return []
+
+    current = fetch_current_analysis_state(cursor, source, product)
+    reusable = fetch_reusable_fastmoss_analysis(cursor, product["product_id"])
+    if not reusable:
+        return []
+
+    updates = []
+    params = []
+    if analysis in {"ip", "both"} and is_blank(current.get("ip_grade")) and not is_blank(reusable.get("ip_grade")):
+        updates.extend(["ip_grade = %s", "ip_reason = %s", "ip_tags = %s"])
+        params.extend([
+            reusable.get("ip_grade"),
+            reusable.get("ip_reason") or "",
+            reusable.get("ip_tags") or "",
+        ])
+    if analysis in {"material", "both"} and is_blank(current.get("material_analysis")) and not is_blank(reusable.get("material_analysis")):
+        updates.append("material_analysis = %s")
+        params.append(reusable.get("material_analysis"))
+    if not updates:
+        return []
+
+    meta = AI_PRODUCT_SOURCES[source]
+    params.extend([str(product["product_id"]), product.get("date_record")])
+    cursor.execute(
+        f"""
+        UPDATE `{meta['table']}`
+        SET {", ".join(updates)}
+        WHERE `{meta['id_field']}` = %s AND `{meta['date_field']}` = %s
+        """,
+        params,
+    )
+    return [
+        field
+        for field in ("ip", "material")
+        if any(update.startswith("ip_") if field == "ip" else update.startswith("material_") for update in updates)
+    ]
+
+
+def fetch_current_analysis_state(cursor, source, product):
+    meta = AI_PRODUCT_SOURCES[source]
+    cursor.execute(
+        f"""
+        SELECT ip_grade, ip_reason, ip_tags, material_analysis
+        FROM `{meta['table']}`
+        WHERE `{meta['id_field']}` = %s AND `{meta['date_field']}` = %s
+        LIMIT 1
+        """,
+        (str(product["product_id"]), product.get("date_record")),
+    )
+    return cursor.fetchone() or {}
+
+
+def fetch_reusable_fastmoss_analysis(cursor, product_id):
+    candidates = []
+    for source in FASTMOSS_ANALYSIS_REUSE_SOURCES:
+        meta = AI_PRODUCT_SOURCES[source]
+        cursor.execute(
+            f"""
+            SELECT ip_grade, ip_reason, ip_tags, material_analysis
+            FROM `{meta['table']}`
+            WHERE `{meta['id_field']}` = %s
+              AND (
+                (ip_grade IS NOT NULL AND ip_grade <> '')
+                OR (material_analysis IS NOT NULL AND material_analysis <> '')
+              )
+            ORDER BY
+              ((ip_grade IS NOT NULL AND ip_grade <> '') + (material_analysis IS NOT NULL AND material_analysis <> '')) DESC,
+              `{meta['date_field']}` DESC
+            LIMIT 1
+            """,
+            (str(product_id),),
+        )
+        row = cursor.fetchone()
+        if row:
+            candidates.append(row)
+    if not candidates:
+        return None
+    reusable = {}
+    for row in candidates:
+        if is_blank(reusable.get("ip_grade")) and not is_blank(row.get("ip_grade")):
+            reusable["ip_grade"] = row.get("ip_grade")
+            reusable["ip_reason"] = row.get("ip_reason")
+            reusable["ip_tags"] = row.get("ip_tags")
+        if is_blank(reusable.get("material_analysis")) and not is_blank(row.get("material_analysis")):
+            reusable["material_analysis"] = row.get("material_analysis")
+    return reusable
+
+
+def needs_ai_analysis(cursor, source, product, analysis):
+    current = fetch_current_analysis_state(cursor, source, product)
+    material = parse_json(current.get("material_analysis")) or {}
+    prefilter_hit = bool(material.get("pre_filter", {}).get("hit"))
+    if analysis == "material":
+        return is_blank(current.get("material_analysis"))
+    if analysis == "ip":
+        return is_blank(current.get("ip_grade")) and not prefilter_hit
+    return is_blank(current.get("material_analysis")) or (is_blank(current.get("ip_grade")) and not prefilter_hit)
+
+
+def is_blank(value):
+    return value is None or value == ""
 
 
 def run_ai_product_flow(cursor, source, product, analysis, write):
@@ -974,7 +1140,7 @@ if __name__ == "__main__":
     start_ai_daemon_if_enabled()
     debug_enabled = os.getenv("FLASK_DEBUG", "true").strip().lower() == "true"
     app.run(
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=int(os.getenv("PORT", "5000")),
         debug=debug_enabled,
         use_reloader=False,

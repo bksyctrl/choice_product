@@ -268,7 +268,7 @@
       btn.classList.add('active');
       $('pageTitle').textContent = sourceText[state.source];
       $('exportReadyLink').href = `/api/products/${state.source}/export-ready-links`;
-      loadAll();
+      loadDefaultDateAndData();
     }));
     document.querySelectorAll('.view-switch button').forEach(btn => btn.addEventListener('click', () => {
       state.view = btn.dataset.view;
@@ -278,8 +278,8 @@
     }));
     document.querySelectorAll('.range-filter').forEach(initRangeFilter);
 
-    $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; loadProducts(); });
-    $('topSearchBtn').addEventListener('click', () => { state.page = 1; loadProducts(); });
+    $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
+    $('topSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
     $('sortBy').addEventListener('change', () => { state.sortBy = $('sortBy').value; state.page = 1; loadProducts(); });
     $('resetFiltersBtn').addEventListener('click', resetFilters);
     initSalesRangeFilter();
@@ -379,6 +379,24 @@
       return `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
     }
 
+    async function setLatestCollectionDate() {
+      try {
+        const res = await fetch(`/api/products/latest-date?source=${state.source}`);
+        if (!res.ok) return false;
+        const json = await res.json();
+        if (!json.ok || !json.data.latest_date) return false;
+        $('dateStart').value = json.data.latest_date.slice(0, 10);
+        $('dateEnd').value = json.data.latest_date.slice(0, 10);
+        return true;
+      } catch (error) {
+        console.warn('latest date load failed', error);
+        return false;
+      }
+    }
+    async function loadDefaultDateAndData() {
+      await setLatestCollectionDate();
+      await loadAll();
+    }
     async function loadAll() { await Promise.all([loadStats(), loadProducts()]); }
     function buildParams() {
       const params = new URLSearchParams({ source: state.source, page: state.page, page_size: state.pageSize, period: $('period').value, sort_by: state.sortBy, sort_order: state.sortOrder });
@@ -408,12 +426,18 @@
       renderPager();
     }
     async function loadStats() {
-      const res = await fetch(`/api/products/stats?source=${state.source}`);
+      const params = buildParams();
+      params.delete('page');
+      params.delete('page_size');
+      params.delete('period');
+      params.delete('sort_by');
+      params.delete('sort_order');
+      const res = await fetch(`/api/products/stats?${params}`);
       const json = await res.json();
       if (!json.ok) return;
       const data = json.data;
       const cards = [
-        ['总商品数', data.total], ['待选中', data.statuses.PENDING || 0], ['待复核', data.statuses.REVIEWING || 0],
+        ['待选中', data.statuses.PENDING || 0], ['待复核', data.statuses.REVIEWING || 0],
         ['待上架', data.statuses.READY || 0], ['已上架', data.statuses.PUBLISHED || 0],
         ['S/A/B', (data.ip_grades.S || 0) + (data.ip_grades.A || 0) + (data.ip_grades.B || 0)],
         ['工厂材质', data.materials['工厂材质'] || 0], ['非工厂材质', data.materials['非工厂材质'] || 0],
@@ -443,9 +467,9 @@
         <td>${escapeHtml(item.price)}</td><td>${escapeHtml(item.rating)}</td><td>${escapeHtml(item.commission_rate)}</td>
         <td>${escapeHtml(item.sold_count)}</td><td>${escapeHtml(item.total_sold_count)}</td><td>${escapeHtml(item.sale_amount)}</td><td>${escapeHtml(item.sales_growth)}</td>
         <td>${escapeHtml(item.author_count)}</td><td>${escapeHtml(item.video_ratio)}</td><td>${escapeHtml(item.product_card_ratio)}</td>
-        <td>${escapeHtml(item.launch_time)}</td><td>${gradeBadge(item.ip_grade)}<small>${escapeHtml(shortText(item.ip_reason, 42))}</small></td>
-        <td>${materialBadge(item)}<small>${escapeHtml(shortText(item.material_reason, 42))}</small></td>
-        <td>${statusSelect(item)}</td><td><a class="link-button" href="${item.platform_url}" target="_blank" rel="noreferrer">平台</a></td>
+        <td>${escapeHtml(item.launch_time)}</td><td>${gradeBadge(item.ip_grade)}${reasonPreview('IP判断原因', item.ip_reason)}</td>
+        <td>${materialBadge(item)}${reasonPreview('材质判断原因', item.material_reason)}</td>
+        <td>${statusSelect(item)}</td><td>${tiktokLink(item)}</td>
         <td><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></td>
       </tr>`;
     }
@@ -455,7 +479,7 @@
         <button class="card-image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img src="${item.image_url}" alt=""></button><div class="card-body"><h3>${escapeHtml(item.title)}</h3><p>${item.product_id} · ${item.date_record || ''}</p>
         <div class="badges">${gradeBadge(item.ip_grade)}${materialBadge(item)}</div>
         <div class="metrics"><span>价格 ${escapeHtml(item.price)}</span><span>销量 ${escapeHtml(item.sold_count)}</span><span>总销量 ${escapeHtml(item.total_sold_count)}</span><span>${label}成交额 ${escapeHtml(item.sale_amount)}</span><span>达人 ${escapeHtml(item.author_count)}</span><span>视频 ${escapeHtml(item.video_ratio)}</span><span>商品卡 ${escapeHtml(item.product_card_ratio)}</span></div>
-        <div class="card-actions">${statusSelect(item)}<a href="${item.platform_url}" target="_blank" rel="noreferrer">平台</a><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></div></div>
+        <div class="card-actions">${statusSelect(item)}${tiktokLink(item)}<button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></div></div>
       </article>`).join('')}</div>`;
       bindRowActions();
     }
@@ -483,6 +507,7 @@
     function bindRowActions() {
       document.querySelectorAll('[data-detail]').forEach(btn => btn.addEventListener('click', () => openDetail(btn.dataset.detail, btn.dataset.date)));
       document.querySelectorAll('[data-image]').forEach(btn => btn.addEventListener('click', () => openImage(btn.dataset.image, btn.dataset.title)));
+      document.querySelectorAll('[data-reason-title]').forEach(btn => btn.addEventListener('click', () => openReason(btn.dataset.reasonTitle, btn.dataset.reasonText)));
       document.querySelectorAll('[data-status-product]').forEach(select => select.addEventListener('change', () => updateStatus(select)));
     }
     function openImage(src, title) {
@@ -496,6 +521,10 @@
       if (!json.ok) return showToast(json.error || '详情加载失败');
       const item = json.data;
       $('detailBody').innerHTML = `<div class="detail-layout"><img class="detail-image" src="${item.image_url}" alt=""><div><h4>${escapeHtml(item.title || '')}</h4><p>${item.product_id} · ${item.date_record || ''}</p><p>${gradeBadge(item.ip_grade)} ${escapeHtml(item.ip_reason || '')}</p><pre>${escapeHtml(JSON.stringify({ ip_tags: item.ip_tags, material_analysis: item.material_analysis, ai_analysis_error: item.ai_analysis_error }, null, 2))}</pre></div></div><h4>原始字段</h4><pre>${escapeHtml(JSON.stringify(item.raw_fields, null, 2))}</pre>`;
+      $('detailDialog').showModal();
+    }
+    function openReason(title, text) {
+      $('detailBody').innerHTML = `<h4>${escapeHtml(title)}</h4><pre>${escapeHtml(text || '暂无详细原因')}</pre>`;
       $('detailDialog').showModal();
     }
     async function updateStatus(select) {
@@ -513,24 +542,33 @@
       await navigator.clipboard.writeText(json.data.links.join('\n'));
       showToast(`已复制 ${json.data.count} 条链接`);
     }
-    function resetFilters() {
+    async function resetFilters() {
       Object.keys(paramMap).forEach(id => { if ($(id)) $(id).value = ''; });
       document.querySelectorAll('.range-trigger').forEach(btn => { btn.textContent = `${btn.textContent.split('：')[0]}：全部`; });
-      $('period').value = '7d'; $('sortBy').value = 'date_record'; state.sortBy = 'date_record'; state.sortOrder = 'desc'; $('salesStart').value = ''; $('salesEnd').value = ''; $('salesRangeTrigger').textContent = '过去7天'; $('salesCustomRange').classList.remove('visible'); state.page = 1; loadProducts();
+      $('period').value = '7d'; $('sortBy').value = 'date_record'; state.sortBy = 'date_record'; state.sortOrder = 'desc'; $('salesStart').value = ''; $('salesEnd').value = ''; $('salesRangeTrigger').textContent = '过去7天'; $('salesCustomRange').classList.remove('visible'); state.page = 1; await loadDefaultDateAndData();
     }
     function renderPager() {
       const maxPage = Math.max(1, Math.ceil(state.total / state.pageSize));
-      $('pageInfo').textContent = `第 ${state.page} / ${maxPage} 页，共 ${state.total} 条`;
+      $('pageInfo').textContent = `第 ${state.page} / ${maxPage} 页`;
       $('prevPage').disabled = state.page <= 1; $('nextPage').disabled = state.page >= maxPage;
     }
     function gradeBadge(grade) { return grade ? `<span class="badge grade-${grade}">IP ${grade}</span>` : '<span class="badge muted">未分析</span>'; }
     function materialBadge(item) { return item.material_type ? `<span class="badge material">${escapeHtml(item.material_type)}${item.material_category ? ' · ' + escapeHtml(item.material_category) : ''}</span>` : '<span class="badge muted">材质未分析</span>'; }
+    function reasonPreview(title, text) { return `<button type="button" class="reason-preview" data-reason-title="${escapeHtml(title)}" data-reason-text="${escapeHtml(text || '')}">${escapeHtml(shortText(text, 42) || '暂无详细原因')}</button>`; }
+    function tiktokLink(item) {
+      const url = state.source === 'kalodata' ? buildTikTokShopUrl(item.product_id) : item.platform_url;
+      return `<a class="tiktok-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="点击按钮可以跳转到tiktok商品详细页" aria-label="点击按钮可以跳转到tiktok商品详细页"><svg class="tiktok-logo" viewBox="0 0 448 512" aria-hidden="true"><path d="M448 210a210 210 0 0 1-123-39v178a163 163 0 1 1-140-161v90a75 75 0 1 0 52 71V0h88a121 121 0 0 0 2 22 122 122 0 0 0 54 80 121 121 0 0 0 67 20z"/></svg></a>`;
+    }
+    function buildTikTokShopUrl(productId) {
+      const slug = 'mens-athletic-t-shirt-by-brand-lightweight-quick-dry-crew-neck-tops';
+      return `https://www.tiktok.com/shop/pdp/${slug}/${encodeURIComponent(productId)}?source=ecommerce_store&region=US`;
+    }
     function statusSelect(item) { return `<select class="status-select" data-status-product="${item.product_id}" data-status-date="${item.date_record}" data-previous="${item.audit_status}">${Object.entries(statusText).map(([value, label]) => `<option value="${value}" ${item.audit_status === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`; }
     function shortText(text, max) { return !text ? '' : (text.length > max ? text.slice(0, max) + '...' : text); }
     function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'}[ch])); }
     function showToast(text) { $('toast').textContent = text; $('toast').classList.add('show'); setTimeout(() => $('toast').classList.remove('show'), 2200); }
     setSalesRangePreset('7d');
-    loadAll();
+    loadDefaultDateAndData();
   </script>
 </body>
 </html>

@@ -279,7 +279,7 @@ a {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(9, minmax(110px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 12px;
   margin: 22px 0;
 }
@@ -299,6 +299,32 @@ a {
 
 .stat strong {
   font-size: 22px;
+}
+
+.tiktok-link {
+  position: relative;
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #111827;
+  border-radius: 8px;
+  background: #050505;
+  color: #fff;
+  text-decoration: none;
+  box-shadow: inset 2px 0 0 #25f4ee, inset -2px 0 0 #fe2c55;
+}
+
+.tiktok-link:hover {
+  transform: translateY(-1px);
+}
+
+.tiktok-logo {
+  width: 17px;
+  height: 20px;
+  fill: currentColor;
+  filter: drop-shadow(-1px 0 0 #25f4ee) drop-shadow(1px 0 0 #fe2c55);
 }
 
 .top-filters {
@@ -547,6 +573,24 @@ td small {
   display: block;
   color: var(--muted);
   margin-top: 4px;
+}
+
+.reason-preview {
+  display: block;
+  max-width: 260px;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+
+.reason-preview:hover {
+  color: var(--brand);
+  text-decoration: underline;
 }
 
 .badge {
