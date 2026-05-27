@@ -24,134 +24,11 @@
       </nav>
 
       <section class="filter-panel">
-        <h2>基础筛选</h2>
-        <label>采集开始<input id="dateStart" type="date"></label>
-        <label>采集结束<input id="dateEnd" type="date"></label>
-        <label>上架开始<input id="launchStart" type="date"></label>
-        <label>上架结束<input id="launchEnd" type="date"></label>
-        <label>
-          商品状态
-          <select id="auditStatus">
-            <option value="">全部</option>
-            <option value="PENDING">待选中</option>
-            <option value="REVIEWING">待复核</option>
-            <option value="READY">待上架</option>
-            <option value="PUBLISHED">已上架</option>
-            <option value="OTHER">其他</option>
-          </select>
-        </label>
-
-        <div class="range-filter" data-min="soldMin" data-max="soldMax">
-          <button type="button" class="range-trigger">销量：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="100">小于 100</button>
-            <button data-min="100" data-max="5000">100-5000</button>
-            <button data-min="5000" data-max="50000">5000-5万</button>
-            <button data-min="50000" data-max="">大于 5万</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
+        <div class="filter-panel-head">
+          <h2>自定义筛选</h2>
+          <button id="addFilterBtn" type="button">添加筛选条件</button>
         </div>
-
-        <div class="range-filter" data-min="saleAmountMin" data-max="saleAmountMax">
-          <button type="button" class="range-trigger">成交金额：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="100">小于 100</button>
-            <button data-min="100" data-max="5000">100-5000</button>
-            <button data-min="5000" data-max="50000">5000-5万</button>
-            <button data-min="50000" data-max="">大于 5万</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="priceMin" data-max="priceMax">
-          <button type="button" class="range-trigger">售价：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="5">小于 5</button>
-            <button data-min="5" data-max="15">5-15</button>
-            <button data-min="15" data-max="30">15-30</button>
-            <button data-min="30" data-max="">大于 30</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="commissionMin" data-max="commissionMax">
-          <button type="button" class="range-trigger">佣金比例：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="5">小于 5%</button>
-            <button data-min="5" data-max="10">5%-10%</button>
-            <button data-min="10" data-max="20">10%-20%</button>
-            <button data-min="20" data-max="">大于 20%</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="authorMin" data-max="authorMax">
-          <button type="button" class="range-trigger">达人数量：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="10">小于 10</button>
-            <button data-min="10" data-max="50">10-50</button>
-            <button data-min="50" data-max="200">50-200</button>
-            <button data-min="200" data-max="">大于 200</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="ratingMin" data-max="ratingMax">
-          <button type="button" class="range-trigger">评分：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="4.8" data-max="">4.8 以上</button>
-            <button data-min="4.5" data-max="">4.5 以上</button>
-            <button data-min="4" data-max="">4.0 以上</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="basePriceMin" data-max="basePriceMax">
-          <button type="button" class="range-trigger">定价：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="5">小于 5</button>
-            <button data-min="5" data-max="15">5-15</button>
-            <button data-min="15" data-max="30">15-30</button>
-            <button data-min="30" data-max="">大于 30</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <div class="range-filter" data-min="transportFeeMin" data-max="transportFeeMax">
-          <button type="button" class="range-trigger">运费：全部</button>
-          <div class="range-popover">
-            <button data-min="" data-max="">全部</button>
-            <button data-min="" data-max="0">包邮/0</button>
-            <button data-min="0" data-max="5">0-5</button>
-            <button data-min="5" data-max="10">5-10</button>
-            <button data-min="10" data-max="">大于 10</button>
-            <div class="custom-range"><input placeholder="最小"><span>-</span><input placeholder="最大"></div>
-            <button class="confirm-range">确认</button>
-          </div>
-        </div>
-
-        <input id="soldMin" type="hidden"><input id="soldMax" type="hidden">
-        <input id="saleAmountMin" type="hidden"><input id="saleAmountMax" type="hidden">
-        <input id="priceMin" type="hidden"><input id="priceMax" type="hidden">
-        <input id="commissionMin" type="hidden"><input id="commissionMax" type="hidden">
-        <input id="authorMin" type="hidden"><input id="authorMax" type="hidden">
-        <input id="ratingMin" type="hidden"><input id="ratingMax" type="hidden">
-        <input id="basePriceMin" type="hidden"><input id="basePriceMax" type="hidden">
-        <input id="transportFeeMin" type="hidden"><input id="transportFeeMax" type="hidden">
+        <div id="activeFilters" class="active-filters"></div>
       </section>
 
       <div class="sidebar-actions">
@@ -241,6 +118,10 @@
     <div class="dialog-head"><h3>商品图片</h3><button id="closeImage">关闭</button></div>
     <img id="largeImage" class="large-image" src="" alt="">
   </dialog>
+  <dialog id="filterDialog" class="filter-dialog">
+    <div class="dialog-head"><h3>添加筛选条件</h3><button id="closeFilterDialog" type="button">关闭</button></div>
+    <div id="filterOptions" class="filter-options"></div>
+  </dialog>
   <div id="toast" class="toast"></div>
 
   <script>
@@ -248,6 +129,36 @@
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
     const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
     const $ = (id) => document.getElementById(id);
+    const filterDefinitions = [
+      { key: 'dateRecord', label: '采集日期', type: 'dateRange', startId: 'dateStart', endId: 'dateEnd', startLabel: '采集开始', endLabel: '采集结束' },
+      { key: 'launchTime', label: '上架时间', type: 'dateRange', startId: 'launchStart', endId: 'launchEnd', startLabel: '上架开始', endLabel: '上架结束' },
+      { key: 'commission', label: '佣金比例', type: 'range', minId: 'commissionMin', maxId: 'commissionMax', suffix: '%', placeholderMin: '最低佣金', placeholderMax: '最高佣金' },
+      { key: 'author', label: '达人数量', type: 'range', minId: 'authorMin', maxId: 'authorMax', placeholderMin: '最少达人', placeholderMax: '最多达人' },
+      { key: 'productCardRatio', label: '商品卡比例', type: 'range', minId: 'productCardRatioMin', maxId: 'productCardRatioMax', suffix: '%', placeholderMin: '最低比例', placeholderMax: '最高比例' },
+      { key: 'transportFee', label: '运费', type: 'range', minId: 'transportFeeMin', maxId: 'transportFeeMax', placeholderMin: '最低运费', placeholderMax: '最高运费' },
+      { key: 'sold', label: '总销量', type: 'range', minId: 'soldMin', maxId: 'soldMax', placeholderMin: '最低销量', placeholderMax: '最高销量' },
+      { key: 'videoRatio', label: '视频成交占比', type: 'range', minId: 'videoRatioMin', maxId: 'videoRatioMax', suffix: '%', placeholderMin: '最低占比', placeholderMax: '最高占比' },
+      { key: 'rating', label: '评分', type: 'range', minId: 'ratingMin', maxId: 'ratingMax', placeholderMin: '最低评分', placeholderMax: '最高评分' },
+      { key: 'price', label: '售价范围', type: 'range', minId: 'priceMin', maxId: 'priceMax', placeholderMin: '最低售价', placeholderMax: '最高售价' },
+      { key: 'basePrice', label: '定价范围', type: 'range', minId: 'basePriceMin', maxId: 'basePriceMax', placeholderMin: '最低定价', placeholderMax: '最高定价' },
+      {
+        key: 'auditStatus',
+        label: '商品状态',
+        type: 'select',
+        id: 'auditStatus',
+        options: [
+          ['', '全部'],
+          ['PENDING', '待选中'],
+          ['REVIEWING', '待复核'],
+          ['READY', '待上架'],
+          ['PUBLISHED', '已上架'],
+          ['OTHER', '其他'],
+        ],
+      },
+    ];
+    const filterByKey = Object.fromEntries(filterDefinitions.map(item => [item.key, item]));
+    const activeFilterKeys = new Set();
+    const filterValues = {};
     const paramMap = {
       keyword: 'keyword', dateStart: 'date_start', dateEnd: 'date_end',
       launchStart: 'launch_start', launchEnd: 'launch_end', auditStatus: 'audit_status',
@@ -258,6 +169,8 @@
       authorMin: 'author_min', authorMax: 'author_max', ratingMin: 'rating_min', ratingMax: 'rating_max',
       basePriceMin: 'base_price_min', basePriceMax: 'base_price_max',
       transportFeeMin: 'transport_fee_min', transportFeeMax: 'transport_fee_max',
+      productCardRatioMin: 'product_card_ratio_min', productCardRatioMax: 'product_card_ratio_max',
+      videoRatioMin: 'video_ratio_min', videoRatioMax: 'video_ratio_max',
       salesStart: 'sales_start', salesEnd: 'sales_end'
     };
 
@@ -276,8 +189,6 @@
       btn.classList.add('active');
       renderItems();
     }));
-    document.querySelectorAll('.range-filter').forEach(initRangeFilter);
-
     $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
     $('topSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
     $('sortBy').addEventListener('change', () => { state.sortBy = $('sortBy').value; state.page = 1; loadProducts(); });
@@ -289,29 +200,96 @@
     $('copyReadyBtn').addEventListener('click', copyReadyLinks);
     $('closeDetail').addEventListener('click', () => $('detailDialog').close());
     $('closeImage').addEventListener('click', () => $('imageDialog').close());
+    initCustomFilters();
 
-    function initRangeFilter(box) {
-      const trigger = box.querySelector('.range-trigger');
-      const popover = box.querySelector('.range-popover');
-      const minId = box.dataset.min;
-      const maxId = box.dataset.max;
-      trigger.addEventListener('click', () => {
-        document.querySelectorAll('.range-filter.open').forEach(item => { if (item !== box) item.classList.remove('open'); });
-        box.classList.toggle('open');
+    function initCustomFilters() {
+      $('addFilterBtn').addEventListener('click', () => {
+        renderFilterOptions();
+        $('filterDialog').showModal();
       });
-      popover.querySelectorAll('button[data-min]').forEach(btn => btn.addEventListener('click', () => {
-        $(minId).value = btn.dataset.min;
-        $(maxId).value = btn.dataset.max;
-        trigger.textContent = `${trigger.textContent.split('：')[0]}：${btn.textContent}`;
-        box.classList.remove('open');
+      $('closeFilterDialog').addEventListener('click', () => $('filterDialog').close());
+      renderActiveFilters();
+    }
+
+    function renderFilterOptions() {
+      $('filterOptions').innerHTML = filterDefinitions.map(def => `
+        <button type="button" data-filter-key="${def.key}" ${activeFilterKeys.has(def.key) ? 'disabled' : ''}>
+          <span>${def.label}</span>
+          <small>${activeFilterKeys.has(def.key) ? '已添加' : filterOptionHint(def)}</small>
+        </button>
+      `).join('');
+      document.querySelectorAll('[data-filter-key]').forEach(btn => btn.addEventListener('click', () => {
+        addFilter(btn.dataset.filterKey);
+        $('filterDialog').close();
+        renderFilterOptions();
       }));
-      popover.querySelector('.confirm-range').addEventListener('click', () => {
-        const inputs = popover.querySelectorAll('.custom-range input');
-        $(minId).value = inputs[0].value.trim();
-        $(maxId).value = inputs[1].value.trim();
-        trigger.textContent = `${trigger.textContent.split('：')[0]}：${$(minId).value || '最小'}-${$(maxId).value || '最大'}`;
-        box.classList.remove('open');
+    }
+
+    function filterOptionHint(def) {
+      if (def.type === 'dateRange') return '输入开始时间与结束时间';
+      if (def.type === 'select') return '选择状态';
+      return '输入最小值与最大值';
+    }
+
+    function addFilter(key) {
+      activeFilterKeys.add(key);
+      renderActiveFilters();
+    }
+
+    function removeFilter(key) {
+      const def = filterByKey[key];
+      activeFilterKeys.delete(key);
+      filterInputIds(def).forEach(id => delete filterValues[id]);
+      renderActiveFilters();
+    }
+
+    function renderActiveFilters() {
+      if (!activeFilterKeys.size) {
+        $('activeFilters').innerHTML = '<div class="empty-filter">点击“添加筛选条件”开始组合筛选</div>';
+        return;
+      }
+      $('activeFilters').innerHTML = Array.from(activeFilterKeys).map(key => filterCardTemplate(filterByKey[key])).join('');
+      document.querySelectorAll('[data-remove-filter]').forEach(btn => btn.addEventListener('click', () => removeFilter(btn.dataset.removeFilter)));
+      document.querySelectorAll('[data-filter-input]').forEach(input => {
+        const rememberValue = () => { filterValues[input.id] = input.value; };
+        input.addEventListener('input', rememberValue);
+        input.addEventListener('change', rememberValue);
       });
+    }
+
+    function filterCardTemplate(def) {
+      return `<div class="filter-card">
+        <div class="filter-card-head"><strong>${def.label}</strong><button type="button" data-remove-filter="${def.key}">移除</button></div>
+        ${filterControlTemplate(def)}
+      </div>`;
+    }
+
+    function filterControlTemplate(def) {
+      if (def.type === 'dateRange') {
+        return `<div class="filter-control two-cols">
+          <label>${def.startLabel}<input data-filter-input id="${def.startId}" type="date" value="${escapeHtml(filterValues[def.startId] || '')}"></label>
+          <label>${def.endLabel}<input data-filter-input id="${def.endId}" type="date" value="${escapeHtml(filterValues[def.endId] || '')}"></label>
+        </div>`;
+      }
+      if (def.type === 'select') {
+        return `<label class="filter-control">${def.label}
+          <select data-filter-input id="${def.id}">
+            ${def.options.map(([value, label]) => `<option value="${value}" ${(filterValues[def.id] || '') === value ? 'selected' : ''}>${label}</option>`).join('')}
+          </select>
+        </label>`;
+      }
+      return `<div class="filter-control range-row">
+        <input data-filter-input id="${def.minId}" inputmode="decimal" placeholder="${def.placeholderMin || '最小值'}${def.suffix || ''}" value="${escapeHtml(filterValues[def.minId] || '')}">
+        <span>-</span>
+        <input data-filter-input id="${def.maxId}" inputmode="decimal" placeholder="${def.placeholderMax || '最大值'}${def.suffix || ''}" value="${escapeHtml(filterValues[def.maxId] || '')}">
+      </div>`;
+    }
+
+    function filterInputIds(def) {
+      if (!def) return [];
+      if (def.type === 'dateRange') return [def.startId, def.endId];
+      if (def.type === 'select') return [def.id];
+      return [def.minId, def.maxId];
     }
 
     function initSalesRangeFilter() {
@@ -385,8 +363,8 @@
         if (!res.ok) return false;
         const json = await res.json();
         if (!json.ok || !json.data.latest_date) return false;
-        $('dateStart').value = json.data.latest_date.slice(0, 10);
-        $('dateEnd').value = json.data.latest_date.slice(0, 10);
+        setFilterValue('dateStart', json.data.latest_date.slice(0, 10));
+        setFilterValue('dateEnd', json.data.latest_date.slice(0, 10));
         return true;
       } catch (error) {
         console.warn('latest date load failed', error);
@@ -394,8 +372,13 @@
       }
     }
     async function loadDefaultDateAndData() {
-      await setLatestCollectionDate();
+      setFilterValue('dateStart', '');
+      setFilterValue('dateEnd', '');
       await loadAll();
+    }
+    function setFilterValue(id, value) {
+      filterValues[id] = value;
+      if ($(id)) $(id).value = value;
     }
     async function loadAll() { await Promise.all([loadStats(), loadProducts()]); }
     function buildParams() {
@@ -415,7 +398,7 @@
       const res = await fetch(`/api/products?${buildParams()}`);
       const json = await res.json();
       if (!json.ok) return showToast(json.error || '加载失败');
-      state.items = json.data.items;
+      state.items = dedupeLatestItems(json.data.items || []);
       state.total = json.data.total;
       state.period = json.data.period;
       state.periodLabel = json.data.period_label || '近7天';
@@ -424,6 +407,23 @@
         : `${state.periodLabel}数据`;
       renderItems();
       renderPager();
+    }
+    function dedupeLatestItems(items) {
+      const latestByProduct = new Map();
+      items.forEach(item => {
+        const key = String(item.product_id || '');
+        if (!key) return;
+        const current = latestByProduct.get(key);
+        if (!current || compareDateRecord(item.date_record, current.date_record) > 0) {
+          latestByProduct.set(key, item);
+        }
+      });
+      return Array.from(latestByProduct.values());
+    }
+    function compareDateRecord(left, right) {
+      const leftTime = Date.parse(String(left || '').replaceAll('/', '-')) || 0;
+      const rightTime = Date.parse(String(right || '').replaceAll('/', '-')) || 0;
+      return leftTime - rightTime;
     }
     async function loadStats() {
       const params = buildParams();
@@ -463,8 +463,8 @@
     function rowTemplate(item) {
       return `<tr>
         <td><button class="image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img class="thumb" src="${item.image_url}" alt=""></button></td>
-        <td class="title-cell"><strong>${escapeHtml(item.title)}</strong><span>${item.product_id} · ${item.date_record || ''}</span></td>
-        <td>${escapeHtml(item.price)}</td><td>${escapeHtml(item.rating)}</td><td>${escapeHtml(item.commission_rate)}</td>
+        <td class="title-cell">${productTitleCell(item)}</td>
+        <td>${escapeHtml(item.price)}</td><td>${escapeHtml(item.rating)}</td><td>${escapeHtml(formatPlainNumber(item.commission_rate))}</td>
         <td>${escapeHtml(item.sold_count)}</td><td>${escapeHtml(item.total_sold_count)}</td><td>${escapeHtml(item.sale_amount)}</td><td>${escapeHtml(item.sales_growth)}</td>
         <td>${escapeHtml(item.author_count)}</td><td>${escapeHtml(item.video_ratio)}</td><td>${escapeHtml(item.product_card_ratio)}</td>
         <td>${escapeHtml(item.launch_time)}</td><td>${gradeBadge(item.ip_grade)}${reasonPreview('IP判断原因', item.ip_reason)}</td>
@@ -509,6 +509,21 @@
       document.querySelectorAll('[data-image]').forEach(btn => btn.addEventListener('click', () => openImage(btn.dataset.image, btn.dataset.title)));
       document.querySelectorAll('[data-reason-title]').forEach(btn => btn.addEventListener('click', () => openReason(btn.dataset.reasonTitle, btn.dataset.reasonText)));
       document.querySelectorAll('[data-status-product]').forEach(select => select.addEventListener('change', () => updateStatus(select)));
+      document.querySelectorAll('[data-product-title]').forEach(el => {
+        el.addEventListener('mouseenter', () => showProductTitleTooltip(el));
+        el.addEventListener('mousemove', () => positionProductTitleTooltip(el));
+        el.addEventListener('mouseleave', hideProductTitleTooltip);
+      });
+      document.querySelectorAll('[data-copy-title]').forEach(btn => btn.addEventListener('click', event => {
+        event.stopPropagation();
+        event.preventDefault();
+        copyProductTitle(btn);
+      }));
+      document.querySelectorAll('[data-translate-title]').forEach(btn => btn.addEventListener('click', event => {
+        event.stopPropagation();
+        event.preventDefault();
+        translateProductTitle(btn);
+      }));
     }
     function openImage(src, title) {
       $('largeImage').src = src;
@@ -544,7 +559,9 @@
     }
     async function resetFilters() {
       Object.keys(paramMap).forEach(id => { if ($(id)) $(id).value = ''; });
-      document.querySelectorAll('.range-trigger').forEach(btn => { btn.textContent = `${btn.textContent.split('：')[0]}：全部`; });
+      Object.keys(filterValues).forEach(id => delete filterValues[id]);
+      activeFilterKeys.clear();
+      renderActiveFilters();
       $('period').value = '7d'; $('sortBy').value = 'date_record'; state.sortBy = 'date_record'; state.sortOrder = 'desc'; $('salesStart').value = ''; $('salesEnd').value = ''; $('salesRangeTrigger').textContent = '过去7天'; $('salesCustomRange').classList.remove('visible'); state.page = 1; await loadDefaultDateAndData();
     }
     function renderPager() {
@@ -559,12 +576,133 @@
       const url = state.source === 'kalodata' ? buildTikTokShopUrl(item.product_id) : item.platform_url;
       return `<a class="tiktok-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="点击按钮可以跳转到tiktok商品详细页" aria-label="点击按钮可以跳转到tiktok商品详细页"><svg class="tiktok-logo" viewBox="0 0 448 512" aria-hidden="true"><path d="M448 210a210 210 0 0 1-123-39v178a163 163 0 1 1-140-161v90a75 75 0 1 0 52 71V0h88a121 121 0 0 0 2 22 122 122 0 0 0 54 80 121 121 0 0 0 67 20z"/></svg></a>`;
     }
+    function productTitleCell(item) {
+      const title = item.title || '';
+      return `<div class="product-title-row">
+        <button type="button" class="product-title-text" data-product-title="${escapeHtml(title)}">${escapeHtml(title)}</button>
+        <div class="product-title-actions">
+          <button type="button" class="icon-button" data-copy-title="${escapeHtml(title)}" title="Copy title" aria-label="Copy title">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="1.5"></rect><path d="M5 15H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v1"></path></svg>
+          </button>
+          <button type="button" class="icon-button" data-translate-title="${escapeHtml(title)}" title="Translate to Chinese" aria-label="Translate to Chinese">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h9"></path><path d="M9 3v2c0 4-2 7-5 9"></path><path d="M5 9c1.1 2.2 3 4.1 5.5 5.5"></path><path d="M12 20l4-9 4 9"></path><path d="M14 16h4"></path></svg>
+          </button>
+        </div>
+      </div><span>${escapeHtml(item.product_id)} · ${escapeHtml(item.date_record || '')}</span><small class="title-translation"></small>`;
+    }
+    function ensureProductTitleTooltip() {
+      let tooltip = $('productTitleTooltip');
+      if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'productTitleTooltip';
+        tooltip.className = 'product-title-tooltip';
+        document.body.appendChild(tooltip);
+      }
+      return tooltip;
+    }
+    function showProductTitleTooltip(el) {
+      const tooltip = ensureProductTitleTooltip();
+      tooltip.textContent = el.dataset.productTitle || '';
+      tooltip.classList.add('show');
+      positionProductTitleTooltip(el);
+    }
+    function positionProductTitleTooltip(el) {
+      const tooltip = ensureProductTitleTooltip();
+      const rect = el.getBoundingClientRect();
+      const left = Math.min(Math.max(12, rect.left), window.innerWidth - tooltip.offsetWidth - 12);
+      const top = Math.max(12, rect.top - tooltip.offsetHeight - 10);
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+    }
+    function hideProductTitleTooltip() {
+      const tooltip = $('productTitleTooltip');
+      if (tooltip) tooltip.classList.remove('show');
+    }
+    function copyProductTitle(btn) {
+      const text = btn.dataset.copyTitle || '';
+      if (copyTextLegacy(text)) {
+        showToast('\u5546\u54c1\u540d\u5df2\u590d\u5236');
+        return;
+      }
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text)
+          .then(() => showToast('\u5546\u54c1\u540d\u5df2\u590d\u5236'))
+          .catch(() => showToast('\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u4e2d\u540e\u590d\u5236'));
+        return;
+      }
+      showToast('\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u4e2d\u540e\u590d\u5236');
+    }
+    function copyTextLegacy(text) {
+      const input = document.createElement('textarea');
+      input.value = text;
+      input.setAttribute('readonly', '');
+      input.style.position = 'fixed';
+      input.style.top = '0';
+      input.style.left = '-9999px';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.focus();
+      input.select();
+      input.setSelectionRange(0, input.value.length);
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (error) {
+        ok = false;
+      }
+      document.body.removeChild(input);
+      return ok;
+    }
+    async function translateProductTitle(btn) {
+      const title = btn.dataset.translateTitle || '';
+      const target = btn.closest('.title-cell')?.querySelector('.title-translation');
+      btn.disabled = true;
+      if (target) target.textContent = '\u7ffb\u8bd1\u4e2d...';
+      try {
+        const res = await fetch('/api/translate-title', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: title}),
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '\u7ffb\u8bd1\u5931\u8d25');
+        if (target) target.textContent = json.data.translation;
+        showToast('\u5df2\u7ffb\u8bd1\u6210\u4e2d\u6587');
+      } catch (error) {
+        if (target) target.textContent = '';
+        showToast(error.message || '\u7ffb\u8bd1\u5931\u8d25');
+      } finally {
+        btn.disabled = false;
+      }
+    }
     function buildTikTokShopUrl(productId) {
       const slug = 'mens-athletic-t-shirt-by-brand-lightweight-quick-dry-crew-neck-tops';
       return `https://www.tiktok.com/shop/pdp/${slug}/${encodeURIComponent(productId)}?source=ecommerce_store&region=US`;
     }
     function statusSelect(item) { return `<select class="status-select" data-status-product="${item.product_id}" data-status-date="${item.date_record}" data-previous="${item.audit_status}">${Object.entries(statusText).map(([value, label]) => `<option value="${value}" ${item.audit_status === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`; }
     function shortText(text, max) { return !text ? '' : (text.length > max ? text.slice(0, max) + '...' : text); }
+    function formatPlainNumber(value) {
+      const text = String(value ?? '');
+      const trimmed = text.trim();
+      if (!/^[+-]?(?:\d+\.?\d*|\.\d+)e[+-]?\d+$/i.test(trimmed)) return text;
+      const sign = trimmed.startsWith('-') ? '-' : '';
+      const unsigned = trimmed.replace(/^[+-]/, '');
+      const [coefficient, exponentText] = unsigned.toLowerCase().split('e');
+      const exponent = Number(exponentText);
+      let digits = coefficient.replace('.', '');
+      const pointIndex = coefficient.includes('.') ? coefficient.indexOf('.') : coefficient.length;
+      let decimalIndex = pointIndex + exponent;
+      while (digits.length > 1 && digits.startsWith('0')) {
+        digits = digits.slice(1);
+        decimalIndex -= 1;
+      }
+      let plain;
+      if (decimalIndex <= 0) plain = `0.${'0'.repeat(Math.abs(decimalIndex))}${digits}`;
+      else if (decimalIndex >= digits.length) plain = digits + '0'.repeat(decimalIndex - digits.length);
+      else plain = `${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
+      plain = plain.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
+      return sign + plain;
+    }
     function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'}[ch])); }
     function showToast(text) { $('toast').textContent = text; $('toast').classList.add('show'); setTimeout(() => $('toast').classList.remove('show'), 2200); }
     setSalesRangePreset('7d');

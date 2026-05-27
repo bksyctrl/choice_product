@@ -2,16 +2,18 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pymysql
+import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, send_file
 from flask_cors import CORS
@@ -25,9 +27,12 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from analyze_single_product import (  # noqa: E402
+    MINIMAX_BASE_URL,
+    MINIMAX_MODEL,
     PRODUCT_SOURCES as AI_PRODUCT_SOURCES,
     build_input_snapshot,
     load_product as load_ai_product,
+    resolve_minimax_api_key,
     run_analysis,
     run_material_prefilter,
 )
@@ -188,7 +193,7 @@ def create_app():
         page = clamp_int(request.args.get("page"), 1, 1, 100000)
         page_size = clamp_int(request.args.get("page_size"), 30, 10, 100)
         meta = SOURCES[source]
-        where, params = build_filters(meta, request.args, latest_by_default=True)
+        where, params = build_filters(meta, request.args)
         order_sql = build_order(request.args.get("sort_by"), request.args.get("sort_order"))
         offset = (page - 1) * page_size
 
@@ -235,7 +240,7 @@ def create_app():
     def stats():
         source = normalize_source(request.args.get("source"))
         meta = SOURCES[source]
-        where, params = build_filters(meta, request.args, latest_by_default=True)
+        where, params = build_filters(meta, request.args)
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*) AS total FROM `{meta['table']}` WHERE {' AND '.join(where)}", params)
             total = int(cursor.fetchone()["total"])
@@ -279,6 +284,24 @@ def create_app():
             "source": source,
             "latest_date": stringify(row.get("latest_date") if row else None),
         })
+
+    @app.post("/api/translate-title")
+    def translate_title():
+        payload = request.get_json(silent=True) or {}
+        text = stringify(payload.get("text")).strip()
+        if not text:
+            return api_error("text 不能为空", 400)
+        if len(text) > 800:
+            return api_error("商品名过长，无法翻译", 400)
+        try:
+            translation = translate_text_to_chinese(text)
+        except RuntimeError as exc:
+            translation = fallback_translate_title(text)
+            return api_ok({"source": text, "translation": translation, "provider": "local_fallback", "warning": str(exc)})
+        except requests.RequestException as exc:
+            translation = fallback_translate_title(text)
+            return api_ok({"source": text, "translation": translation, "provider": "local_fallback", "warning": str(exc)})
+        return api_ok({"source": text, "translation": translation, "provider": "minimax"})
 
     @app.get("/api/products/<source>/<product_id>")
     def product_detail(source, product_id):
@@ -390,6 +413,112 @@ def create_app():
 
 def db():
     return pymysql.connect(**DB_CONFIG)
+
+
+def translate_text_to_chinese(text):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY，无法翻译商品名")
+    url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MINIMAX_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是电商商品标题翻译助手。只输出简体中文译文，不要解释。",
+                },
+                {
+                    "role": "user",
+                    "content": f"请把下面的英文商品名翻译成简体中文，保留品牌名、型号和关键规格：\n{text}",
+                },
+            ],
+            "temperature": 0,
+            "stream": False,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    try:
+        translation = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("翻译服务返回格式异常") from exc
+    if not translation:
+        raise RuntimeError("翻译服务返回为空")
+    return translation
+
+
+TITLE_TRANSLATION_PHRASES = [
+    ("wireless charging", "无线充电"),
+    ("magsafe compatible", "兼容 MagSafe"),
+    ("shockproof", "防摔"),
+    ("drop resistant", "防摔"),
+    ("anti drop", "防摔"),
+    ("screen protector", "屏幕保护膜"),
+    ("camera lens protector", "摄像头镜头保护膜"),
+    ("camera protection", "摄像头保护"),
+    ("full coverage", "全覆盖"),
+    ("protective film", "保护膜"),
+    ("tempered glass", "钢化玻璃"),
+    ("phone case", "手机壳"),
+    ("case cover", "保护壳"),
+    ("protective cover", "保护壳"),
+    ("airbag", "气囊"),
+    ("magnetic", "磁吸"),
+    ("transparent", "透明"),
+    ("clear", "透明"),
+    ("glitter", "闪粉"),
+    ("sparkly", "闪亮"),
+    ("aesthetic", "高颜值"),
+    ("solid color", "纯色"),
+    ("jelly", "果冻质感"),
+    ("matte", "磨砂"),
+    ("soft", "柔软"),
+    ("hard", "硬壳"),
+    ("slim", "轻薄"),
+    ("durable", "耐用"),
+    ("compatible with", "适用于"),
+    ("suitable for", "适用于"),
+    ("for iphone", "适用于 iPhone"),
+    ("for samsung", "适用于 Samsung"),
+    ("women", "女士"),
+    ("men", "男士"),
+    ("cover", "保护壳"),
+    ("case", "壳"),
+    ("protector", "保护膜"),
+    ("charging", "充电"),
+    ("privacy", "防窥"),
+    ("transparent", "透明"),
+    ("black", "黑色"),
+    ("white", "白色"),
+    ("pink", "粉色"),
+    ("blue", "蓝色"),
+    ("green", "绿色"),
+    ("purple", "紫色"),
+    ("red", "红色"),
+    ("gray", "灰色"),
+    ("grey", "灰色"),
+    ("gold", "金色"),
+    ("silver", "银色"),
+    ("brown", "棕色"),
+]
+
+
+def fallback_translate_title(text):
+    translated = stringify(text)
+    for english, chinese in TITLE_TRANSLATION_PHRASES:
+        translated = re.sub(rf"\b{re.escape(english)}\b", chinese, translated, flags=re.IGNORECASE)
+    translated = re.sub(r"\s+", " ", translated).strip()
+    translated = re.sub(r"\s+([,;:)\]])", r"\1", translated)
+    translated = re.sub(r"([(\[])\s+", r"\1", translated)
+    translated = re.sub(r"\s*-\s*", " - ", translated)
+    return translated or stringify(text)
 
 
 def api_ok(data):
@@ -514,6 +643,8 @@ def build_filters(meta, args, latest_by_default=False):
     add_number_range_filter(where, params, meta.get("price"), args.get("price_min"), args.get("price_max"))
     add_number_range_filter(where, params, meta.get("base_price"), args.get("base_price_min"), args.get("base_price_max"))
     add_number_range_filter(where, params, meta.get("transport_fee"), args.get("transport_fee_min"), args.get("transport_fee_max"))
+    add_ratio_range_filter(where, params, meta, args, "视频", args.get("video_ratio_min"), args.get("video_ratio_max"), direct_field=meta.get("video_ratio"))
+    add_ratio_range_filter(where, params, meta, args, "商品卡", args.get("product_card_ratio_min"), args.get("product_card_ratio_max"), direct_field=meta.get("product_card_ratio"))
     add_range_filter(where, params, "launch_time", args.get("launch_start"), args.get("launch_end")) if has_launch_time(meta) else None
     keyword = (args.get("keyword") or "").strip()
     if keyword:
@@ -541,6 +672,41 @@ def add_number_range_filter(where, params, field, start, end):
     if end:
         where.append(f"{expr} <= %s")
         params.append(end)
+
+
+def add_ratio_range_filter(where, params, meta, args, ratio_name, start, end, direct_field=None):
+    if not start and not end:
+        return
+    if direct_field:
+        add_number_range_filter(where, params, direct_field, start, end)
+        return
+
+    field = get_distribution_filter_field(meta, args)
+    if not field:
+        return
+    expr = distribution_ratio_number_expr(field)
+    if start:
+        where.append(f"JSON_VALID(`{field}`) AND {expr} >= %s")
+        params.extend([ratio_name, start])
+    if end:
+        where.append(f"JSON_VALID(`{field}`) AND {expr} <= %s")
+        params.extend([ratio_name, end])
+
+
+def get_distribution_filter_field(meta, args):
+    period = normalize_period(args.get("period"))
+    if period == "custom":
+        period = "7d"
+    field = meta.get(f"distribution_{period}")
+    return field or meta.get("distribution_7d") or meta.get("distribution_30d")
+
+
+def distribution_ratio_number_expr(field):
+    search_path = f"JSON_UNQUOTE(JSON_SEARCH(`{field}`, 'one', %s, NULL, '$[*].name'))"
+    value_path = f"REPLACE({search_path}, '.name', '.percentage')"
+    value_expr = f"JSON_UNQUOTE(JSON_EXTRACT(`{field}`, {value_path}))"
+    clean_expr = f"REPLACE(REPLACE({value_expr}, '%%', ''), ',', '')"
+    return f"CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4))"
 
 
 def add_eq_filter(where, params, field, value):
@@ -590,7 +756,7 @@ def build_order(sort_by, sort_order):
     numeric_keys = {"sold", "sale_amount", "rating", "price", "author_count"}
     if sort_by in numeric_keys:
         # 移除常见非数字符号并转换为 DECIMAL 排序
-        clean_expr = f"REPLACE(REPLACE(REPLACE({raw_field}, '$', ''), '%', ''), ',', '')"
+        clean_expr = f"REPLACE(REPLACE(REPLACE({raw_field}, '$', ''), '%%', ''), ',', '')"
         return f"ORDER BY CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4)) {direction}"
 
     return f"ORDER BY {raw_field} {direction}"
@@ -613,7 +779,7 @@ def normalize_product_row(source, row, sales_period):
         "date_record": row.get("date_record"),
         "title": row.get("title") or "",
         "image_url": row.get("image_url"),
-        "price": stringify(row.get("price_view")),
+        "price": normalize_price_display(row.get("price_view"), row.get("base_price_view")),
         "base_price": stringify(row.get("base_price_view")),
         "rating": stringify(row.get("rating_view")),
         "commission_rate": stringify(row.get("commission_rate_view")),
@@ -751,6 +917,28 @@ def ratio_from_distribution(distribution, name):
     return ""
 
 
+PRICE_CURRENCY_WORDS_RE = re.compile(
+    r"\b(?:US|USD|EUR|GBP|CNY|RMB|AUD|CAD|HKD|SGD|MXN)\b",
+    re.IGNORECASE,
+)
+PRICE_ALLOWED_CHARS_RE = re.compile(r"^[\s\d.,$€£¥￥%+\-~–—/()]+$")
+
+
+def normalize_price_display(*values):
+    for value in values:
+        text = stringify(value).strip()
+        if is_price_display(text):
+            return text
+    return ""
+
+
+def is_price_display(text):
+    if not text or not any(char.isdigit() for char in text):
+        return False
+    without_currency_words = PRICE_CURRENCY_WORDS_RE.sub("", text)
+    return bool(PRICE_ALLOWED_CHARS_RE.fullmatch(without_currency_words))
+
+
 def normalize_detail(source, row):
     meta = SOURCES[source]
     product_id = stringify(row.get(meta["id"]))
@@ -854,13 +1042,28 @@ def parse_json(value):
         return None
 
 
+def format_decimal_plain(value):
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def stringify(value):
     if value is None:
         return ""
     if isinstance(value, Decimal):
-        return str(value.normalize())
+        return format_decimal_plain(value)
     if isinstance(value, (datetime, date)):
         return value.strftime("%Y-%m-%d %H:%M:%S") if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, str) and "e" in value.lower():
+        stripped = value.strip()
+        try:
+            decimal_value = Decimal(stripped)
+        except InvalidOperation:
+            return value
+        if decimal_value.is_finite():
+            return format_decimal_plain(decimal_value)
     return str(value)
 
 
