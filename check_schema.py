@@ -1,33 +1,23 @@
-import pymysql
 import os
-import json
 from dotenv import load_dotenv
+import pymysql
+import json
 
 load_dotenv()
+conn = pymysql.connect(
+    host=os.getenv("DB_HOST", "127.0.0.1"),
+    port=int(os.getenv("DB_PORT", 3306)),
+    user=os.getenv("DB_USER", "root"),
+    password=os.getenv("DB_PASSWORD", ""),
+    database=os.getenv("DB_NAME", "choice_product"),
+    cursorclass=pymysql.cursors.DictCursor
+)
 
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "192.168.0.168"),
-    "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "ITaimysql"),
-    "password": os.getenv("DB_PASSWORD", "Ai12345678@"),
-    "database": os.getenv("DB_NAME", "ecommerce_workflow"),
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-}
-
-def check_schema():
-    conn = pymysql.connect(**DB_CONFIG)
-    try:
-        with conn.cursor() as cursor:
-            tables = ['fastmoss_product_aggregate', 'fastmoss_product_rank_aggregate', 'kalodata_youwei_product']
-            for t in tables:
-                print(f"--- {t} ---")
-                cursor.execute(f"DESCRIBE {t}")
-                for row in cursor.fetchall():
-                    print(f"{row['Field']}: {row['Type']}")
-                print("\n")
-    finally:
-        conn.close()
-
-if __name__ == "__main__":
-    check_schema()
+with conn.cursor() as cursor:
+    cursor.execute("SELECT overview_7d FROM cp_kalodata WHERE overview_7d IS NOT NULL LIMIT 1")
+    row = cursor.fetchone()
+    print("Kalodata:", row['overview_7d'] if row else "None")
+    
+    cursor.execute("SELECT sales_overview FROM cp_fastmoss WHERE sales_overview IS NOT NULL LIMIT 1")
+    row = cursor.fetchone()
+    print("Fastmoss:", row['sales_overview'] if row else "None")

@@ -1,130 +1,4 @@
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>选品审核平台</title>
-  <link rel="stylesheet" href="/static/styles.css">
-</head>
-<body>
-  <div class="app" id="appShell">
-    <aside class="sidebar">
-      <div class="brand">
-        <div class="brand-mark">CP</div>
-        <div>
-          <h1>选品审核</h1>
-          <p>商品筛选与上架管理</p>
-        </div>
-      </div>
 
-      <nav class="source-nav" id="sourceNav">
-        <button class="active" data-source="unified">统一表</button>
-        <button data-source="fastmoss">fastmoss</button>
-        <button data-source="kalodata">kalodata</button>
-      </nav>
-
-      <section class="filter-panel">
-        <div class="filter-panel-head">
-          <h2>自定义筛选</h2>
-          <button id="addFilterBtn" type="button">添加筛选条件</button>
-        </div>
-        <div id="activeFilters" class="active-filters"></div>
-      </section>
-
-      <div class="sidebar-actions">
-        <button id="sidebarSearchBtn" class="primary">查询</button>
-        <button id="resetFiltersBtn">重置</button>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div>
-          <h2 id="pageTitle">统一表</h2>
-          <p>采集日期决定商品快照和销量，销售周期决定周期指标口径。</p>
-        </div>
-        <div class="view-switch">
-          <button class="active" data-view="table">表格</button>
-          <button data-view="cards">卡片</button>
-        </div>
-      </header>
-
-      <section class="stats" id="stats"></section>
-
-      <section class="top-filters">
-        <label>关键词<input id="keyword" placeholder="标题搜索"></label>
-        <div class="date-range-filter" id="salesRangeFilter">
-          <label>销售日期</label>
-          <button type="button" id="salesRangeTrigger" class="date-range-trigger">过去7天</button>
-          <div class="date-range-popover">
-            <button type="button" data-sales-range="yesterday">昨日</button>
-            <button type="button" data-sales-range="7d">过去7天</button>
-            <button type="button" data-sales-range="30d">过去30天</button>
-            <button type="button" data-sales-range="custom">自定义</button>
-            <div class="date-custom-range" id="salesCustomRange">
-              <input id="salesStart" type="date">
-              <span>→</span>
-              <input id="salesEnd" type="date">
-              <button type="button" id="applySalesRange">确认</button>
-            </div>
-          </div>
-          <input id="period" type="hidden" value="7d">
-        </div>
-        <label>IP 起点<select id="ipGradeMin"><option value="">不限</option><option>E</option><option>D</option><option>C</option><option>B</option><option>A</option><option>S</option></select></label>
-        <label>IP 终点<select id="ipGradeMax"><option value="">不限</option><option>E</option><option>D</option><option>C</option><option>B</option><option>A</option><option>S</option></select></label>
-        <label>
-          材质类型
-          <select id="materialType">
-            <option value="">全部</option>
-            <option value="工厂材质">工厂材质</option>
-            <option value="非工厂材质">非工厂材质</option>
-            <option value="疑似材质">疑似材质</option>
-            <option value="其他疑似材质">其他疑似材质</option>
-          </select>
-        </label>
-        <label>材质细分<input id="materialCategories" placeholder="TPU,硅胶"></label>
-        <label>排除材质<input id="excludeMaterialCategories" placeholder="钢化膜,贴纸"></label>
-        <label>排序<select id="sortBy"><option value="date_record">采集日期</option><option value="sold">销量</option><option value="sale_amount">成交额</option><option value="rating">评分</option><option value="price">售价</option><option value="author_count">达人数量</option><option value="launch_time">上架时间</option></select></label>
-        <button id="topSearchBtn" class="primary">查询</button>
-      </section>
-
-      <section class="list-toolbar">
-        <div>
-          <strong>商品列表</strong>
-          <span id="periodHint">近7天数据</span>
-        </div>
-        <div>
-          <button id="copyReadyBtn">复制待上架链接</button>
-          <a id="exportReadyLink" class="button-link" href="/api/products/unified/export-ready-links">导出 Excel</a>
-        </div>
-      </section>
-
-      <section id="content" class="content"></section>
-
-      <footer class="pager">
-        <button id="prevPage">上一页</button>
-        <span id="pageInfo">第 1 页</span>
-        <select id="pageSize"><option>10</option><option selected>30</option><option>50</option><option>100</option></select>
-        <button id="nextPage">下一页</button>
-      </footer>
-    </main>
-  </div>
-
-  <dialog id="detailDialog">
-    <div class="dialog-head"><h3>商品详情</h3><button id="closeDetail">关闭</button></div>
-    <div id="detailBody" class="detail-body"></div>
-  </dialog>
-  <dialog id="imageDialog" class="image-dialog">
-    <div class="dialog-head"><h3>商品图片</h3><button id="closeImage">关闭</button></div>
-    <img id="largeImage" class="large-image" src="" alt="">
-  </dialog>
-  <dialog id="filterDialog" class="filter-dialog">
-    <div class="dialog-head"><h3>添加筛选条件</h3><button id="closeFilterDialog" type="button">关闭</button></div>
-    <div id="filterOptions" class="filter-options"></div>
-  </dialog>
-  <div id="toast" class="toast"></div>
-
-  <script>
     const state = { source: 'unified', view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'date_record', sortOrder: 'desc' };
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
     const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
@@ -950,11 +824,6 @@
       return `https://www.fastmoss.com/zh/e-commerce/detail/${encodeURIComponent(productId)}`;
     }
 
-    function formatPlainNumber(value) {
-      if (value === null || value === undefined) return '';
-      return String(value).replace(/%$/, '');
-    }
-
     function productTitleCell(item) {
       const title = item.title || '';
       return `<div class="product-title-row">
@@ -1067,19 +936,9 @@
       return `https://www.tiktok.com/shop/pdp/${slug}/${productId}?source=ecommerce_store&region=US`;
     }
 
-    function statusSelect(item) {
-      return `<select class="status-select" data-status-product="${item.product_id}" data-status-date="${item.date_record}" data-previous="${item.audit_status}">${Object.entries(statusText).map(([value, label]) => `<option value="${value}" ${item.audit_status === value ? 'selected' : ''}>${label}</option>`).join('')}</select>`;
-    }
-
-    function shortText(text, max) {
-      return !text ? '' : (text.length > max ? text.slice(0, max) + '...' : text);
-    }
-
     function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'}[ch])); }
     function showToast(text) { $('toast').textContent = text; $('toast').classList.add('show'); setTimeout(() => $('toast').classList.remove('show'), 2200); }
 
     setSalesRangePreset('7d');
     loadDefaultDateAndData();
-  </script>
-</body>
-</html>
+  
