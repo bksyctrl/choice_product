@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 - 选品审核</title>
+  <link rel="stylesheet" href="/static/styles.css?v=1.1.0">
+</head>
+<body class="login-page">
+  <main class="auth-view">
+    <section class="auth-panel">
+      <div class="auth-brand">
+        <div class="brand-mark">CP</div>
+        <div>
+          <h1>选品审核</h1>
+          <p id="authSubtitle">登录后进入私人选品工作台</p>
+        </div>
+      </div>
+
+      <form id="authForm">
+        <label>用户名
+          <input id="authUsername" autocomplete="username" required>
+        </label>
+        <label>密码
+          <input id="authPassword" type="password" autocomplete="current-password" required>
+        </label>
+        <label id="displayNameRow" class="hidden">展示名称
+          <input id="authDisplayName" autocomplete="nickname">
+        </label>
+        <button class="primary" id="authSubmit" type="submit">登录</button>
+        <button class="link-button" id="authModeBtn" type="button">没有账号？注册</button>
+        <div class="auth-message" id="authMessage"></div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    let mode = 'login';
+    const $ = (id) => document.getElementById(id);
+
+    $('authModeBtn').addEventListener('click', () => {
+      mode = mode === 'login' ? 'register' : 'login';
+      $('displayNameRow').classList.toggle('hidden', mode !== 'register');
+      $('authSubmit').textContent = mode === 'login' ? '登录' : '注册并登录';
+      $('authModeBtn').textContent = mode === 'login' ? '没有账号？注册' : '已有账号？登录';
+      $('authSubtitle').textContent = mode === 'login' ? '登录后进入私人选品工作台' : '创建账号后进入私人选品工作台';
+      $('authMessage').textContent = '';
+    });
+
+    $('authForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      $('authMessage').textContent = '';
+      const payload = {
+        username: $('authUsername').value.trim(),
+        password: $('authPassword').value,
+      };
+      if (mode === 'register') {
+        payload.display_name = $('authDisplayName').value.trim() || payload.username;
+      }
+      try {
+        const res = await fetch(`/api/auth/${mode}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
+          body: JSON.stringify(payload),
+        });
+        if (res.status === 404) throw new Error('后端未加载登录接口，请重启服务');
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '操作失败');
+        const next = new URLSearchParams(location.search).get('next') || '/';
+        location.href = next;
+      } catch (error) {
+        $('authMessage').textContent = error.message || '网络异常，请稍后重试';
+      }
+    });
+  </script>
+</body>
+</html>

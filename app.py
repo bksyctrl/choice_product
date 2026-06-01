@@ -15,9 +15,10 @@ from pathlib import Path
 import pymysql
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request, send_file
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session
 from flask_cors import CORS
 from openpyxl import Workbook
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 load_dotenv()
@@ -59,12 +60,16 @@ AI_DAEMON_SOURCES = [
 ]
 AI_DAEMON_ANALYSIS = os.getenv("AI_DAEMON_ANALYSIS", "both").strip().lower()
 AI_DAEMON_INTERVAL_SECONDS = int(os.getenv("AI_DAEMON_INTERVAL_SECONDS", "300"))
-AI_DAEMON_BATCH_SIZE = int(os.getenv("AI_DAEMON_BATCH_SIZE", "5"))
-AI_DAEMON_CONCURRENCY = max(1, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "5"))))
+AI_DAEMON_BATCH_SIZE = int(os.getenv("AI_DAEMON_BATCH_SIZE", "10"))
+AI_DAEMON_CONCURRENCY = max(10, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "5"))))
 AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false"
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
 FASTMOSS_ANALYSIS_REUSE_SOURCES = ("fastmoss", "fastmoss_rank")
+
+
+class ApiAuthError(Exception):
+    pass
 
 SOURCES = {
     "unified": {
@@ -147,7 +152,7 @@ SOURCES = {
         "transport_fee": None,
         "video_ratio": "近28天视频占比",
         "product_card_ratio": "近28天商品卡占比",
-        "distribution_30d": "distribution_7d",
+        "distribution_30d": None,
         "distribution_7d": "distribution_7d",
         "distribution_90d": "distribution_90d",
         "distribution_180d": "distribution_180d",
@@ -175,14 +180,89 @@ SORT_FIELDS = {
 
 def create_app():
     app = Flask(__name__, static_folder="static", template_folder="static")
-    CORS(app)
+    app.secret_key = os.getenv("SECRET_KEY", "choice-product-dev-secret")
+    CORS(app, supports_credentials=True)
+
+    @app.errorhandler(ApiAuthError)
+    def handle_auth_error(_error):
+        return api_error("未登录", 401)
 
     @app.get("/")
     def index():
         return render_template("index.html")
 
+    @app.get("/login")
+    def login_page():
+        return render_template("login.html")
+
+    @app.post("/api/auth/register")
+    def register():
+        payload = request.get_json(silent=True) or {}
+        username = stringify(payload.get("username")).strip()
+        password = stringify(payload.get("password"))
+        display_name = stringify(payload.get("display_name")).strip() or username
+        if not username or not password:
+            return api_error("用户名和密码不能为空", 400)
+        if len(username) > 64:
+            return api_error("用户名过长", 400)
+        if len(password) < 6:
+            return api_error("密码至少 6 位", 400)
+
+        password_hash = generate_password_hash(password)
+        try:
+            with db() as conn, conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO app_user (username, password_hash, display_name, role, status)
+                    VALUES (%s, %s, %s, 'USER', 'ACTIVE')
+                    """,
+                    (username, password_hash, display_name),
+                )
+                conn.commit()
+                user_id = cursor.lastrowid
+                cursor.execute(
+                    "SELECT id, username, display_name, role, status FROM app_user WHERE id = %s",
+                    (user_id,),
+                )
+                user = cursor.fetchone()
+        except pymysql.err.IntegrityError:
+            return api_error("用户名已存在", 409)
+        session["uid"] = user["id"]
+        return api_ok({"user": public_user(user)})
+
+    @app.post("/api/auth/login")
+    def login():
+        payload = request.get_json(silent=True) or {}
+        username = stringify(payload.get("username")).strip()
+        password = stringify(payload.get("password"))
+        if not username or not password:
+            return api_error("用户名和密码不能为空", 400)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, username, password_hash, display_name, role, status FROM app_user WHERE username = %s",
+                (username,),
+            )
+            user = cursor.fetchone()
+        if not user or user.get("status") != "ACTIVE" or not check_password_hash(user.get("password_hash") or "", password):
+            return api_error("用户名或密码错误", 401)
+        session["uid"] = user["id"]
+        return api_ok({"user": public_user(user)})
+
+    @app.get("/api/auth/me")
+    def auth_me():
+        user = current_user()
+        if not user:
+            return api_error("未登录", 401)
+        return api_ok({"user": public_user(user)})
+
+    @app.post("/api/auth/logout")
+    def logout():
+        session.clear()
+        return api_ok({"logged_out": True})
+
     @app.get("/api/products")
     def products():
+        require_current_user()
         source = normalize_source(request.args.get("source"))
         period = normalize_period(request.args.get("period"))
         sales_period = build_sales_period(
@@ -194,27 +274,42 @@ def create_app():
         page_size = clamp_int(request.args.get("page_size"), 30, 10, 100)
         meta = SOURCES[source]
         where, params = build_filters(meta, request.args)
-        order_sql = build_order(request.args.get("sort_by"), request.args.get("sort_order"))
+        use_sales_aggregate = True
+        order_sql = build_order(meta, request.args.get("sort_by"), request.args.get("sort_order"), sales_period, use_sales_aggregate)
         offset = (page - 1) * page_size
 
         select_sql = build_product_select(source, meta)
+        latest_join = build_latest_product_join(meta, where)
+        sales_aggregate_join = build_sales_aggregate_join(meta, where) if use_sales_aggregate else ""
+        runtime_sold_select = (
+            "sales_aggregate.aggregate_sold_count AS runtime_sold_count"
+            if use_sales_aggregate
+            else "NULL AS runtime_sold_count"
+        )
         sql = f"""
-            SELECT {select_sql}
+            SELECT {select_sql}, {runtime_sold_select}
             FROM `{meta["table"]}`
-            WHERE {" AND ".join(where)}
+            {latest_join}
+            {sales_aggregate_join}
             {order_sql}
             LIMIT %s OFFSET %s
         """
         count_sql = f"""
-            SELECT COUNT(*) AS total
-            FROM `{meta["table"]}`
-            WHERE {" AND ".join(where)}
+            SELECT COUNT(*) AS total FROM (
+                SELECT `{meta["id"]}` AS product_id
+                FROM `{meta["table"]}`
+                WHERE {" AND ".join(where)}
+                GROUP BY `{meta["id"]}`
+            ) AS latest_count
         """
 
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(count_sql, params)
             total = int(cursor.fetchone()["total"])
-            cursor.execute(sql, [*params, page_size, offset])
+            query_params = [*params]
+            if use_sales_aggregate:
+                query_params.extend(params)
+            cursor.execute(sql, [*query_params, page_size, offset])
             raw_rows = cursor.fetchall()
             attach_runtime_metrics(
                 cursor,
@@ -238,6 +333,7 @@ def create_app():
 
     @app.get("/api/products/stats")
     def stats():
+        require_current_user()
         source = normalize_source(request.args.get("source"))
         meta = SOURCES[source]
         where, params = build_filters(meta, request.args)
@@ -275,6 +371,7 @@ def create_app():
 
     @app.get("/api/products/latest-date")
     def latest_date():
+        require_current_user()
         source = normalize_source(request.args.get("source"))
         meta = SOURCES[source]
         with db() as conn, conn.cursor() as cursor:
@@ -287,6 +384,7 @@ def create_app():
 
     @app.post("/api/translate-title")
     def translate_title():
+        require_current_user()
         payload = request.get_json(silent=True) or {}
         text = stringify(payload.get("text")).strip()
         if not text:
@@ -305,6 +403,7 @@ def create_app():
 
     @app.get("/api/products/<source>/<product_id>")
     def product_detail(source, product_id):
+        require_current_user()
         source = normalize_source(source)
         meta = SOURCES[source]
         date_record = request.args.get("date_record")
@@ -325,12 +424,15 @@ def create_app():
                 params,
             )
             row = cursor.fetchone()
-        if not row:
-            return api_error("商品不存在", 404)
-        return api_ok(normalize_detail(source, row))
+            if not row:
+                return api_error("商品不存在", 404)
+            detail = normalize_detail(source, row)
+            enrich_detail_period_fields(cursor, source, meta, row, detail)
+        return api_ok(detail)
 
     @app.patch("/api/products/<source>/<product_id>/status")
     def update_status(source, product_id):
+        require_current_user()
         source = normalize_source(source)
         payload = request.get_json(silent=True) or {}
         audit_status = payload.get("audit_status")
@@ -358,12 +460,14 @@ def create_app():
 
     @app.get("/api/products/<source>/ready-links")
     def ready_links(source):
+        require_current_user()
         source = normalize_source(source)
         links = fetch_ready_links(source)
         return api_ok({"source": source, "count": len(links), "links": links})
 
     @app.get("/api/products/<source>/export-ready-links")
     def export_ready_links(source):
+        require_current_user()
         source = normalize_source(source)
         links = fetch_ready_links(source)
         wb = Workbook()
@@ -384,6 +488,7 @@ def create_app():
 
     @app.get("/api/products/<source>/<product_id>/image")
     def product_image(source, product_id):
+        require_current_user()
         source = normalize_source(source)
         meta = SOURCES[source]
         date_record = request.args.get("date_record")
@@ -408,6 +513,13 @@ def create_app():
             return api_error("图片不存在", 404)
         return serve_image_value(row["image_value"])
 
+    @app.after_request
+    def add_cache_headers(response):
+        if request.path in {"/", "/login"} or response.content_type.startswith("text/html"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
     return app
 
 
@@ -529,6 +641,37 @@ def api_error(message, status):
     return jsonify({"ok": False, "error": message}), status
 
 
+def current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, username, display_name, role, status FROM app_user WHERE id = %s",
+            (uid,),
+        )
+        user = cursor.fetchone()
+    if not user or user.get("status") != "ACTIVE":
+        return None
+    return user
+
+
+def require_current_user():
+    user = current_user()
+    if not user:
+        raise ApiAuthError()
+    return user
+
+
+def public_user(user):
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "display_name": user.get("display_name") or user.get("username"),
+        "role": user.get("role") or "USER",
+    }
+
+
 def normalize_source(source):
     source = source or "unified"
     if source not in SOURCES:
@@ -617,6 +760,36 @@ def build_product_select(source, meta):
         platform_url_expr,
         image_url_expr,
     ])
+
+
+def build_latest_product_join(meta, where):
+    return f"""
+        INNER JOIN (
+            SELECT `{meta["id"]}` AS latest_product_id, MAX(`{meta["date"]}`) AS latest_date
+            FROM `{meta["table"]}`
+            WHERE {" AND ".join(where)}
+            GROUP BY `{meta["id"]}`
+        ) AS latest_snapshot
+          ON latest_snapshot.latest_product_id = `{meta["table"]}`.`{meta["id"]}`
+         AND latest_snapshot.latest_date = `{meta["table"]}`.`{meta["date"]}`
+    """
+
+
+def build_sales_aggregate_join(meta, where):
+    sold_field = meta.get("sold")
+    if not sold_field:
+        return ""
+    sold_expr = numeric_sql_expr(f"`{sold_field}`")
+    return f"""
+        LEFT JOIN (
+            SELECT `{meta["id"]}` AS aggregate_product_id,
+                   SUM(COALESCE({sold_expr}, 0)) AS aggregate_sold_count
+            FROM `{meta["table"]}`
+            WHERE {" AND ".join(where)}
+            GROUP BY `{meta["id"]}`
+        ) AS sales_aggregate
+          ON sales_aggregate.aggregate_product_id = `{meta["table"]}`.`{meta["id"]}`
+    """
 
 
 def has_launch_time(meta):
@@ -747,17 +920,61 @@ def split_csv(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def build_order(sort_by, sort_order):
-    raw_field = SORT_FIELDS.get(sort_by or "date_record", "date_record")
+def numeric_sql_expr(expr):
+    clean_expr = expr
+    for token in ("US$", "USD", "$", "¥", "￥", "%%", ",", "，", " "):
+        clean_expr = f"REPLACE({clean_expr}, '{token}', '')"
+    return (
+        "CASE "
+        f"WHEN {clean_expr} LIKE '%%万%%' THEN CAST(NULLIF(REPLACE({clean_expr}, '万', ''), '') AS DECIMAL(20,4)) * 10000 "
+        f"ELSE CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4)) "
+        "END"
+    )
+
+
+def qualified_field(meta, field):
+    if not field:
+        return "NULL"
+    return f"`{meta['table']}`.`{field}`"
+
+
+def sort_field_expr(meta, sort_by):
+    fields = {
+        "date_record": meta["date"],
+        "sold": meta.get("sold"),
+        "total_sold": meta.get("total_sold"),
+        "sale_amount": meta.get("sale_amount"),
+        "rating": meta.get("rating"),
+        "price": meta.get("price"),
+        "commission": meta.get("commission"),
+        "author_count": meta.get("author_count"),
+        "launch_time": "launch_time" if has_launch_time(meta) else None,
+    }
+    return qualified_field(meta, fields.get(sort_by or "date_record") or meta["date"])
+
+
+def build_order(meta, sort_by, sort_order, sales_period=None, use_sales_aggregate=False):
+    raw_field = sort_field_expr(meta, sort_by)
     direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+    if sort_by == "sold" and use_sales_aggregate:
+        return f"ORDER BY COALESCE(sales_aggregate.aggregate_sold_count, 0) {direction}"
 
     # 针对数值字段，强制进行数值转换排序，处理可能存在的 $ % , 等符号
     # 防止出现字符串排序导致的 "84 > 658" 错误
-    numeric_keys = {"sold", "sale_amount", "rating", "price", "author_count"}
+    overview_metrics = {"sold": "销量", "sale_amount": "销售额", "author_count": "带货达人数"}
+    if sort_by in overview_metrics and sales_period:
+        period = sales_period["period"] if sales_period["period"] != "custom" else "7d"
+        overview_field = meta.get(f"overview_{period}")
+        if not overview_field:
+            return f"ORDER BY {numeric_sql_expr(raw_field)} {direction}"
+        overview_field_expr = qualified_field(meta, overview_field)
+        overview_expr = f"JSON_UNQUOTE(JSON_EXTRACT({overview_field_expr}, '$.\"{overview_metrics[sort_by]}\"'))"
+        return f"ORDER BY COALESCE({numeric_sql_expr(overview_expr)}, {numeric_sql_expr(raw_field)}) {direction}"
+
+    numeric_keys = {"sold", "total_sold", "sale_amount", "rating", "price", "commission", "author_count"}
     if sort_by in numeric_keys:
         # 移除常见非数字符号并转换为 DECIMAL 排序
-        clean_expr = f"REPLACE(REPLACE(REPLACE({raw_field}, '$', ''), '%%', ''), ',', '')"
-        return f"ORDER BY CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4)) {direction}"
+        return f"ORDER BY {numeric_sql_expr(raw_field)} {direction}"
 
     return f"ORDER BY {raw_field} {direction}"
 
@@ -806,22 +1023,10 @@ def normalize_product_row(source, row, sales_period):
 
 
 def attach_runtime_metrics(cursor, meta, rows, sales_period, collection_start=None, collection_end=None):
-    if meta.get("sold") != "rank_sold_count":
-        for row in rows:
-            row["sales_growth_view"] = "N/A"
-            row["runtime_sold_count"] = None
-        return
     for row in rows:
-        metrics = calculate_runtime_sales_metrics(
-            cursor,
-            meta,
-            row,
-            sales_period,
-            collection_start,
-            collection_end,
-        )
-        row["runtime_sold_count"] = metrics["current_sum"]
-        row["sales_growth_view"] = metrics["growth"]
+        if row.get("runtime_sold_count") is not None:
+            row["runtime_sold_count"] = float(row.get("runtime_sold_count") or 0)
+        row["sales_growth_view"] = "N/A"
 
 
 def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_start=None, collection_end=None):
@@ -962,8 +1167,110 @@ def normalize_detail(source, row):
         "ip_tags": parse_json(row.get("ip_tags")),
         "material_analysis": parse_json(row.get("material_analysis")),
         "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
+        "period_fields": build_detail_period_fields(source, row, meta),
         "raw_fields": raw,
     }
+
+
+def build_detail_period_fields(source, row, meta):
+    fields = {}
+    for period in ("7d", "30d", "90d", "180d"):
+        overview_field = meta.get(f"overview_{period}")
+        distribution_field = meta.get(f"distribution_{period}")
+        fields[f"overview_{period}"] = serialize_value(row.get(overview_field)) if overview_field else None
+        fields[f"distribution_{period}"] = serialize_value(row.get(distribution_field)) if distribution_field else None
+
+    if source == "kalodata" and not fields.get("overview_30d"):
+        fields["overview_30d"] = json.dumps(build_kalodata_30d_overview(row), ensure_ascii=False)
+    if source == "kalodata" and not fields.get("distribution_30d"):
+        fields["distribution_30d"] = json.dumps(build_kalodata_30d_distribution(row), ensure_ascii=False)
+    return fields
+
+
+def build_kalodata_30d_overview(row):
+    return {
+        "销售额": stringify(row.get("总成交额")),
+        "日均销售额": stringify(row.get("日均成交额")),
+        "销量": stringify(row.get("销量") or row.get("总销量")),
+        "日均销量": stringify(row.get("日均销量")),
+        "带货达人数": stringify(row.get("关联达人数")),
+        "带货视频数": stringify(row.get("带货视频数")),
+        "直播销售额": stringify(row.get("直播销售额")),
+        "视频销售额": stringify(row.get("视频成交额")),
+        "商品卡": stringify(row.get("商品卡成交额")),
+    }
+
+
+def build_kalodata_30d_distribution(row):
+    video_ratio = stringify(row.get("近28天视频占比"))
+    product_card_ratio = stringify(row.get("近28天商品卡占比"))
+    video_amount = stringify(row.get("视频成交额"))
+    product_card_amount = stringify(row.get("商品卡成交额"))
+    return [
+        {"name": "视频", "percentage": video_ratio, "sales": video_amount},
+        {"name": "直播", "percentage": "0%", "sales": stringify(row.get("直播销售额"))},
+        {"name": "商品卡", "percentage": product_card_ratio, "sales": product_card_amount},
+    ]
+
+
+def enrich_detail_period_fields(cursor, source, meta, row, detail):
+    fields = detail.get("period_fields") or {}
+    if fields.get("overview_30d") and fields.get("overview_30d") != fields.get("overview_7d"):
+        return
+    aggregate = build_collection_aggregate_overview(cursor, meta, row, 30)
+    if aggregate:
+        fields["overview_30d"] = json.dumps(aggregate, ensure_ascii=False)
+        detail["period_fields"] = fields
+
+
+def build_collection_aggregate_overview(cursor, meta, row, days):
+    if not meta.get("sold"):
+        return None
+    product_id = row.get(meta["id"])
+    date_record = row.get(meta["date"])
+    if not product_id or not date_record:
+        return None
+    sold_expr = numeric_sql_expr(f"`{meta['sold']}`")
+    sale_amount_expr = numeric_sql_expr(f"`{meta['sale_amount']}`") if meta.get("sale_amount") else "NULL"
+    author_expr = numeric_sql_expr(f"`{meta['author_count']}`") if meta.get("author_count") else "NULL"
+    cursor.execute(
+        f"""
+        SELECT
+          SUM(COALESCE({sold_expr}, 0)) AS sold_sum,
+          SUM(COALESCE({sale_amount_expr}, 0)) AS sale_amount_sum,
+          MAX(COALESCE({author_expr}, 0)) AS author_count
+        FROM `{meta['table']}`
+        WHERE `{meta['id']}` = %s
+          AND `{meta['date']}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY) AND CAST(%s AS DATE)
+        """,
+        (product_id, date_record, days - 1, date_record),
+    )
+    result = cursor.fetchone() or {}
+    sold_sum = number_or_zero(result.get("sold_sum"))
+    sale_amount_sum = number_or_zero(result.get("sale_amount_sum"))
+    if sold_sum <= 0 and sale_amount_sum <= 0:
+        return None
+    return {
+        "销量": format_metric_number(sold_sum),
+        "日均销量": format_metric_number(sold_sum / days),
+        "销售额": format_metric_number(sale_amount_sum),
+        "日均销售额": format_metric_number(sale_amount_sum / days),
+        "带货达人数": format_metric_number(number_or_zero(result.get("author_count"))),
+    }
+
+
+def number_or_zero(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def format_metric_number(value):
+    value = number_or_zero(value)
+    if value.is_integer():
+        return int(value)
+    return round(value, 2)
 
 
 def build_platform_url(source, product_id):
@@ -974,7 +1281,7 @@ def build_platform_url(source, product_id):
 
 def resolve_platform_url(source, product_id, detail_url=None):
     if source == "kalodata":
-        return build_tiktok_shop_url(product_id)
+        return detail_url or ""
     return detail_url or build_platform_url(source, product_id)
 
 
