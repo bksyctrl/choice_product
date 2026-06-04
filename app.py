@@ -61,8 +61,13 @@ AI_DAEMON_SOURCES = [
 AI_DAEMON_ANALYSIS = os.getenv("AI_DAEMON_ANALYSIS", "both").strip().lower()
 AI_DAEMON_INTERVAL_SECONDS = int(os.getenv("AI_DAEMON_INTERVAL_SECONDS", "300"))
 AI_DAEMON_BATCH_SIZE = int(os.getenv("AI_DAEMON_BATCH_SIZE", "10"))
-AI_DAEMON_CONCURRENCY = max(10, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "5"))))
+AI_DAEMON_CONCURRENCY = max(1, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "1"))))
 AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false"
+AI_DAEMON_LOCK_RETRIES = max(1, int(os.getenv("AI_DAEMON_LOCK_RETRIES", "3")))
+AI_DAEMON_LOCK_WAIT_SECONDS = max(1, int(os.getenv("AI_DAEMON_LOCK_WAIT_SECONDS", "3")))
+AI_DAEMON_LATEST_ONLY = os.getenv("AI_DAEMON_LATEST_ONLY", "true").strip().lower() != "false"
+DETAIL_ANALYSIS_TABLE = "cp_user_detail_analysis"
+DETAIL_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.getenv("DETAIL_ANALYSIS_CONCURRENCY", "2")))))
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
 FASTMOSS_ANALYSIS_REUSE_SOURCES = ("fastmoss", "fastmoss_rank")
@@ -98,6 +103,8 @@ SOURCES = {
         "overview_7d": "overview_7d",
         "overview_90d": "overview_90d",
         "overview_180d": "overview_180d",
+        "sku_analysis_7d": "sku_analysis_7d",
+        "sku_analysis_28d": "sku_analysis_28d",
         "detail_url": "detail_url",
         "platform": "fastmoss",
         "selling_points": "selling_points",
@@ -129,6 +136,8 @@ SOURCES = {
         "overview_7d": "overview_7d",
         "overview_90d": "overview_90d",
         "overview_180d": "overview_180d",
+        "sku_analysis_7d": "sku_analysis_7d",
+        "sku_analysis_28d": "sku_analysis_28d",
         "detail_url": "detail_url",
         "platform": "fastmoss",
         "selling_points": None,
@@ -160,6 +169,8 @@ SOURCES = {
         "overview_7d": "overview_7d",
         "overview_90d": "overview_90d",
         "overview_180d": "overview_180d",
+        "sku_analysis_7d": "sku_analysis_7d",
+        "sku_analysis_28d": "sku_analysis_28d",
         "detail_url": "商品链接",
         "platform": "kalodata",
         "selling_points": "卖点",
@@ -175,6 +186,10 @@ SORT_FIELDS = {
     "price": "price_view",
     "author_count": "author_count_view",
     "launch_time": "launch_time",
+    "product_card_sales": "product_card_sales_view",
+    "product_card_ratio": "product_card_ratio_view",
+    "sales_growth": "sales_growth_view",
+    "ip_grade": "ip_grade",
 }
 
 
@@ -182,6 +197,7 @@ def create_app():
     app = Flask(__name__, static_folder="static", template_folder="static")
     app.secret_key = os.getenv("SECRET_KEY", "choice-product-dev-secret")
     CORS(app, supports_credentials=True)
+    ensure_detail_analysis_table()
 
     @app.errorhandler(ApiAuthError)
     def handle_auth_error(_error):
@@ -275,22 +291,35 @@ def create_app():
         meta = SOURCES[source]
         where, params = build_filters(meta, request.args)
         use_sales_aggregate = True
-        order_sql = build_order(meta, request.args.get("sort_by"), request.args.get("sort_order"), sales_period, use_sales_aggregate)
+        order_sql = build_order(meta, request.args.get("sort_by"), request.args.get("sort_order"), sales_period, use_sales_aggregate, request.args)
         offset = (page - 1) * page_size
 
         select_sql = build_product_select(source, meta)
         latest_join = build_latest_product_join(meta, where)
         sales_aggregate_join = build_sales_aggregate_join(meta, where) if use_sales_aggregate else ""
+        previous_sales_aggregate_join = build_previous_sales_aggregate_join(
+            meta,
+            request.args.get("date_start"),
+            request.args.get("date_end"),
+        ) if use_sales_aggregate else ""
+        sales_delta_join = build_sales_delta_join(
+            meta,
+            request.args.get("date_start"),
+            request.args.get("date_end"),
+        ) if use_sales_aggregate else ""
         runtime_sold_select = (
-            "sales_aggregate.aggregate_sold_count AS runtime_sold_count"
+            "sales_aggregate.aggregate_sold_count AS runtime_sold_count, previous_sales_aggregate.previous_sold_count AS previous_runtime_sold_count, "
+            f"{sales_delta_current_expr(meta)} AS current_period_sold_count, {sales_delta_previous_expr()} AS previous_period_sold_count"
             if use_sales_aggregate
-            else "NULL AS runtime_sold_count"
+            else "NULL AS runtime_sold_count, NULL AS previous_runtime_sold_count, NULL AS current_period_sold_count, NULL AS previous_period_sold_count"
         )
         sql = f"""
             SELECT {select_sql}, {runtime_sold_select}
             FROM `{meta["table"]}`
             {latest_join}
             {sales_aggregate_join}
+            {previous_sales_aggregate_join}
+            {sales_delta_join}
             {order_sql}
             LIMIT %s OFFSET %s
         """
@@ -429,6 +458,68 @@ def create_app():
             detail = normalize_detail(source, row)
             enrich_detail_period_fields(cursor, source, meta, row, detail)
         return api_ok(detail)
+
+    @app.post("/api/products/<source>/<product_id>/analysis-detail")
+    def product_analysis_detail(source, product_id):
+        user = require_current_user()
+        source = normalize_source(source)
+        payload = request.get_json(silent=True) or {}
+        analysis_type = stringify(payload.get("analysis_type")).strip().lower()
+        date_record = payload.get("date_record") or request.args.get("date_record")
+        if analysis_type not in {"ip", "material"}:
+            return api_error("analysis_type 必须是 ip 或 material", 400)
+        if not date_record:
+            return api_error("date_record 不能为空", 400)
+
+        ai_source = "fastmoss" if source == "unified" else source
+        if ai_source not in AI_PRODUCT_SOURCES:
+            return api_error(f"暂不支持该数据源的详细分析：{source}", 400)
+
+        with db() as conn, conn.cursor() as cursor:
+            record = fetch_detail_analysis_record(cursor, user["id"], source, product_id, date_record, analysis_type)
+            if record and record.get("status") == "SUCCESS":
+                return api_ok({"cached": True, "record": normalize_detail_analysis_record(record), "result": parse_json(record.get("result_json"))})
+            if record and record.get("status") == "RUNNING":
+                return api_ok({"cached": False, "record": normalize_detail_analysis_record(record), "status": "RUNNING"})
+            record_id = upsert_detail_analysis_record(
+                cursor,
+                user,
+                source,
+                AI_PRODUCT_SOURCES[ai_source]["table"],
+                product_id,
+                date_record,
+                analysis_type,
+                payload.get("title") or "",
+            )
+            conn.commit()
+        DETAIL_ANALYSIS_EXECUTOR.submit(run_detail_analysis_task, record_id, user["id"], ai_source, product_id, date_record, analysis_type)
+        return api_ok({"cached": False, "status": "RUNNING", "record": {"id": record_id, "status": "RUNNING"}})
+
+    @app.get("/api/detail-analyses")
+    def detail_analyses():
+        user = require_current_user()
+        analysis_type = stringify(request.args.get("analysis_type")).strip().lower() or "ip"
+        status = stringify(request.args.get("status")).strip().upper()
+        if analysis_type not in {"ip", "material"}:
+            return api_error("analysis_type 蹇呴』鏄?ip 鎴?material", 400)
+        where = ["user_id = %s", "analysis_type = %s"]
+        params = [user["id"], analysis_type]
+        if status in {"RUNNING", "SUCCESS", "FAILED"}:
+            where.append("status = %s")
+            params.append(status)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {DETAIL_ANALYSIS_TABLE}
+                WHERE {" AND ".join(where)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 200
+                """,
+                params,
+            )
+            rows = [normalize_detail_analysis_record(row) for row in cursor.fetchall()]
+        return api_ok({"items": rows, "analysis_type": analysis_type})
 
     @app.patch("/api/products/<source>/<product_id>/status")
     def update_status(source, product_id):
@@ -663,6 +754,154 @@ def require_current_user():
     return user
 
 
+def ensure_detail_analysis_table():
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {DETAIL_ANALYSIS_TABLE} (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              user_id BIGINT NOT NULL,
+              username VARCHAR(128) NOT NULL DEFAULT '',
+              source VARCHAR(32) NOT NULL,
+              product_table VARCHAR(128) NOT NULL,
+              product_id VARCHAR(128) NOT NULL,
+              date_record DATE NOT NULL,
+              analysis_type VARCHAR(32) NOT NULL,
+              product_title TEXT NULL,
+              status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
+              result_json LONGTEXT NULL,
+              error_message TEXT NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              completed_at DATETIME NULL,
+              UNIQUE KEY uq_user_detail_analysis (user_id, source, product_id, date_record, analysis_type),
+              KEY idx_user_type_status (user_id, analysis_type, status),
+              KEY idx_product_lookup (source, product_id, date_record)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+
+
+def fetch_detail_analysis_record(cursor, user_id, source, product_id, date_record, analysis_type):
+    cursor.execute(
+        f"""
+        SELECT *
+        FROM {DETAIL_ANALYSIS_TABLE}
+        WHERE user_id = %s
+          AND source = %s
+          AND product_id = %s
+          AND date_record = %s
+          AND analysis_type = %s
+        LIMIT 1
+        """,
+        (user_id, source, str(product_id), date_record, analysis_type),
+    )
+    return cursor.fetchone()
+
+
+def upsert_detail_analysis_record(cursor, user, source, product_table, product_id, date_record, analysis_type, product_title=""):
+    cursor.execute(
+        f"""
+        INSERT INTO {DETAIL_ANALYSIS_TABLE}
+          (user_id, username, source, product_table, product_id, date_record, analysis_type, product_title, status, result_json, error_message, completed_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'RUNNING', NULL, NULL, NULL)
+        ON DUPLICATE KEY UPDATE
+          username = VALUES(username),
+          product_table = VALUES(product_table),
+          product_title = IF(VALUES(product_title) <> '', VALUES(product_title), product_title),
+          status = 'RUNNING',
+          result_json = NULL,
+          error_message = NULL,
+          completed_at = NULL
+        """,
+        (
+            user["id"],
+            user.get("username") or "",
+            source,
+            product_table,
+            str(product_id),
+            date_record,
+            analysis_type,
+            stringify(product_title),
+        ),
+    )
+    cursor.execute(
+        f"""
+        SELECT id
+        FROM {DETAIL_ANALYSIS_TABLE}
+        WHERE user_id = %s AND source = %s AND product_id = %s AND date_record = %s AND analysis_type = %s
+        LIMIT 1
+        """,
+        (user["id"], source, str(product_id), date_record, analysis_type),
+    )
+    return cursor.fetchone()["id"]
+
+
+def run_detail_analysis_task(record_id, user_id, ai_source, product_id, date_record, analysis_type):
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            product = load_ai_product(cursor, ai_source, product_id, date_record)
+            result = run_analysis(
+                cursor,
+                ai_source,
+                product,
+                "IP" if analysis_type == "ip" else "MATERIAL",
+                write=False,
+                detail=True,
+            )
+            if result.get("error"):
+                cursor.execute(
+                    f"""
+                    UPDATE {DETAIL_ANALYSIS_TABLE}
+                    SET status = 'FAILED', error_message = %s, completed_at = NOW()
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (result["error"], record_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    UPDATE {DETAIL_ANALYSIS_TABLE}
+                    SET status = 'SUCCESS', result_json = %s, error_message = NULL, completed_at = NOW()
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (json.dumps(result.get("result") or {}, ensure_ascii=False, default=str), record_id, user_id),
+                )
+            conn.commit()
+    except Exception as exc:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {DETAIL_ANALYSIS_TABLE}
+                SET status = 'FAILED', error_message = %s, completed_at = NOW()
+                WHERE id = %s AND user_id = %s
+                """,
+                (str(exc), record_id, user_id),
+            )
+            conn.commit()
+
+
+def normalize_detail_analysis_record(row):
+    return {
+        "id": row.get("id"),
+        "user_id": row.get("user_id"),
+        "username": row.get("username"),
+        "source": row.get("source"),
+        "product_table": row.get("product_table"),
+        "product_id": row.get("product_id"),
+        "date_record": stringify(row.get("date_record")),
+        "analysis_type": row.get("analysis_type"),
+        "product_title": row.get("product_title") or "",
+        "status": row.get("status"),
+        "result": parse_json(row.get("result_json")),
+        "error_message": row.get("error_message") or "",
+        "created_at": stringify(row.get("created_at")),
+        "updated_at": stringify(row.get("updated_at")),
+        "completed_at": stringify(row.get("completed_at")),
+    }
+
+
 def public_user(user):
     return {
         "id": user.get("id"),
@@ -792,6 +1031,109 @@ def build_sales_aggregate_join(meta, where):
     """
 
 
+def build_previous_sales_aggregate_join(meta, date_start, date_end):
+    sold_field = meta.get("sold")
+    if not sold_field or not date_start:
+        return """
+        LEFT JOIN (
+            SELECT NULL AS previous_product_id, NULL AS previous_sold_count
+        ) AS previous_sales_aggregate
+          ON previous_sales_aggregate.previous_product_id = `{table}`.`{id_field}`
+        """.format(table=meta["table"], id_field=meta["id"])
+    try:
+        start = datetime.fromisoformat(str(date_start)[:10]).date()
+        end = datetime.fromisoformat(str(date_end or date_start)[:10]).date()
+    except ValueError:
+        return """
+        LEFT JOIN (
+            SELECT NULL AS previous_product_id, NULL AS previous_sold_count
+        ) AS previous_sales_aggregate
+          ON previous_sales_aggregate.previous_product_id = `{table}`.`{id_field}`
+        """.format(table=meta["table"], id_field=meta["id"])
+    days = max(1, (end - start).days + 1)
+    previous_start = start.isoformat()
+    sold_expr = numeric_sql_expr(f"`{sold_field}`")
+    return f"""
+        LEFT JOIN (
+            SELECT `{meta["id"]}` AS previous_product_id,
+                   SUM(COALESCE({sold_expr}, 0)) AS previous_sold_count
+            FROM `{meta["table"]}`
+            WHERE `{meta["date"]}` BETWEEN DATE_SUB(CAST('{previous_start}' AS DATE), INTERVAL {days} DAY)
+                                      AND DATE_SUB(CAST('{previous_start}' AS DATE), INTERVAL 1 DAY)
+            GROUP BY `{meta["id"]}`
+        ) AS previous_sales_aggregate
+          ON previous_sales_aggregate.previous_product_id = `{meta["table"]}`.`{meta["id"]}`
+    """
+
+
+def build_sales_delta_join(meta, date_start, date_end):
+    total_field = meta.get("total_sold") or meta.get("sold")
+    if not total_field or not date_start:
+        return empty_sales_delta_join(meta)
+    try:
+        start = datetime.fromisoformat(str(date_start)[:10]).date()
+        end = datetime.fromisoformat(str(date_end or date_start)[:10]).date()
+    except ValueError:
+        return empty_sales_delta_join(meta)
+    days = max(1, (end - start).days + 1)
+    previous_start = start - date.resolution * days
+    return f"""
+        LEFT JOIN (
+            SELECT base_source.`{meta["id"]}` AS base_product_id,
+                   {numeric_sql_expr(f"base_source.`{total_field}`")} AS base_total_sold_count
+            FROM `{meta["table"]}` AS base_source
+            INNER JOIN (
+                SELECT `{meta["id"]}` AS product_id, MAX(`{meta["date"]}`) AS base_date
+                FROM `{meta["table"]}`
+                WHERE `{meta["date"]}` < CAST('{start.isoformat()}' AS DATE)
+                GROUP BY `{meta["id"]}`
+            ) AS base_latest
+              ON base_latest.product_id = base_source.`{meta["id"]}`
+             AND base_latest.base_date = base_source.`{meta["date"]}`
+        ) AS current_sales_base
+          ON current_sales_base.base_product_id = `{meta["table"]}`.`{meta["id"]}`
+        LEFT JOIN (
+            SELECT previous_base_source.`{meta["id"]}` AS previous_base_product_id,
+                   {numeric_sql_expr(f"previous_base_source.`{total_field}`")} AS previous_base_total_sold_count
+            FROM `{meta["table"]}` AS previous_base_source
+            INNER JOIN (
+                SELECT `{meta["id"]}` AS product_id, MAX(`{meta["date"]}`) AS previous_base_date
+                FROM `{meta["table"]}`
+                WHERE `{meta["date"]}` < CAST('{previous_start.isoformat()}' AS DATE)
+                GROUP BY `{meta["id"]}`
+            ) AS previous_base_latest
+              ON previous_base_latest.product_id = previous_base_source.`{meta["id"]}`
+             AND previous_base_latest.previous_base_date = previous_base_source.`{meta["date"]}`
+        ) AS previous_sales_base
+          ON previous_sales_base.previous_base_product_id = `{meta["table"]}`.`{meta["id"]}`
+    """
+
+
+def empty_sales_delta_join(meta):
+    return """
+        LEFT JOIN (
+            SELECT NULL AS base_product_id, NULL AS base_total_sold_count
+        ) AS current_sales_base
+          ON current_sales_base.base_product_id = `{table}`.`{id_field}`
+        LEFT JOIN (
+            SELECT NULL AS previous_base_product_id, NULL AS previous_base_total_sold_count
+        ) AS previous_sales_base
+          ON previous_sales_base.previous_base_product_id = `{table}`.`{id_field}`
+    """.format(table=meta["table"], id_field=meta["id"])
+
+
+def sales_delta_current_expr(meta):
+    total_field = meta.get("total_sold") or meta.get("sold")
+    if not total_field:
+        return "NULL"
+    current_total_expr = numeric_sql_expr(f"`{meta['table']}`.`{total_field}`")
+    return f"GREATEST(COALESCE({current_total_expr}, 0) - COALESCE(current_sales_base.base_total_sold_count, 0), 0)"
+
+
+def sales_delta_previous_expr():
+    return "GREATEST(COALESCE(current_sales_base.base_total_sold_count, 0) - COALESCE(previous_sales_base.previous_base_total_sold_count, 0), 0)"
+
+
 def has_launch_time(meta):
     return meta["table"] in {"fastmoss_product_aggregate", "fastmoss_product_rank_aggregate"}
 
@@ -882,6 +1224,18 @@ def distribution_ratio_number_expr(field):
     return f"CAST(NULLIF({clean_expr}, '') AS DECIMAL(20,4))"
 
 
+def distribution_item_number_expr(field, item_name, key):
+    search_path = f"JSON_UNQUOTE(JSON_SEARCH(`{field}`, 'one', '{item_name}', NULL, '$[*].name'))"
+    value_path = f"REPLACE({search_path}, '.name', '.{key}')"
+    value_expr = f"JSON_UNQUOTE(JSON_EXTRACT(`{field}`, {value_path}))"
+    return numeric_sql_expr(value_expr)
+
+
+def distribution_index_number_expr(field, index, key):
+    value_expr = f"JSON_UNQUOTE(JSON_EXTRACT(`{field}`, '$[{index}].{key}'))"
+    return numeric_sql_expr(value_expr)
+
+
 def add_eq_filter(where, params, field, value):
     if value:
         where.append(f"`{field}` = %s")
@@ -953,11 +1307,19 @@ def sort_field_expr(meta, sort_by):
     return qualified_field(meta, fields.get(sort_by or "date_record") or meta["date"])
 
 
-def build_order(meta, sort_by, sort_order, sales_period=None, use_sales_aggregate=False):
+def build_order(meta, sort_by, sort_order, sales_period=None, use_sales_aggregate=False, args=None):
     raw_field = sort_field_expr(meta, sort_by)
     direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
     if sort_by == "sold" and use_sales_aggregate:
         return f"ORDER BY COALESCE(sales_aggregate.aggregate_sold_count, 0) {direction}"
+    if sort_by == "product_card_sales":
+        return f"ORDER BY {product_card_sales_sort_expr(meta)} {direction}"
+    if sort_by == "product_card_ratio":
+        return f"ORDER BY {product_card_ratio_sort_expr(meta)} {direction}"
+    if sort_by == "sales_growth" and args:
+        return f"ORDER BY {sales_growth_sort_expr(meta, args)} {direction}"
+    if sort_by == "ip_grade":
+        return f"ORDER BY FIELD(ip_grade, 'E', 'D', 'C', 'B', 'A', 'S') {direction}, ip_grade {direction}"
 
     # 针对数值字段，强制进行数值转换排序，处理可能存在的 $ % , 等符号
     # 防止出现字符串排序导致的 "84 > 658" 错误
@@ -979,17 +1341,74 @@ def build_order(meta, sort_by, sort_order, sales_period=None, use_sales_aggregat
     return f"ORDER BY {raw_field} {direction}"
 
 
+def product_card_sales_sort_expr(meta):
+    distribution_field = meta.get("distribution_7d") or meta.get("distribution_30d")
+    if distribution_field:
+        return f"COALESCE({distribution_item_number_expr(distribution_field, '商品卡', 'sales')}, 0)"
+    ratio_field = meta.get("product_card_ratio")
+    total_field = meta.get("total_sold") or meta.get("sold")
+    if ratio_field and total_field:
+        return f"COALESCE({numeric_sql_expr(f'`{total_field}`')}, 0) * COALESCE({numeric_sql_expr(f'`{ratio_field}`')}, 0) / 100"
+    return "0"
+
+
+def product_card_ratio_sort_expr(meta):
+    expressions = []
+    if meta.get("distribution_30d"):
+        expressions.append(distribution_item_number_expr(meta["distribution_30d"], "商品卡", "percentage"))
+    if meta.get("product_card_ratio"):
+        expressions.append(numeric_sql_expr(f"`{meta['product_card_ratio']}`"))
+    if meta.get("distribution_7d"):
+        expressions.append(distribution_item_number_expr(meta["distribution_7d"], "商品卡", "percentage"))
+    if not expressions:
+        return "0"
+    return f"COALESCE({', '.join(expressions)}, 0)"
+
+
+def product_card_sales_sort_expr(meta):
+    distribution_field = meta.get("distribution_7d") or meta.get("distribution_30d")
+    if distribution_field:
+        return "COALESCE({sales}, {count}, {sold}, {value_count}, 0)".format(
+            sales=distribution_index_number_expr(distribution_field, 2, "sales"),
+            count=distribution_index_number_expr(distribution_field, 2, "count"),
+            sold=distribution_index_number_expr(distribution_field, 2, "sold"),
+            value_count=distribution_index_number_expr(distribution_field, 2, "value_count"),
+        )
+    ratio_field = meta.get("product_card_ratio")
+    total_field = meta.get("total_sold") or meta.get("sold")
+    if ratio_field and total_field:
+        return f"COALESCE({numeric_sql_expr(f'`{total_field}`')}, 0) * COALESCE({numeric_sql_expr(f'`{ratio_field}`')}, 0) / 100"
+    return "0"
+
+
+def sales_growth_sort_expr(meta, args):
+    current_expr = sales_delta_current_expr(meta)
+    previous_expr = sales_delta_previous_expr()
+    return f"CASE WHEN COALESCE({previous_expr}, 0) <= 0 THEN NULL ELSE (({current_expr} / {previous_expr}) - 1) END"
+
+
 def normalize_product_row(source, row, sales_period):
     material = parse_json(row.get("material_analysis")) or {}
     tags = parse_json(row.get("ip_tags")) or {}
     field_period = sales_period["period"] if sales_period["period"] != "custom" else "7d"
     overview = parse_json(row.get(f"overview_{field_period}")) or {}
     distribution = parse_json(row.get(f"distribution_{field_period}")) or []
+    distribution_7d = parse_json(row.get("distribution_7d")) or []
+    distribution_28d = parse_json(row.get("distribution_30d")) or []
     sold_count = row.get("runtime_sold_count") if row.get("runtime_sold_count") is not None else overview.get("销量") or row.get("sold_count_view")
+    total_sold = row.get("total_sold_count_view") or row.get("sold_count_view")
     sale_amount = overview.get("销售额") or row.get("sale_amount_view")
     author_count = overview.get("带货达人数") or row.get("author_count_view")
     video_ratio = row.get("video_ratio_view") or ratio_from_distribution(distribution, "视频")
     product_card_ratio = row.get("product_card_ratio_view") or ratio_from_distribution(distribution, "商品卡")
+    product_card_ratio_28d = row.get("product_card_ratio_view") or ratio_from_distribution(distribution_28d, "商品卡")
+    product_card_sales = sales_from_distribution(distribution_7d or distribution, "商品卡", sold_count)
+    chart_7d = normalize_distribution_chart(distribution_7d, sold_count)
+    chart_28d = normalize_distribution_chart(
+        distribution_28d,
+        total_sold,
+        {"视频": row.get("video_ratio_view"), "商品卡": row.get("product_card_ratio_view")},
+    )
     return {
         "source": source,
         "product_id": stringify(row.get("product_id")),
@@ -1001,12 +1420,16 @@ def normalize_product_row(source, row, sales_period):
         "rating": stringify(row.get("rating_view")),
         "commission_rate": stringify(row.get("commission_rate_view")),
         "sold_count": stringify(sold_count),
-        "total_sold_count": stringify(row.get("total_sold_count_view") or row.get("sold_count_view")),
+        "product_card_sales": stringify(format_metric_number(product_card_sales)),
+        "total_sold_count": stringify(total_sold),
         "sale_amount": stringify(sale_amount),
         "sales_growth": row.get("sales_growth_view") or "N/A",
         "author_count": stringify(author_count),
         "video_ratio": stringify(video_ratio),
         "product_card_ratio": stringify(product_card_ratio),
+        "product_card_ratio_28d": stringify(product_card_ratio_28d),
+        "distribution_7d_chart": chart_7d,
+        "distribution_28d_chart": chart_28d,
         "transport_fee": stringify(row.get("transport_fee_view")),
         "launch_time": stringify(row.get("launch_time")),
         "audit_status": row.get("audit_status") or "PENDING",
@@ -1026,7 +1449,37 @@ def attach_runtime_metrics(cursor, meta, rows, sales_period, collection_start=No
     for row in rows:
         if row.get("runtime_sold_count") is not None:
             row["runtime_sold_count"] = float(row.get("runtime_sold_count") or 0)
-        row["sales_growth_view"] = "N/A"
+        if row.get("previous_runtime_sold_count") is not None:
+            row["previous_runtime_sold_count"] = float(row.get("previous_runtime_sold_count") or 0)
+        if row.get("current_period_sold_count") is not None:
+            row["current_period_sold_count"] = float(row.get("current_period_sold_count") or 0)
+        if row.get("previous_period_sold_count") is not None:
+            row["previous_period_sold_count"] = float(row.get("previous_period_sold_count") or 0)
+        if row.get("current_period_sold_count") is not None and row.get("previous_period_sold_count") is not None:
+            row["sales_growth_view"] = format_runtime_sales_result(
+                {
+                    "current_sum": row.get("current_period_sold_count"),
+                    "previous_sum": row.get("previous_period_sold_count"),
+                }
+            )["growth"]
+            continue
+        if row.get("previous_runtime_sold_count") is not None:
+            row["sales_growth_view"] = format_runtime_sales_result(
+                {
+                    "current_sum": row.get("runtime_sold_count"),
+                    "previous_sum": row.get("previous_runtime_sold_count"),
+                }
+            )["growth"]
+            continue
+        metrics = calculate_runtime_sales_metrics(
+            cursor,
+            meta,
+            row,
+            sales_period,
+            collection_start,
+            collection_end,
+        )
+        row["sales_growth_view"] = metrics["growth"]
 
 
 def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_start=None, collection_end=None):
@@ -1038,10 +1491,17 @@ def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_
     id_field = meta["id"]
     date_field = meta["date"]
     sold_field = meta["sold"]
+    sold_expr = numeric_sql_expr(f"`{sold_field}`")
 
     if collection_start and collection_end:
-        current_start = collection_start
-        current_end = collection_end
+        return calculate_collection_sales_growth(
+            cursor,
+            meta,
+            product_id,
+            collection_start,
+            collection_end,
+            sold_expr,
+        )
     elif sales_period["period"] == "custom" and sales_period["start"] and sales_period["end"]:
         current_start = sales_period["start"]
         current_end = sales_period["end"]
@@ -1052,12 +1512,12 @@ def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_
             SELECT
               SUM(CASE
                 WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY) AND CAST(%s AS DATE)
-                THEN COALESCE(`{sold_field}`, 0) ELSE 0
+                THEN COALESCE({sold_expr}, 0) ELSE 0
               END) AS current_sum,
               SUM(CASE
                 WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY)
                                      AND DATE_SUB(CAST(%s AS DATE), INTERVAL %s DAY)
-                THEN COALESCE(`{sold_field}`, 0) ELSE 0
+                THEN COALESCE({sold_expr}, 0) ELSE 0
               END) AS previous_sum
             FROM `{table}`
             WHERE `{id_field}` = %s
@@ -1081,12 +1541,12 @@ def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_
         SELECT
           SUM(CASE
             WHEN `{date_field}` BETWEEN CAST(%s AS DATE) AND CAST(%s AS DATE)
-            THEN COALESCE(`{sold_field}`, 0) ELSE 0
+            THEN COALESCE({sold_expr}, 0) ELSE 0
           END) AS current_sum,
           SUM(CASE
             WHEN `{date_field}` BETWEEN DATE_SUB(CAST(%s AS DATE), INTERVAL DATEDIFF(CAST(%s AS DATE), CAST(%s AS DATE)) + 1 DAY)
                                  AND DATE_SUB(CAST(%s AS DATE), INTERVAL 1 DAY)
-            THEN COALESCE(`{sold_field}`, 0) ELSE 0
+            THEN COALESCE({sold_expr}, 0) ELSE 0
           END) AS previous_sum
         FROM `{table}`
         WHERE `{id_field}` = %s
@@ -1105,12 +1565,65 @@ def calculate_runtime_sales_metrics(cursor, meta, row, sales_period, collection_
     return format_runtime_sales_result(result)
 
 
+def calculate_collection_sales_growth(cursor, meta, product_id, current_start, current_end, sold_expr):
+    date_count = collection_date_count(current_start, current_end)
+    table = meta["table"]
+    id_field = meta["id"]
+    date_field = meta["date"]
+    cursor.execute(
+        f"""
+        SELECT SUM(COALESCE({sold_expr}, 0)) AS current_sum
+        FROM `{table}`
+        WHERE `{id_field}` = %s
+          AND `{date_field}` BETWEEN CAST(%s AS DATE) AND CAST(%s AS DATE)
+        """,
+        (product_id, current_start, current_end),
+    )
+    current_sum = number_or_zero((cursor.fetchone() or {}).get("current_sum"))
+
+    cursor.execute(
+        f"""
+        SELECT DISTINCT `{date_field}` AS previous_date
+        FROM `{table}`
+        WHERE `{id_field}` = %s AND `{date_field}` < CAST(%s AS DATE)
+        ORDER BY `{date_field}` DESC
+        LIMIT %s
+        """,
+        (product_id, current_start, date_count),
+    )
+    previous_dates = [row["previous_date"] for row in cursor.fetchall()]
+    if not previous_dates:
+        return {"current_sum": current_sum, "growth": "N/A"}
+
+    placeholders = ",".join(["%s"] * len(previous_dates))
+    cursor.execute(
+        f"""
+        SELECT SUM(COALESCE({sold_expr}, 0)) AS previous_sum
+        FROM `{table}`
+        WHERE `{id_field}` = %s AND `{date_field}` IN ({placeholders})
+        """,
+        [product_id, *previous_dates],
+    )
+    previous_sum = number_or_zero((cursor.fetchone() or {}).get("previous_sum"))
+    return format_runtime_sales_result({"current_sum": current_sum, "previous_sum": previous_sum})
+
+
+def collection_date_count(current_start, current_end):
+    try:
+        start = datetime.fromisoformat(str(current_start)[:10]).date()
+        end = datetime.fromisoformat(str(current_end)[:10]).date()
+    except ValueError:
+        return 1
+    return max(1, (end - start).days + 1)
+
+
 def format_runtime_sales_result(result):
     current_sum = float(result.get("current_sum") or 0)
     previous_sum = float(result.get("previous_sum") or 0)
     if previous_sum <= 0:
         return {"current_sum": current_sum, "growth": "N/A"}
-    return {"current_sum": current_sum, "growth": f"{((current_sum / previous_sum) - 1) * 100:.1f}%"}
+    growth = (current_sum / previous_sum) - 1
+    return {"current_sum": current_sum, "growth": f"{growth * 100:.2f}%"}
 
 
 def ratio_from_distribution(distribution, name):
@@ -1168,6 +1681,7 @@ def normalize_detail(source, row):
         "material_analysis": parse_json(row.get("material_analysis")),
         "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
         "period_fields": build_detail_period_fields(source, row, meta),
+        "sku_analysis": build_detail_sku_analysis(row, meta),
         "raw_fields": raw,
     }
 
@@ -1185,6 +1699,250 @@ def build_detail_period_fields(source, row, meta):
     if source == "kalodata" and not fields.get("distribution_30d"):
         fields["distribution_30d"] = json.dumps(build_kalodata_30d_distribution(row), ensure_ascii=False)
     return fields
+
+
+def build_detail_sku_analysis(row, meta):
+    fields = {}
+    for period, label in (("7d", "近7天"), ("28d", "近28天")):
+        field = meta.get(f"sku_analysis_{period}")
+        parsed = parse_json(row.get(field)) if field else None
+        normalized = normalize_sku_analysis(parsed)
+        if normalized:
+            normalized["period"] = period
+            normalized["period_label"] = label
+            fields[period] = normalized
+    return fields
+
+
+def normalize_sku_analysis(parsed):
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+
+    rules = []
+    dimensions_source = None
+    for value in parsed.values():
+        if isinstance(value, list) and not rules:
+            rules = [stringify(item) for item in value if stringify(item)]
+        elif isinstance(value, dict):
+            if rules and any(rule in value for rule in rules):
+                dimensions_source = value
+            elif dimensions_source is None:
+                dimensions_source = value
+
+    if not isinstance(dimensions_source, dict) or not dimensions_source:
+        return None
+    if not rules:
+        rules = [stringify(key) for key in dimensions_source.keys()]
+
+    dimensions = []
+    for rule in rules:
+        dimension = dimensions_source.get(rule)
+        if not isinstance(dimension, dict):
+            continue
+        sales_block = find_sku_sales_block(dimension)
+        if not sales_block:
+            continue
+        items = normalize_sku_items(sales_block.get("items") or sales_block.get("details") or [])
+        if not items:
+            continue
+        dimensions.append(
+            {
+                "name": rule,
+                "total": sales_block.get("total"),
+                "total_display": sales_block.get("total_display") or format_metric_number(sales_block.get("total")),
+                "items": items,
+            }
+        )
+
+    if not dimensions:
+        return None
+
+    best = find_best_sku_dimension(dimensions)
+    return {
+        "rules": [item["name"] for item in dimensions],
+        "dimensions": dimensions,
+        "best_sku": best,
+    }
+
+
+def find_sku_sales_block(dimension):
+    fallback = None
+    for metric in dimension.values():
+        if not isinstance(metric, dict):
+            continue
+        details = first_list_value(metric)
+        if not details:
+            continue
+        block = {
+            "total": first_numeric_value(metric),
+            "total_display": first_display_value(metric),
+            "items": details,
+        }
+        if fallback is None:
+            fallback = block
+        if not sku_block_has_currency(details):
+            return block
+    return fallback
+
+
+def sku_block_has_currency(details):
+    if not isinstance(details, list):
+        return False
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        for value in detail.values():
+            text = stringify(value)
+            if "$" in text or "USD" in text or "¥" in text or "￥" in text:
+                return True
+    return False
+
+
+def normalize_sku_items(items):
+    if not isinstance(items, list):
+        return []
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = first_sku_name(item)
+        ratio = first_percent_value(item)
+        sales = first_numeric_value(item)
+        sales_display = first_display_value(item) or format_metric_number(sales)
+        if not name:
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "ratio": ratio,
+                "sales": sales,
+                "sales_display": sales_display,
+            }
+        )
+    return normalized
+
+
+def first_list_value(value):
+    for item in value.values():
+        if isinstance(item, list):
+            return item
+    return None
+
+
+def first_numeric_value(value):
+    for item in value.values():
+        if isinstance(item, (int, float, Decimal)):
+            return number_or_zero(item)
+    return 0
+
+
+def first_display_value(value):
+    for item in value.values():
+        text = stringify(item).strip()
+        if not text or text.endswith("%"):
+            continue
+        normalized = text.replace(",", "").replace("，", "").replace("$", "").replace("¥", "").replace("￥", "").strip()
+        if normalized.replace(".", "", 1).isdigit():
+            return text
+    return ""
+
+
+def sales_from_distribution(distribution, name, total_fallback=None):
+    if not isinstance(distribution, list):
+        return 0
+    for item in distribution:
+        if str(item.get("name")) != name:
+            continue
+        sales = number_or_zero(item.get("sales") or item.get("sold") or item.get("count") or item.get("value_count"))
+        if sales > 0:
+            return sales
+        ratio = percent_to_number(item.get("percentage") or item.get("ratio"))
+        if total_fallback is not None and ratio > 0:
+            return number_or_zero(total_fallback) * ratio / 100
+    return 0
+
+
+def percent_to_number(value):
+    text = stringify(value).replace("%", "").replace(",", "").strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return 0
+    return number * 100 if 0 < number <= 1 else number
+
+
+def normalize_distribution_chart(distribution, total_fallback=None, direct_ratios=None):
+    names = ["视频", "直播", "商品卡"]
+    direct_ratios = direct_ratios or {}
+    items = []
+    for name in names:
+        ratio = ratio_from_distribution(distribution, name)
+        if not ratio and name in direct_ratios:
+            ratio = direct_ratios[name]
+        sales = sales_from_distribution(distribution, name, total_fallback)
+        if sales <= 0 and ratio:
+            sales = number_or_zero(total_fallback) * percent_to_number(ratio) / 100
+        items.append(
+            {
+                "name": name,
+                "ratio": normalize_percent_display(ratio),
+                "sales": format_metric_number(sales),
+            }
+        )
+    return items
+
+
+def normalize_percent_display(value):
+    number = percent_to_number(value)
+    if not number:
+        return "0%"
+    if float(number).is_integer():
+        return f"{int(number)}%"
+    return f"{number:.2f}%"
+
+
+def first_percent_value(value):
+    for item in value.values():
+        text = stringify(item).strip()
+        if text.endswith("%"):
+            return text
+    return ""
+
+
+def first_sku_name(value):
+    for item in value.values():
+        if isinstance(item, (dict, list)):
+            continue
+        text = stringify(item).strip()
+        if not text or text.endswith("%"):
+            continue
+        if text.replace(".", "", 1).isdigit():
+            continue
+        if text.startswith("$"):
+            continue
+        return text
+    return ""
+
+
+def find_best_sku_dimension(dimensions):
+    best = None
+    fallback = None
+    for dimension in dimensions:
+        for item in dimension.get("items") or []:
+            sales = number_or_zero(item.get("sales"))
+            candidate = {
+                "rule": dimension["name"],
+                "name": item.get("name") or "",
+                "sales": sales,
+                "sales_display": item.get("sales_display") or format_metric_number(sales),
+            }
+            if fallback is None or sales > fallback["sales"]:
+                fallback = candidate
+            if stringify(item.get("name")).strip().lower() == "other":
+                continue
+            if best is None or sales > best["sales"]:
+                best = candidate
+    return best or fallback
 
 
 def build_kalodata_30d_overview(row):
@@ -1404,6 +2162,8 @@ def start_ai_daemon_if_enabled():
         "[AI_DAEMON] started "
         f"sources={','.join(AI_DAEMON_SOURCES)} analysis={AI_DAEMON_ANALYSIS} "
         f"batch_size={AI_DAEMON_BATCH_SIZE} interval={AI_DAEMON_INTERVAL_SECONDS}s "
+        f"concurrency={AI_DAEMON_CONCURRENCY} lock_wait={AI_DAEMON_LOCK_WAIT_SECONDS}s "
+        f"latest_only={AI_DAEMON_LATEST_ONLY} "
         f"write={AI_DAEMON_WRITE}",
         flush=True,
     )
@@ -1423,7 +2183,9 @@ def ai_daemon_loop():
 def run_ai_daemon_once():
     processed = 0
     for source in AI_DAEMON_SOURCES:
+        print(f"[AI_DAEMON] fetching source={source}", flush=True)
         keys = fetch_ai_daemon_product_keys(source, AI_DAEMON_ANALYSIS, AI_DAEMON_BATCH_SIZE)
+        print(f"[AI_DAEMON] source={source} queued={len(keys)}", flush=True)
         if not keys:
             continue
 
@@ -1442,11 +2204,23 @@ def run_ai_daemon_once():
 
 
 def process_single_ai_task(source, key):
+    for attempt in range(1, AI_DAEMON_LOCK_RETRIES + 1):
+        result = process_single_ai_task_once(source, key, attempt)
+        if result is not None:
+            return result
+        time.sleep(0.5 * attempt)
+    return False
+
+
+def process_single_ai_task_once(source, key, attempt=1):
     conn = db()
     try:
         with conn.cursor() as cursor:
+            cursor.execute(f"SET SESSION innodb_lock_wait_timeout = {AI_DAEMON_LOCK_WAIT_SECONDS}")
             product = load_ai_product(cursor, source, key["product_id"], key["date_record"])
             reused_fields = reuse_existing_product_analysis(cursor, source, product, AI_DAEMON_ANALYSIS)
+            if reused_fields:
+                conn.commit()
             if reused_fields and not needs_ai_analysis(cursor, source, product, AI_DAEMON_ANALYSIS):
                 print(
                     f"[AI_DAEMON][{threading.current_thread().name}] reused "
@@ -1454,8 +2228,16 @@ def process_single_ai_task(source, key):
                     f"product_id={product['product_id']} date_record={product.get('date_record')}",
                     flush=True,
                 )
-                conn.commit()
                 return True
+            if not needs_ai_analysis(cursor, source, product, AI_DAEMON_ANALYSIS):
+                print(
+                    f"[AI_DAEMON][{threading.current_thread().name}] skip already analyzed "
+                    f"source={source} product_id={product['product_id']} "
+                    f"date_record={product.get('date_record')}",
+                    flush=True,
+                )
+                conn.commit()
+                return False
             print(
                 f"[AI_DAEMON][{threading.current_thread().name}] analyzing "
                 f"source={source} product_id={product['product_id']} "
@@ -1465,6 +2247,32 @@ def process_single_ai_task(source, key):
             run_ai_product_flow(cursor, source, product, AI_DAEMON_ANALYSIS, AI_DAEMON_WRITE)
             conn.commit()
             return True
+    except pymysql.err.OperationalError as exc:
+        conn.rollback()
+        if exc.args and exc.args[0] == 1205:
+            if attempt < AI_DAEMON_LOCK_RETRIES:
+                print(
+                    f"[AI_DAEMON][{threading.current_thread().name}] lock wait timeout, retry "
+                    f"{attempt}/{AI_DAEMON_LOCK_RETRIES} source={source} "
+                    f"product_id={key.get('product_id')} date_record={key.get('date_record')}",
+                    flush=True,
+                )
+                return None
+            print(
+                f"[AI_DAEMON][{threading.current_thread().name}] lock wait timeout, skip this cycle "
+                f"source={source} product_id={key.get('product_id')} "
+                f"date_record={key.get('date_record')}",
+                flush=True,
+            )
+            return False
+        print(
+            f"[AI_DAEMON][{threading.current_thread().name}] item failed "
+            f"source={source} product_id={key.get('product_id')} "
+            f"date_record={key.get('date_record')}",
+            flush=True,
+        )
+        traceback.print_exc()
+        return False
     except Exception:
         conn.rollback()
         print(
@@ -1490,6 +2298,7 @@ def reuse_existing_product_analysis(cursor, source, product, analysis):
 
     updates = []
     params = []
+    guards = []
     if analysis in {"ip", "both"} and is_blank(current.get("ip_grade")) and not is_blank(reusable.get("ip_grade")):
         updates.extend(["ip_grade = %s", "ip_reason = %s", "ip_tags = %s"])
         params.extend([
@@ -1497,19 +2306,23 @@ def reuse_existing_product_analysis(cursor, source, product, analysis):
             reusable.get("ip_reason") or "",
             reusable.get("ip_tags") or "",
         ])
+        guards.append("(ip_grade IS NULL OR ip_grade = '')")
     if analysis in {"material", "both"} and is_blank(current.get("material_analysis")) and not is_blank(reusable.get("material_analysis")):
         updates.append("material_analysis = %s")
         params.append(reusable.get("material_analysis"))
+        guards.append("(material_analysis IS NULL OR material_analysis = '')")
     if not updates:
         return []
 
     meta = AI_PRODUCT_SOURCES[source]
     params.extend([str(product["product_id"]), product.get("date_record")])
+    guard_sql = f" AND ({' OR '.join(guards)})" if guards else ""
     cursor.execute(
         f"""
         UPDATE `{meta['table']}`
         SET {", ".join(updates)}
         WHERE `{meta['id_field']}` = %s AND `{meta['date_field']}` = %s
+          {guard_sql}
         """,
         params,
     )
@@ -1613,34 +2426,43 @@ def fetch_ai_daemon_product_keys(source, analysis, limit):
     date_field = meta["date_field"]
     image_field = meta["image_field"]
     where = [f"`{image_field}` IS NOT NULL", f"`{image_field}` <> ''"]
+    params = []
+    if AI_DAEMON_LATEST_ONLY:
+        latest_date = fetch_ai_daemon_latest_date(meta)
+        if not latest_date:
+            return []
+        where.append(f"`{date_field}` = %s")
+        params.append(latest_date)
 
-    prefilter_hit_sql = (
-        "JSON_VALID(material_analysis) "
-        "AND JSON_UNQUOTE(JSON_EXTRACT(material_analysis, '$.pre_filter.hit')) = 'true'"
-    )
     if analysis == "both":
         where.append(
             "("
             "material_analysis IS NULL OR material_analysis = '' "
-            "OR ((ip_grade IS NULL OR ip_grade = '') AND NOT (" + prefilter_hit_sql + "))"
+            "OR ip_grade IS NULL OR ip_grade = ''"
             ")"
         )
     elif analysis == "material":
         where.append("(material_analysis IS NULL OR material_analysis = '')")
     else:
         where.append("(ip_grade IS NULL OR ip_grade = '')")
-        where.append(f"NOT ({prefilter_hit_sql})")
 
     sql = f"""
         SELECT `{id_field}` AS product_id, `{date_field}` AS date_record
         FROM `{table}`
         WHERE {" AND ".join(where)}
-        ORDER BY `{date_field}` DESC, `id`
+        ORDER BY `id` DESC
         LIMIT %s
     """
     with db() as conn, conn.cursor() as cursor:
-        cursor.execute(sql, (limit,))
+        cursor.execute(sql, [*params, limit])
         return cursor.fetchall()
+
+
+def fetch_ai_daemon_latest_date(meta):
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(f"SELECT MAX(`{meta['date_field']}`) AS latest_date FROM `{meta['table']}`")
+        row = cursor.fetchone() or {}
+        return row.get("latest_date")
 
 
 app = create_app()

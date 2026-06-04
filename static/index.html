@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>选品审核平台</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.1.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.1.5">
 </head>
 <body>
   <div class="app hidden" id="appShell">
@@ -21,6 +21,9 @@
         <button class="active" data-source="unified">统一表</button>
         <button data-source="fastmoss">fastmoss</button>
         <button data-source="kalodata">kalodata</button>
+      </nav>
+      <nav class="source-nav utility-nav">
+        <button id="detailAnalysisNav" type="button">深度分析</button>
       </nav>
 
       <section class="filter-panel">
@@ -72,7 +75,7 @@
         </label>
         <label>材质细分<input id="materialCategories" placeholder="TPU,硅胶"></label>
         <label>排除材质<input id="excludeMaterialCategories" placeholder="钢化膜,贴纸"></label>
-        <label>排序<select id="sortBy"><option value="date_record">采集日期</option><option value="price">价格</option><option value="rating">评分</option><option value="commission">佣金比例</option><option value="sold">销量</option><option value="total_sold">总销量</option><option value="sale_amount">成交额</option><option value="author_count">达人数量</option><option value="launch_time">上架时间</option></select></label>
+        <label>排序<select id="sortBy"><option value="product_card_sales">商品卡销量</option><option value="total_sold">总销量</option><option value="sales_growth">销售环比</option><option value="product_card_ratio">商品卡占比</option><option value="launch_time">上架时间</option><option value="rating">评分</option><option value="ip_grade">IP等级</option></select></label>
         <button id="topSearchBtn" class="primary">查询</button>
       </section>
 
@@ -113,7 +116,7 @@
   <div id="toast" class="toast"></div>
 
   <script>
-    const state = { source: 'unified', view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'date_record', sortOrder: 'desc' };
+    const state = { source: 'unified', mode: 'products', detailAnalysisType: 'ip', view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
     const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
     const $ = (id) => document.getElementById(id);
@@ -177,14 +180,28 @@
     }
 
     document.querySelectorAll('#sourceNav button').forEach(btn => btn.addEventListener('click', () => {
+      state.mode = 'products';
       state.source = btn.dataset.source;
       state.page = 1;
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       btn.classList.add('active');
+      $('detailAnalysisNav').classList.remove('active');
       $('pageTitle').textContent = sourceText[state.source];
       $('exportReadyLink').href = `/api/products/${state.source}/export-ready-links`;
       loadDefaultDateAndData();
     }));
+    $('detailAnalysisNav').addEventListener('click', () => {
+      openDetailAnalysisWorkspace();
+    });
+
+    function openDetailAnalysisWorkspace(type = state.detailAnalysisType || 'ip') {
+      state.mode = 'detailAnalysis';
+      state.detailAnalysisType = type;
+      document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
+      $('detailAnalysisNav').classList.add('active');
+      renderDetailAnalysisPage();
+      loadDetailAnalyses();
+    }
     document.querySelectorAll('.view-switch button').forEach(btn => btn.addEventListener('click', () => {
       state.view = btn.dataset.view;
       document.querySelectorAll('.view-switch button').forEach(item => item.classList.remove('active'));
@@ -203,6 +220,102 @@
     $('closeDetail').addEventListener('click', () => $('detailDialog').close());
     $('closeImage').addEventListener('click', () => $('imageDialog').close());
     initCustomFilters();
+
+    function renderDetailAnalysisPage(items = [], loading = true) {
+      $('pageTitle').textContent = '深度分析';
+      $('stats').innerHTML = '';
+      $('periodHint').textContent = '用户主动触发的详细分析记录';
+      $('content').innerHTML = `
+        <section class="detail-analysis-page">
+          <div class="detail-analysis-toolbar">
+            <div class="detail-analysis-tabs">
+              <button type="button" class="${state.detailAnalysisType === 'ip' ? 'active' : ''}" data-detail-analysis-type="ip">IP分析</button>
+              <button type="button" class="${state.detailAnalysisType === 'material' ? 'active' : ''}" data-detail-analysis-type="material">材质分析</button>
+            </div>
+            <button type="button" data-refresh-detail-analyses>刷新</button>
+          </div>
+          <div class="detail-analysis-records">
+            ${loading ? '<div class="detail-empty">正在加载深度分析记录...</div>' : detailAnalysisRecordsHtml(items)}
+          </div>
+        </section>`;
+      $('pageInfo').textContent = '深度分析';
+      $('prevPage').disabled = true;
+      $('nextPage').disabled = true;
+      document.querySelectorAll('[data-detail-analysis-type]').forEach(btn => btn.addEventListener('click', () => {
+        state.detailAnalysisType = btn.dataset.detailAnalysisType;
+        renderDetailAnalysisPage([], true);
+        loadDetailAnalyses();
+      }));
+      document.querySelector('[data-refresh-detail-analyses]')?.addEventListener('click', loadDetailAnalyses);
+    }
+
+    async function loadDetailAnalyses() {
+      const res = await fetch(`/api/detail-analyses?analysis_type=${encodeURIComponent(state.detailAnalysisType)}`);
+      const json = await res.json();
+      if (!json.ok) return showToast(json.error || '深度分析记录加载失败');
+      renderDetailAnalysisPage(json.data.items || [], false);
+    }
+
+    function detailAnalysisRecordsHtml(items) {
+      if (!items.length) return '<div class="detail-empty">暂无深度分析记录</div>';
+      return items.map(record => {
+        const result = record.result || {};
+        const body = record.status === 'SUCCESS'
+          ? (record.analysis_type === 'ip' ? ipDetailedResultHtml(result) : materialDetailedResultHtml(result))
+          : `<div class="detail-empty">${record.status === 'RUNNING' ? '正在分析中，稍后刷新查看结果' : escapeHtml(record.error_message || '分析失败')}</div>`;
+        return `<article class="detail-analysis-record">
+          <div class="detail-analysis-record-head">
+            <div>
+              <strong>${escapeHtml(shortText(record.product_title || record.product_id, 90))}</strong>
+              <span>${escapeHtml(record.source)} · ${escapeHtml(record.product_id)} · ${escapeHtml(record.date_record)}</span>
+            </div>
+            <em class="record-status ${escapeHtml(record.status || '')}">${escapeHtml(record.status || '')}</em>
+          </div>
+          ${body}
+        </article>`;
+      }).join('');
+    }
+
+    async function loadDetailAnalyses() {
+      try {
+        const res = await fetch(`/api/detail-analyses?analysis_type=${encodeURIComponent(state.detailAnalysisType)}`);
+        if (!res.ok) {
+          renderDetailAnalysisPage([], false);
+          document.querySelector('.detail-analysis-records').innerHTML = `<div class="detail-empty">深度分析接口暂不可用，请确认后端已重启并加载最新代码。HTTP ${res.status}</div>`;
+          return;
+        }
+        const json = await res.json();
+        if (!json.ok) {
+          renderDetailAnalysisPage([], false);
+          document.querySelector('.detail-analysis-records').innerHTML = `<div class="detail-empty">${escapeHtml(json.error || '深度分析记录加载失败')}</div>`;
+          return;
+        }
+        renderDetailAnalysisPage(json.data.items || [], false);
+      } catch (error) {
+        renderDetailAnalysisPage([], false);
+        document.querySelector('.detail-analysis-records').innerHTML = '<div class="detail-empty">深度分析记录加载失败，请确认后端服务已重启。</div>';
+      }
+    }
+
+    function detailAnalysisRecordsHtml(items) {
+      if (!items.length) return '<div class="detail-empty">暂无深度分析记录。打开任意商品的 IP 或材质分析，点击“详细分析”后，这里会显示正在分析和已完成的记录。</div>';
+      return items.map(record => {
+        const result = record.result || {};
+        const body = record.status === 'SUCCESS'
+          ? (record.analysis_type === 'ip' ? ipDetailedResultHtml(result) : materialDetailedResultHtml(result))
+          : `<div class="detail-empty">${record.status === 'RUNNING' ? '正在分析中，稍后刷新查看结果' : escapeHtml(record.error_message || '分析失败')}</div>`;
+        return `<article class="detail-analysis-record">
+          <div class="detail-analysis-record-head">
+            <div>
+              <strong>${escapeHtml(shortText(record.product_title || record.product_id, 90))}</strong>
+              <span>${escapeHtml(record.source)} · ${escapeHtml(record.product_id)} · ${escapeHtml(record.date_record)}</span>
+            </div>
+            <em class="record-status ${escapeHtml(record.status || '')}">${escapeHtml(record.status || '')}</em>
+          </div>
+          ${body}
+        </article>`;
+      }).join('');
+    }
 
     async function logout() {
       await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
@@ -373,8 +486,11 @@
     }
 
     async function loadDefaultDateAndData() {
-      setFilterValue('dateStart', '');
-      setFilterValue('dateEnd', '');
+      const latest = await getLatestCollectionDate();
+      activeFilterKeys.add('dateRecord');
+      setFilterValue('dateStart', formatDate(latest));
+      setFilterValue('dateEnd', formatDate(latest));
+      renderActiveFilters();
       await loadAll();
     }
     function setFilterValue(id, value) {
@@ -473,12 +589,11 @@
     }
 
     function renderTable() {
-      const label = state.period === 'custom' ? '近7天' : state.periodLabel;
       $('content').innerHTML = `<div class="table-wrap"><table><thead><tr>
-        <th>商品图</th><th>商品标题</th><th>${sortHeader('price', '价格')}</th><th>${sortHeader('rating', '评分')}</th><th>${sortHeader('commission', '佣金比例')}</th>
-        <th class="metric-header">${sortHeader('sold', '销量')}<small>采集日期范围内求和</small><span class="metric-hint" title="按当前选择的采集日期范围，对该商品每天的销量字段求和展示。">?</span></th><th>${sortHeader('total_sold', '总销量')}</th><th>${sortHeader('sale_amount', `${label}成交额`)}</th><th>销售环比</th><th>${sortHeader('author_count', `${label}带货达人数`)}</th>
-        <th>${label}视频成交占比</th><th>${label}商品卡成交占比</th><th>上架时间</th>
-        <th>IP 等级</th><th>材质标签</th><th>当前状态</th><th>链接</th><th>详情</th>
+        <th>商品图</th><th>商品标题</th><th>${sortHeader('product_card_sales', '商品卡销量')}</th><th>近7天销量占比</th><th>近28天销量占比</th>
+        <th>${sortHeader('total_sold', '总销量')}</th><th class="metric-header">${sortHeader('sales_growth', '销售环比')}<span class="metric-hint" title="销售环比 = ((当前销量 / 上期销量) - 1) * 100%。当前销量按所选采集日期范围求和，上期销量取前一段同等数量的采集日期；上期销量为0时展示N/A。">?</span></th>
+        <th>${sortHeader('product_card_ratio', '商品卡占比')}</th><th>${sortHeader('launch_time', '上架时间')}</th><th>${sortHeader('rating', '评分')}</th><th>${sortHeader('ip_grade', 'IP等级')}</th>
+        <th>材质标签</th><th>当前状态</th><th>链接</th><th>详情</th>
       </tr></thead><tbody>${state.items.map(rowTemplate).join('')}</tbody></table></div>`;
       bindRowActions();
       bindSortHeaders();
@@ -488,10 +603,9 @@
       return `<tr>
         <td><button class="image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img class="thumb" src="${item.image_url}" alt=""></button></td>
         <td class="title-cell">${productTitleCell(item)}</td>
-        <td>${escapeHtml(item.price)}</td><td>${escapeHtml(item.rating)}</td><td>${escapeHtml(formatPlainNumber(item.commission_rate))}</td>
-        <td>${escapeHtml(item.sold_count)}</td><td>${escapeHtml(item.total_sold_count)}</td><td>${escapeHtml(item.sale_amount)}</td><td>${escapeHtml(item.sales_growth)}</td>
-        <td>${escapeHtml(item.author_count)}</td><td>${escapeHtml(item.video_ratio)}</td><td>${escapeHtml(item.product_card_ratio)}</td>
-        <td>${escapeHtml(item.launch_time)}</td><td>${gradeBadge(item.ip_grade)}${reasonPreview('IP判断原因', item.ip_reason, item)}</td>
+        <td>${escapeHtml(item.product_card_sales)}</td><td>${salesSharePie(item.distribution_7d_chart)}</td><td>${salesSharePie(item.distribution_28d_chart)}</td>
+        <td>${escapeHtml(item.total_sold_count)}</td><td>${escapeHtml(item.sales_growth)}</td><td>${escapeHtml(item.product_card_ratio_28d || item.product_card_ratio)}</td>
+        <td>${escapeHtml(item.launch_time)}</td><td>${escapeHtml(item.rating)}</td><td>${gradeBadge(item.ip_grade, item)}</td>
         <td>${materialBadge(item)}${reasonPreview('材质判断原因', item.material_reason)}</td>
         <td>${statusSelect(item)}</td><td>${platformLinks(item)}</td>
         <td><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></td>
@@ -502,11 +616,40 @@
       const label = state.periodLabel;
       $('content').innerHTML = `<div class="card-grid">${state.items.map(item => `<article class="product-card">
         <button class="card-image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img src="${item.image_url}" alt=""></button><div class="card-body"><h3>${escapeHtml(item.title)}</h3><p>${item.product_id} · ${item.date_record || ''}</p>
-        <div class="badges">${gradeBadge(item.ip_grade)}${materialBadge(item)}</div>
+        <div class="badges">${gradeBadge(item.ip_grade, item)}${materialBadge(item)}</div>
         <div class="metrics"><span>价格 ${escapeHtml(item.price)}</span><span title="按当前选择的采集日期范围，对该商品每天的销量字段求和展示。">销量 ${escapeHtml(item.sold_count)}</span><span>总销量 ${escapeHtml(item.total_sold_count)}</span><span>${label}成交额 ${escapeHtml(item.sale_amount)}</span><span>达人 ${escapeHtml(item.author_count)}</span><span>视频 ${escapeHtml(item.video_ratio)}</span><span>商品卡 ${escapeHtml(item.product_card_ratio)}</span></div>
         <div class="card-actions">${statusSelect(item)}${platformLinks(item)}<button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></div></div>
       </article>`).join('')}</div>`;
       bindRowActions();
+    }
+
+    function salesSharePie(items = []) {
+      const colors = ['#5d82ff', '#86e7bd', '#ff5b92'];
+      const list = Array.isArray(items) ? items : [];
+      const values = list.map(item => numericDisplayValue(item.sales ?? 0));
+      let total = values.reduce((sum, value) => sum + value, 0);
+      if (total <= 0) {
+        values.splice(0, values.length, ...list.map(item => percentNumber(item.ratio)));
+        total = values.reduce((sum, value) => sum + value, 0);
+      }
+      if (total <= 0) return '<span class="mini-pie-empty">暂无</span>';
+      let cursor = 0;
+      const stops = values.map((value, index) => {
+        const start = cursor;
+        cursor += (value / total) * 100;
+        return `${colors[index % colors.length]} ${start}% ${cursor}%`;
+      }).join(', ');
+      return `<div class="mini-share">
+        <span class="mini-pie" style="background: conic-gradient(${stops});"></span>
+        <span class="mini-share-list">${list.map((item, index) => `<em><i style="background:${colors[index % colors.length]}"></i>${escapeHtml(item.name)} ${escapeHtml(item.ratio || '0%')}</em>`).join('')}</span>
+      </div>`;
+    }
+
+    function percentNumber(value) {
+      const text = String(value ?? '').replace('%', '').replace(',', '').trim();
+      const number = Number(text);
+      if (!Number.isFinite(number)) return 0;
+      return number <= 1 && number > 0 ? number * 100 : number;
     }
 
     function sortHeader(field, label) {
@@ -535,7 +678,7 @@
     function bindRowActions() {
       document.querySelectorAll('[data-detail]').forEach(btn => btn.addEventListener('click', () => openDetail(btn.dataset.detail, btn.dataset.date)));
       document.querySelectorAll('[data-image]').forEach(btn => btn.addEventListener('click', () => openImage(btn.dataset.image, btn.dataset.title)));
-      document.querySelectorAll('[data-reason-title]').forEach(btn => btn.addEventListener('click', () => openReason(btn.dataset.reasonTitle, btn.dataset.reasonText, btn.dataset.productTitle, btn.dataset.ipGrade)));
+      document.querySelectorAll('[data-reason-title]').forEach(btn => btn.addEventListener('click', () => openReason(btn.dataset.reasonTitle, btn.dataset.reasonText, btn.dataset.productTitle, btn.dataset.ipGrade, btn.dataset.productId, btn.dataset.dateRecord, btn.dataset.source)));
       document.querySelectorAll('[data-status-product]').forEach(select => select.addEventListener('change', () => updateStatus(select)));
       document.querySelectorAll('[data-product-title]').forEach(el => {
         el.addEventListener('mouseenter', () => showProductTitleTooltip(el));
@@ -563,6 +706,8 @@
     let currentDetailItem = null;
     let currentDetailPeriod = '7d';
     let currentDistributionView = 'bar';
+    let currentSkuRule = null;
+    let currentSkuView = 'bar';
 
     async function openDetail(productId, dateRecord) {
       const res = await fetch(`/api/products/${state.source}/${productId}?date_record=${encodeURIComponent(dateRecord || '')}`);
@@ -570,12 +715,15 @@
       if (!json.ok) return showToast(json.error || '详情加载失败');
       currentDetailItem = json.data;
       currentDetailPeriod = state.period === '30d' ? '30d' : '7d';
+      currentSkuRule = null;
+      currentSkuView = 'bar';
       renderDetailDialog();
       $('detailDialog').showModal();
     }
 
     window.setDetailPeriod = function(period) {
       currentDetailPeriod = period;
+      currentSkuRule = null;
       renderDetailDialog();
     };
 
@@ -590,12 +738,35 @@
         currentDistributionView = btn.dataset.distributionView;
         renderDetailDialog();
       }));
+      document.querySelectorAll('[data-sku-rule]').forEach(btn => btn.addEventListener('click', () => {
+        currentSkuRule = btn.dataset.skuRule;
+        renderDetailDialog();
+      }));
+      document.querySelectorAll('[data-sku-view]').forEach(btn => btn.addEventListener('click', () => {
+        currentSkuView = btn.dataset.skuView;
+        renderDetailDialog();
+      }));
+      document.querySelectorAll('[data-analysis-detail]').forEach(btn => btn.addEventListener('click', () => loadDetailedAnalysis(btn)));
+      document.querySelectorAll('[data-open-detail-analysis]').forEach(btn => btn.addEventListener('click', () => {
+        $('detailDialog').close();
+        openDetailAnalysisWorkspace(btn.dataset.openDetailAnalysis || state.detailAnalysisType);
+      }));
     }
 
-    function openReason(title, text, productTitle = '', grade = '') {
+    function openReason(title, text, productTitle = '', grade = '', productId = '', dateRecord = '', source = '') {
+      if (productId && dateRecord) {
+        currentDetailItem = {
+          ...(currentDetailItem || {}),
+          source: source || state.source,
+          product_id: productId,
+          date_record: dateRecord,
+          title: productTitle,
+        };
+      }
       $('detailBody').innerHTML = title.includes('IP')
-        ? formatIpReasonHtml(text, { title: productTitle, ip_grade: grade })
+        ? formatIpReasonHtml(text, { title: productTitle, ip_grade: grade, product_id: productId, date_record: dateRecord })
         : `<h4>${escapeHtml(title)}</h4><pre>${escapeHtml(text || '暂无详细原因')}</pre>`;
+      bindDetailControls();
       $('detailDialog').showModal();
     }
 
@@ -663,6 +834,7 @@
             ${overviewPanel('核心指标', overview)}
           </div>
         </section>
+        ${skuAnalysisSection(item, period)}
         <section class="detail-section">
           <div class="detail-section-head"><h4>风险与属性分析</h4></div>
           <div class="detail-analysis-grid">
@@ -777,6 +949,90 @@
       return String(value).includes('万') ? number * 10000 : number;
     }
 
+    function skuAnalysisSection(item, period) {
+      const sku = detailSkuAnalysis(item, period);
+      if (!sku) return '';
+      const dimensions = Array.isArray(sku.dimensions) ? sku.dimensions : [];
+      if (!dimensions.length) return '';
+      const activeRule = currentSkuRule && dimensions.some(dim => dim.name === currentSkuRule)
+        ? currentSkuRule
+        : dimensions[0].name;
+      const dimension = dimensions.find(dim => dim.name === activeRule) || dimensions[0];
+      const items = (dimension.items || []).slice(0, 6);
+      const best = sku.best_sku;
+      const bestText = best && best.name
+        ? `表现最佳SKU：${best.rule} - ${best.name} ｜ 销量 ${best.sales_display || best.sales || 0}`
+        : '暂无表现最佳SKU';
+      return `<section class="detail-section sku-section">
+        <div class="detail-section-head">
+          <h4>SKU分析</h4>
+          <span>${escapeHtml(sku.period_label || (period === '30d' ? '近28天' : '近7天'))}</span>
+        </div>
+        <div class="sku-best">${escapeHtml(bestText)}</div>
+        <div class="sku-rule-row">
+          <span>筛选规则：</span>
+          ${dimensions.map(dim => `<button type="button" class="${dim.name === activeRule ? 'active' : ''}" data-sku-rule="${escapeHtml(dim.name)}">${escapeHtml(dim.name)}</button>`).join('')}
+        </div>
+        <div class="detail-panel sku-chart-panel">
+          <div class="detail-panel-headline">
+            <h5>成交占比(${escapeHtml(sku.period_label || '')})</h5>
+            <div class="detail-chart-switch">
+              <button type="button" class="${currentSkuView === 'bar' ? 'active' : ''}" data-sku-view="bar">条形图</button>
+              <button type="button" class="${currentSkuView === 'pie' ? 'active' : ''}" data-sku-view="pie">饼图</button>
+            </div>
+          </div>
+          ${items.length ? (currentSkuView === 'pie' ? skuDonutTable(items) : skuBarTable(items)) : '<div class="detail-empty">暂无SKU销量数据</div>'}
+        </div>
+      </section>`;
+    }
+
+    function detailSkuAnalysis(item, period) {
+      const fields = item.sku_analysis || {};
+      const key = period === '30d' ? '28d' : '7d';
+      return fields[key] || null;
+    }
+
+    function skuDonutTable(items) {
+      const colors = ['#ff5b92', '#86e7bd', '#5d82ff', '#f59e0b', '#8b5cf6', '#06b6d4'];
+      const values = items.map(item => numericDisplayValue(item.sales ?? item.sales_display ?? 0));
+      const total = values.reduce((sum, value) => sum + value, 0) || 100;
+      let cursor = 0;
+      const stops = values.map((value, index) => {
+        const start = cursor;
+        cursor += (value / total) * 100;
+        return `${colors[index % colors.length]} ${start}% ${cursor}%`;
+      }).join(', ');
+      return `<div class="detail-donut-layout sku-donut-layout">
+        <div class="detail-donut sku-donut" style="background: conic-gradient(${stops});"></div>
+        <div class="detail-distribution-table">
+          <div class="detail-distribution-head">
+            <span>规格</span><span>占比</span><span>销量</span>
+          </div>
+          ${items.map((item, index) => {
+          const ratio = total ? `${Math.round((values[index] / total) * 100)}%` : (item.ratio || '0%');
+          return `<div class="detail-distribution-row">
+            <span><i style="background:${colors[index % colors.length]}"></i>${escapeHtml(item.name || `规格${index + 1}`)}</span>
+            <strong>${escapeHtml(ratio)}</strong>
+            <em>${escapeHtml(item.sales_display ?? item.sales ?? 0)}</em>
+          </div>`;
+        }).join('')}
+        </div>
+      </div>`;
+    }
+
+    function skuBarTable(items) {
+      const values = items.map(item => numericDisplayValue(item.sales ?? item.sales_display ?? 0));
+      const total = values.reduce((sum, value) => sum + value, 0) || 100;
+      return `<div class="detail-bars sku-bars">${items.map((item, index) => {
+        const ratio = total ? `${Math.round((values[index] / total) * 100)}%` : (item.ratio || '0%');
+        return `<div class="detail-bar-row">
+          <div><strong>${escapeHtml(item.name || `规格${index + 1}`)}</strong><span>${escapeHtml(item.sales_display ?? item.sales ?? 0)}</span></div>
+          <div class="detail-bar-track"><i style="width:${escapeHtml(ratio)}"></i></div>
+          <em>${escapeHtml(ratio)}</em>
+        </div>`;
+      }).join('')}</div>`;
+    }
+
     function overviewPanel(title, overview) {
       if (!overview || !Object.keys(overview).length) return `<div class="detail-panel"><h5>${escapeHtml(title)}</h5><div class="detail-empty">暂无周期指标</div></div>`;
       const baseKeys = Object.keys(overview).filter(k => !k.startsWith('日均') && overview[k] !== null && overview[k] !== '' && overview[k] !== undefined);
@@ -855,7 +1111,7 @@
       Object.keys(filterValues).forEach(id => delete filterValues[id]);
       activeFilterKeys.clear();
       renderActiveFilters();
-      $('period').value = '7d'; $('sortBy').value = 'date_record'; state.sortBy = 'date_record'; state.sortOrder = 'desc'; state.page = 1; loadDefaultDateAndData();
+      $('period').value = '7d'; $('sortBy').value = 'product_card_sales'; state.sortBy = 'product_card_sales'; state.sortOrder = 'desc'; state.page = 1; loadDefaultDateAndData();
     }
 
     function renderPager() {
@@ -864,7 +1120,13 @@
       $('prevPage').disabled = state.page <= 1; $('nextPage').disabled = state.page >= maxPage;
     }
 
-    function gradeBadge(grade) { return grade ? `<span class="badge grade-${grade}">IP ${grade}</span>` : '<span class="badge muted">未分析</span>'; }
+    function gradeBadge(grade, item = null) {
+      if (!grade) return '<span class="badge muted">未分析</span>';
+      if (item && item.ip_reason) {
+        return `<button type="button" class="badge grade-${grade} badge-button" data-reason-title="IP 简要分析" data-reason-text="${escapeHtml(item.ip_reason || '')}" data-product-title="${escapeHtml(item.title || '')}" data-ip-grade="${escapeHtml(grade)}" data-product-id="${escapeHtml(item.product_id || '')}" data-date-record="${escapeHtml(item.date_record || '')}" data-source="${escapeHtml(item.source || state.source)}">IP ${escapeHtml(grade)}</button>`;
+      }
+      return `<span class="badge grade-${grade}">IP ${escapeHtml(grade)}</span>`;
+    }
 
     function materialBadge(item) { return item.material_type ? `<span class="badge material">${escapeHtml(item.material_type)}${item.material_category ? ' · ' + escapeHtml(item.material_category) : ''}</span>` : '<span class="badge muted">材质未分析</span>'; }
 
@@ -924,6 +1186,9 @@
     }
 
     function inferIllustrationSource(text, grade) {
+      if (grade === 'E' || /低风险|未识别到明确 IP|未命中特定 IP|无IP风险|非IP|通用/.test(String(text || ''))) {
+        return '未识别到明确的版权角色、品牌 Logo 或特定作品来源。';
+      }
       const sourcePatterns = [
         [/Adventure Time|探险活宝/i, 'Cartoon Network 动画《Adventure Time / 探险活宝》'],
         [/Disney|迪士尼|Mickey|Minnie|米老鼠/i, 'Disney / 迪士尼相关角色或标识'],
@@ -978,6 +1243,298 @@
 
     function tidySentence(text) {
       return String(text || '').replace(/^[：:；;，,\s]+/, '').replace(/[。；;，,\s]+$/, '').trim();
+    }
+
+    async function loadDetailedAnalysis(btn) {
+      if (!currentDetailItem || !currentDetailItem.product_id || !currentDetailItem.date_record) {
+        showToast('\u7f3a\u5c11\u5546\u54c1\u4fe1\u606f\uff0c\u8bf7\u5148\u6253\u5f00\u5546\u54c1\u8be6\u60c5\u540e\u518d\u8bd5');
+        return;
+      }
+      const type = btn.dataset.analysisDetail;
+      const target = document.querySelector(btn.dataset.analysisTarget);
+      btn.disabled = true;
+      const originalText = btn.textContent;
+      btn.textContent = '分析中...';
+      if (target) target.innerHTML = '<div class="detail-empty">正在生成详细分析...</div>';
+      try {
+        const res = await fetch(`/api/products/${currentDetailItem.source}/${encodeURIComponent(currentDetailItem.product_id)}/analysis-detail`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({analysis_type: type, date_record: currentDetailItem.date_record})
+        });
+        const json = await res.json();
+        if (!json.ok) {
+          if (target) target.innerHTML = `<div class="detail-empty">${escapeHtml(json.error || '详细分析失败')}</div>`;
+          showToast(json.error || '详细分析失败');
+          return;
+        }
+        const result = json.data?.result || {};
+        if (target) target.innerHTML = type === 'ip' ? ipDetailedResultHtml(result) : materialDetailedResultHtml(result);
+      } catch (error) {
+        if (target) target.innerHTML = '<div class="detail-empty">详细分析请求失败</div>';
+        showToast('详细分析请求失败');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    function formatIpReasonHtml(text, item = {}) {
+      const summary = ipSummaryData(text, item);
+      const targetId = `ip-detail-${String(item.product_id || 'current').replace(/[^a-zA-Z0-9_-]/g, '')}`;
+      return `<section class="ip-analysis detail-panel">
+        <div class="ip-analysis-head">
+          <span>${gradeBadge(summary.grade)}</span>
+          <strong>${escapeHtml(summary.riskSummary)}</strong>
+        </div>
+        <div class="ip-section"><h4>1. 插画/图案出自哪里？</h4><p>${escapeHtml(summary.source)}</p></div>
+        <div class="ip-section"><h4>2. 是否构成侵权？</h4><p>${escapeHtml(summary.infringement)}</p></div>
+        <button type="button" class="detail-analysis-button" data-analysis-detail="ip" data-analysis-target="#${targetId}">详细分析</button>
+        <div id="${targetId}" class="analysis-detail-result"></div>
+      </section>`;
+    }
+
+    function ipSummaryData(text, item = {}) {
+      const parsed = parseMaybeJson(text);
+      const grade = item.ip_grade || parsed?.ip_grade || inferIpGrade(text);
+      if (parsed) {
+        return {
+          grade,
+          source: parsed.illustration_source || parsed.source || '暂未识别到明确插画/IP来源',
+          infringement: parsed.infringement_reason || (parsed.is_infringing ? `是否侵权：${parsed.is_infringing}` : inferRiskDetail('', grade)),
+          riskSummary: parsed.risk_summary || inferRiskLabel('', grade),
+        };
+      }
+      const oldSummary = summarizeIpReason(String(text || ''), item.title || '', grade);
+      return {
+        grade,
+        source: oldSummary.source,
+        infringement: oldSummary.riskDetail,
+        riskSummary: oldSummary.risk,
+      };
+    }
+
+    function ipDetailedResultHtml(result) {
+      const source = result.illustration_source || '暂未识别到明确来源';
+      const infringement = result.infringement_reason || result.is_infringing || '暂未给出侵权判断';
+      const summary = result.risk_summary || '';
+      return `<div class="analysis-detail-card">
+        ${summary ? `<div class="ip-conclusion"><strong>结论：</strong>${escapeHtml(summary)}</div>` : ''}
+        <div class="ip-section"><h4>图片出自何处</h4><p>${escapeHtml(source)}</p></div>
+        <div class="ip-section"><h4>是否构成侵权</h4><p>${escapeHtml(infringement)}</p></div>
+        ${analysisListGroup('图片角度', result.image_reasons)}
+        ${analysisListGroup('标题角度', result.title_reasons)}
+        ${analysisListGroup('规则/经验依据', result.rule_reasons)}
+      </div>`;
+    }
+
+    function materialAnalysisHtml(value) {
+      const material = parseMaybeJson(value) || {};
+      const targetId = 'material-detail-current';
+      if (!Object.keys(material).length) return `<div class="detail-panel"><h5>材质分析</h5><div class="detail-empty">暂无材质分析</div></div>`;
+      return `<div class="detail-panel material-analysis">
+        <h5>材质分析</h5>
+        <div class="detail-kv-grid">
+          <div><span>类型</span><strong>${escapeHtml(material.material_type || '--')}</strong></div>
+          <div><span>细分</span><strong>${escapeHtml(material.material_category || '--')}</strong></div>
+          <div><span>置信度</span><strong>${escapeHtml(material.confidence || '--')}</strong></div>
+        </div>
+        <p class="detail-note">${escapeHtml(material.material_summary || material.material_reason || '')}</p>
+        <button type="button" class="detail-analysis-button" data-analysis-detail="material" data-analysis-target="#${targetId}">详细分析</button>
+        <div id="${targetId}" class="analysis-detail-result"></div>
+      </div>`;
+    }
+
+    function materialDetailedResultHtml(result) {
+      return `<div class="analysis-detail-card">
+        <div class="detail-kv-grid">
+          <div><span>类型</span><strong>${escapeHtml(result.material_type || '--')}</strong></div>
+          <div><span>细分</span><strong>${escapeHtml(result.material_category || '--')}</strong></div>
+          <div><span>置信度</span><strong>${escapeHtml(result.confidence || '--')}</strong></div>
+        </div>
+        <p class="detail-note">${escapeHtml(result.material_summary || result.material_reason || '')}</p>
+        ${analysisListGroup('图片角度', result.image_reasons)}
+        ${analysisListGroup('标题角度', result.title_reasons)}
+        ${analysisListGroup('规则/经验依据', result.rule_reasons)}
+      </div>`;
+    }
+
+    function analysisListGroup(title, items) {
+      const list = Array.isArray(items) ? items.filter(Boolean) : [];
+      if (!list.length) return '';
+      return `<div class="ip-reason-group"><strong>${escapeHtml(title)}</strong><ul>${list.map(item => `<li>${escapeHtml(shortText(item, 180))}</li>`).join('')}</ul></div>`;
+    }
+
+    function uiText(key) {
+      const texts = {
+        detail: '\u8be6\u7ec6\u5206\u6790',
+        analyzing: '\u5206\u6790\u4e2d...',
+        generating: '\u6b63\u5728\u751f\u6210\u8be6\u7ec6\u5206\u6790...',
+        failed: '\u8be6\u7ec6\u5206\u6790\u5931\u8d25',
+        requestFailed: '\u8be6\u7ec6\u5206\u6790\u8bf7\u6c42\u5931\u8d25',
+        ipSourceTitle: '1. \u63d2\u753b/\u56fe\u6848\u51fa\u81ea\u54ea\u91cc\uff1f',
+        ipRiskTitle: '2. \u662f\u5426\u6784\u6210\u4fb5\u6743\uff1f',
+        noIpSource: '\u6682\u672a\u8bc6\u522b\u5230\u660e\u786e\u63d2\u753b/IP\u6765\u6e90',
+        noDetailSource: '\u6682\u672a\u8bc6\u522b\u5230\u660e\u786e\u6765\u6e90',
+        noInfringement: '\u6682\u672a\u7ed9\u51fa\u4fb5\u6743\u5224\u65ad',
+        conclusion: '\u7ed3\u8bba\uff1a',
+        imageFrom: '\u56fe\u7247\u51fa\u81ea\u4f55\u5904',
+        riskQuestion: '\u662f\u5426\u6784\u6210\u4fb5\u6743',
+        imageAngle: '\u56fe\u7247\u89d2\u5ea6',
+        titleAngle: '\u6807\u9898\u89d2\u5ea6',
+        ruleAngle: '\u89c4\u5219/\u7ecf\u9a8c\u4f9d\u636e',
+        material: '\u6750\u8d28\u5206\u6790',
+        noMaterial: '\u6682\u65e0\u6750\u8d28\u5206\u6790',
+        type: '\u7c7b\u578b',
+        category: '\u7ec6\u5206',
+        confidence: '\u7f6e\u4fe1\u5ea6',
+        isInfringing: '\u662f\u5426\u4fb5\u6743\uff1a',
+      };
+      return texts[key] || key;
+    }
+
+    async function loadDetailedAnalysis(btn) {
+      if (!currentDetailItem || !currentDetailItem.product_id || !currentDetailItem.date_record) {
+        showToast('\u7f3a\u5c11\u5546\u54c1\u4fe1\u606f\uff0c\u8bf7\u5148\u6253\u5f00\u5546\u54c1\u8be6\u60c5\u540e\u518d\u8bd5');
+        return;
+      }
+      const type = btn.dataset.analysisDetail;
+      const target = document.querySelector(btn.dataset.analysisTarget);
+      btn.disabled = true;
+      const originalText = btn.textContent;
+      btn.textContent = uiText('analyzing');
+      if (target) target.innerHTML = `<div class="detail-empty">${uiText('generating')}</div>`;
+      try {
+        const res = await fetch(`/api/products/${currentDetailItem.source}/${encodeURIComponent(currentDetailItem.product_id)}/analysis-detail`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({analysis_type: type, date_record: currentDetailItem.date_record, title: currentDetailItem.title || ''})
+        });
+        const json = await res.json();
+        if (!json.ok) {
+          if (target) target.innerHTML = `<div class="detail-empty">${escapeHtml(json.error || uiText('failed'))}</div>`;
+          showToast(json.error || uiText('failed'));
+          return;
+        }
+        if (json.data?.result) {
+          const result = json.data.result || {};
+          if (target) target.innerHTML = type === 'ip' ? ipDetailedResultHtml(result) : materialDetailedResultHtml(result);
+          showToast(json.data.cached ? '\u5df2\u8bfb\u53d6\u7f13\u5b58\u8be6\u7ec6\u5206\u6790' : '\u8be6\u7ec6\u5206\u6790\u5df2\u5b8c\u6210');
+        } else {
+          if (target) target.innerHTML = `<div class="detail-analysis-queued">
+            <strong>已加入深度分析</strong>
+            <span>后台正在分析中，你可以关闭弹窗继续筛选商品。</span>
+            <button type="button" data-open-detail-analysis="${escapeHtml(type)}">去深度分析查看</button>
+          </div>`;
+          bindDetailControls();
+          showToast('已加入深度分析');
+        }
+      } catch (error) {
+        if (target) target.innerHTML = `<div class="detail-empty">${uiText('requestFailed')}</div>`;
+        showToast(uiText('requestFailed'));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    function formatIpReasonHtml(text, item = {}) {
+      const summary = ipSummaryData(text, item);
+      const targetId = `ip-detail-${String(item.product_id || 'current').replace(/[^a-zA-Z0-9_-]/g, '')}`;
+      return `<section class="ip-analysis detail-panel">
+        <div class="ip-analysis-head"><span>${gradeBadge(summary.grade)}</span><strong>${escapeHtml(summary.riskSummary)}</strong></div>
+        <div class="ip-section"><h4>${uiText('ipSourceTitle')}</h4><p>${escapeHtml(summary.source)}</p></div>
+        <div class="ip-section"><h4>${uiText('ipRiskTitle')}</h4><p>${escapeHtml(summary.infringement)}</p></div>
+        <button type="button" class="detail-analysis-button" data-analysis-detail="ip" data-analysis-target="#${targetId}">${uiText('detail')}</button>
+        ${detailAnalysisHintHtml('ip')}
+        <div id="${targetId}" class="analysis-detail-result"></div>
+      </section>`;
+    }
+
+    function ipSummaryData(text, item = {}) {
+      const parsed = parseMaybeJson(text);
+      let grade = item.ip_grade || parsed?.ip_grade || inferIpGrade(text);
+      const parsedSource = parsed?.illustration_source || parsed?.source || '';
+      const sourceText = parsedSource || String(text || '');
+      const shouldDowngradeUnclear = ['S', 'A', 'B', 'C'].includes(grade) && isUnknownIpSourceText(sourceText);
+      if (shouldDowngradeUnclear) grade = 'D';
+      const lowRiskSource = grade === 'E' ? uiText('noIpSource') : '';
+      if (parsed) {
+        return {
+          grade,
+          source: lowRiskSource || parsed.illustration_source || parsed.source || uiText('noIpSource'),
+          infringement: shouldDowngradeUnclear ? '\u6765\u6e90\u8bc1\u636e\u4e0d\u660e\u786e\uff0c\u4e0d\u80fd\u76f4\u63a5\u6309\u9ad8\u98ce\u9669 IP \u5904\u7406\uff0c\u5efa\u8bae\u4eba\u5de5\u590d\u6838\u3002' : (parsed.infringement_reason || (parsed.is_infringing ? `${uiText('isInfringing')}${parsed.is_infringing}` : inferRiskDetail('', grade))),
+          riskSummary: shouldDowngradeUnclear ? '\u7591\u4f3c\u98ce\u9669\uff0c\u6765\u6e90\u8bc1\u636e\u4e0d\u660e\u786e' : (parsed.risk_summary || inferRiskLabel('', grade)),
+        };
+      }
+      const oldSummary = summarizeIpReason(String(text || ''), item.title || '', grade);
+      const oldSummaryUnclear = ['S', 'A', 'B', 'C'].includes(grade) && isUnknownIpSourceText(`${oldSummary.source} ${oldSummary.riskDetail}`);
+      if (oldSummaryUnclear) grade = 'D';
+      return {
+        grade,
+        source: lowRiskSource || (shouldDowngradeUnclear || oldSummaryUnclear ? '\u672a\u8bc6\u522b\u5230\u660e\u786eIP\u6765\u6e90\uff0c\u4e0d\u80fd\u8bf4\u660e\u5177\u4f53\u51fa\u81ea\u54ea\u4e2a\u4f5c\u54c1\u6216\u54c1\u724c\u3002' : oldSummary.source),
+        infringement: shouldDowngradeUnclear || oldSummaryUnclear ? '\u6765\u6e90\u8bc1\u636e\u4e0d\u660e\u786e\uff0c\u4e0d\u80fd\u76f4\u63a5\u6309\u9ad8\u98ce\u9669 IP \u5904\u7406\uff0c\u5efa\u8bae\u4eba\u5de5\u590d\u6838\u3002' : oldSummary.riskDetail,
+        riskSummary: shouldDowngradeUnclear || oldSummaryUnclear ? '\u7591\u4f3c\u98ce\u9669\uff0c\u6765\u6e90\u8bc1\u636e\u4e0d\u660e\u786e' : oldSummary.risk,
+      };
+    }
+
+    function isUnknownIpSourceText(text) {
+      return /unknown|not identified|no clear|unclear|\u672a\u8bc6\u522b|\u6682\u672a|\u672a\u63d0\u53d6|\u672a\u627e\u5230|\u4e0d\u660e\u786e|\u65e0\u6cd5\u786e\u8ba4|\u9700\u8981\u4eba\u5de5|\u901a\u7528\u5143\u7d20/.test(String(text || '').toLowerCase());
+    }
+
+    function ipDetailedResultHtml(result) {
+      const source = result.illustration_source || uiText('noDetailSource');
+      const infringement = result.infringement_reason || result.is_infringing || uiText('noInfringement');
+      const summary = result.risk_summary || '';
+      return `<div class="analysis-detail-card">
+        ${summary ? `<div class="ip-conclusion"><strong>${uiText('conclusion')}</strong>${escapeHtml(summary)}</div>` : ''}
+        <div class="ip-section"><h4>${uiText('imageFrom')}</h4><p>${escapeHtml(source)}</p></div>
+        <div class="ip-section"><h4>${uiText('riskQuestion')}</h4><p>${escapeHtml(infringement)}</p></div>
+        ${analysisListGroup(uiText('imageAngle'), result.image_reasons)}
+        ${analysisListGroup(uiText('titleAngle'), result.title_reasons)}
+        ${analysisListGroup(uiText('ruleAngle'), result.rule_reasons)}
+      </div>`;
+    }
+
+    function materialAnalysisHtml(value) {
+      const material = parseMaybeJson(value) || {};
+      const targetId = 'material-detail-current';
+      if (!Object.keys(material).length) return `<div class="detail-panel"><h5>${uiText('material')}</h5><div class="detail-empty">${uiText('noMaterial')}</div></div>`;
+      return `<div class="detail-panel material-analysis">
+        <h5>${uiText('material')}</h5>
+        <div class="detail-kv-grid">
+          <div><span>${uiText('type')}</span><strong>${escapeHtml(material.material_type || '--')}</strong></div>
+          <div><span>${uiText('category')}</span><strong>${escapeHtml(material.material_category || '--')}</strong></div>
+          <div><span>${uiText('confidence')}</span><strong>${escapeHtml(material.confidence || '--')}</strong></div>
+        </div>
+        <p class="detail-note">${escapeHtml(material.material_summary || material.material_reason || '')}</p>
+        <button type="button" class="detail-analysis-button" data-analysis-detail="material" data-analysis-target="#${targetId}">${uiText('detail')}</button>
+        ${detailAnalysisHintHtml('material')}
+        <div id="${targetId}" class="analysis-detail-result"></div>
+      </div>`;
+    }
+
+    function materialDetailedResultHtml(result) {
+      return `<div class="analysis-detail-card">
+        <div class="detail-kv-grid">
+          <div><span>${uiText('type')}</span><strong>${escapeHtml(result.material_type || '--')}</strong></div>
+          <div><span>${uiText('category')}</span><strong>${escapeHtml(result.material_category || '--')}</strong></div>
+          <div><span>${uiText('confidence')}</span><strong>${escapeHtml(result.confidence || '--')}</strong></div>
+        </div>
+        <p class="detail-note">${escapeHtml(result.material_summary || result.material_reason || '')}</p>
+        ${analysisListGroup(uiText('imageAngle'), result.image_reasons)}
+        ${analysisListGroup(uiText('titleAngle'), result.title_reasons)}
+        ${analysisListGroup(uiText('ruleAngle'), result.rule_reasons)}
+      </div>`;
+    }
+
+    function detailAnalysisHintHtml(type) {
+      return `<div class="detail-analysis-hint">
+        <strong>不用停在这里等结果</strong>
+        <span>点击后会在后台继续分析，关闭弹窗也不会取消。稍后可以到“深度分析”查看完成和正在分析的商品。</span>
+        <button type="button" data-open-detail-analysis="${escapeHtml(type)}">去深度分析查看</button>
+      </div>
+      <p class="detail-analysis-microcopy">首次使用提示：详细分析会消耗更多时间，已完成结果会自动缓存，再次点击同一商品会直接读取。</p>`;
     }
 
     function platformLinks(item) {

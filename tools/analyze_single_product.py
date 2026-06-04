@@ -29,6 +29,39 @@ MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY") or os.getenv("minimax_api_key") o
 MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
 PROMPT_VERSION = "single_product_v1"
 MAX_LOG_TEXT_LENGTH = 120000
+UNKNOWN_IP_SOURCE_MARKERS = (
+    "unknown",
+    "not identified",
+    "no clear",
+    "unclear",
+    "未识别",
+    "暂未",
+    "未知",
+    "不明确",
+    "无法确认",
+    "需要人工",
+    "通用元素",
+)
+PROTECTED_IP_MARKERS = (
+    "Disney",
+    "迪士尼",
+    "Mickey",
+    "Minnie",
+    "米老鼠",
+    "Barbie",
+    "芭比",
+    "Cartoon Network",
+    "Adventure Time",
+    "探险活宝",
+    "Powerpuff",
+    "飞天小女警",
+    "BAPE",
+    "Supreme",
+    "Burberry",
+    "Naruto",
+    "Jujutsu",
+    "JOJO",
+)
 
 PRODUCT_SOURCES = {
     "fastmoss": {
@@ -361,6 +394,118 @@ def build_material_prompt(product, rules, experiences):
     }
 
 
+def build_ip_prompt(product, rules, experiences, detail=False):
+    if detail:
+        task = "输出该商品的 IP 风险详细分析，必须覆盖图片来源、是否构成侵权、图片角度、标题角度、规则/经验依据与结论。"
+        required_json = {
+            "ip_grade": "S/A/B/C/D/E",
+            "illustration_source": "图片/插画/图案出自何处；如果未识别到明确IP，说明是通用元素或未识别到明确来源",
+            "is_infringing": "是/否/不确定",
+            "risk_summary": "一句话结论，适合直接展示给用户",
+            "infringement_reason": "是否构成侵权风险的简明判断",
+            "image_reasons": ["从图片角度列出关键证据"],
+            "title_reasons": ["从标题/卖点角度列出关键证据"],
+            "rule_reasons": ["从规则库/经验库角度列出关键证据"],
+            "match_score": "0-100 数字",
+            "matched_grade_rule": "S/A/B/C/D/E",
+            "matched_rules": "数组；只填确实命中的 rule_code，不要编造",
+            "tags": ["品牌名/角色名/IP类型/关键词"],
+        }
+    else:
+        task = "输出该商品的 IP 风险短分析，只保留用户最关心的两个问题：图片出自何处、是否构成侵权。"
+        required_json = {
+            "ip_grade": "S/A/B/C/D/E",
+            "illustration_source": "图片/插画/图案出自何处；如果未识别到明确IP，说明是通用元素或未识别到明确来源",
+            "is_infringing": "是/否/不确定",
+            "risk_summary": "一句话结论，控制在80字以内",
+            "infringement_reason": "一句话说明是否构成侵权风险，控制在120字以内",
+            "match_score": "0-100 数字",
+            "matched_grade_rule": "S/A/B/C/D/E",
+            "matched_rules": "数组；只填确实命中的 rule_code，不要编造",
+            "tags": ["品牌名/角色名/IP类型/关键词"],
+        }
+    return {
+        "system": (
+            "你是选品系统的 IP 风险分析器。必须严格根据商品主图、标题、卖点、IP规则库和经验库判断。"
+            "只输出JSON，不要输出Markdown。不要编造规则库中不存在的 rule_code。"
+            "默认分析必须短，详细分析才展开原因。"
+            "严禁把规则库或经验库中的示例品牌当成当前商品来源；只有商品图片、标题或卖点中明确可识别时，才能输出具体IP/品牌名。"
+            "S/A/B/C 等级必须有明确可识别的品牌、角色、作品名、Logo、商标或规则命中证据；如果来源未知或只能说需要人工确认，不允许给 A/B/C/S，最多给 D。"
+            "如果 ip_grade 为 E，illustration_source 必须表达未识别到明确IP来源，不能出现 Disney、Barbie 等具体受保护IP名称。"
+        ),
+        "user_text": json_dumps({
+            "task": task,
+            "grade_rules": {
+                "S": "奢侈品大牌，例如 Gucci、LV、Chrome Hearts、Hermes",
+                "A": "美国本地IP/品牌，例如 Disney、Barbie、Powerpuff Girls",
+                "B": "非美国本地动漫IP，例如 Naruto、Jujutsu Kaisen、JOJO",
+                "C": "潮牌或品牌视觉资产，例如 BAPE、Supreme、Burberry",
+                "D": "擦边插画、疑似IP延伸或扭曲设计",
+                "E": "未识别到明确IP风险",
+            },
+            "product": {
+                "product_id": str(product["product_id"]),
+                "date_record": product.get("date_record"),
+                "title": product.get("title") or "",
+                "selling_points": product.get("selling_points") or "",
+            },
+            "rules": rules,
+            "experiences": experiences,
+            "detail": detail,
+            "required_json": required_json,
+        }),
+    }
+
+
+def build_material_prompt(product, rules, experiences, detail=False):
+    if detail:
+        task = "输出该商品的材质详细分析，说明材质类型、细分、置信度、图片/标题/规则依据。"
+        required_json = {
+            "material_type": "工厂材质/非工厂材质/疑似材质/其他",
+            "material_category": "TPU/硅胶/亚克力/金属/皮革/布料/磁吸类/其他",
+            "material_summary": "一两句话总结",
+            "material_reason": "详细判断原因",
+            "image_reasons": ["从图片角度列出关键证据"],
+            "title_reasons": ["从标题/卖点角度列出关键证据"],
+            "rule_reasons": ["从规则库/经验库角度列出关键证据"],
+            "confidence": "0-100 数字",
+            "matched_tags": ["材质关键词"],
+            "matched_rules": [{"rule_code": "MAT_RULE_xxxx", "rule_name": "规则名称", "why": "命中原因"}],
+            "pre_filter": {"hit": False, "matched_keywords": [], "source_fields": []},
+        }
+    else:
+        task = "输出该商品的材质短分析，只保留类型、细分和一两句话总结。"
+        required_json = {
+            "material_type": "工厂材质/非工厂材质/疑似材质/其他",
+            "material_category": "TPU/硅胶/亚克力/金属/皮革/布料/磁吸类/其他",
+            "material_summary": "一两句话总结，控制在120字以内",
+            "material_reason": "同 material_summary，可稍微补充证据但不要长篇展开",
+            "confidence": "0-100 数字",
+            "matched_tags": ["材质关键词"],
+            "matched_rules": [{"rule_code": "MAT_RULE_xxxx", "rule_name": "规则名称", "why": "命中原因"}],
+            "pre_filter": {"hit": False, "matched_keywords": [], "source_fields": []},
+        }
+    return {
+        "system": (
+            "你是选品系统的手机壳工厂材质分析器。必须严格根据商品主图、标题、卖点、材质规则库和经验库判断。"
+            "只输出JSON，不要输出Markdown。默认分析必须短，详细分析才展开原因。"
+        ),
+        "user_text": json_dumps({
+            "task": task,
+            "product": {
+                "product_id": str(product["product_id"]),
+                "date_record": product.get("date_record"),
+                "title": product.get("title") or "",
+                "selling_points": product.get("selling_points") or "",
+            },
+            "rules": rules,
+            "experiences": experiences,
+            "detail": detail,
+            "required_json": required_json,
+        }),
+    }
+
+
 def call_minimax(prompt, image_value):
     api_key = resolve_minimax_api_key()
     if not api_key:
@@ -402,7 +547,19 @@ def validate_ip_result(result):
     grade = result.get("ip_grade")
     if grade not in {"S", "A", "B", "C", "D", "E"}:
         raise ValueError(f"ip_grade 非法：{grade}")
+    result = normalize_ip_grade_consistency(result)
+    grade = result.get("ip_grade")
     result["match_score"] = float(result.get("match_score", 0))
+    if not result.get("reason"):
+        result["reason"] = json_dumps({
+            "illustration_source": result.get("illustration_source") or "",
+            "is_infringing": result.get("is_infringing") or "",
+            "risk_summary": result.get("risk_summary") or "",
+            "infringement_reason": result.get("infringement_reason") or "",
+            "image_reasons": result.get("image_reasons") or [],
+            "title_reasons": result.get("title_reasons") or [],
+            "rule_reasons": result.get("rule_reasons") or [],
+        })
     reason = str(result.get("reason") or "").strip()
     if not reason:
         raise ValueError("reason 不能为空")
@@ -415,10 +572,60 @@ def validate_ip_result(result):
     return result
 
 
+def normalize_ip_grade_consistency(result):
+    grade = result.get("ip_grade")
+    source = str(result.get("illustration_source") or result.get("source") or "").strip()
+    risk_summary = str(result.get("risk_summary") or "").strip()
+    infringement_reason = str(result.get("infringement_reason") or "").strip()
+    reason = str(result.get("reason") or "").strip()
+    tags = result.get("tags") or []
+    matched_rules = result.get("matched_rules") or []
+    evidence_text = "\n".join([
+        source,
+        risk_summary,
+        infringement_reason,
+        reason,
+        " ".join(str(tag) for tag in tags if tag),
+    ])
+    unknown_source = is_unknown_ip_source(source) or is_unknown_ip_source(evidence_text)
+    has_rule_hit = isinstance(matched_rules, list) and len(matched_rules) > 0
+    has_protected_marker = contains_protected_ip_marker(evidence_text)
+
+    if grade in {"S", "A", "B", "C"} and unknown_source and not has_rule_hit and not has_protected_marker:
+        result["ip_grade"] = "D"
+        result["matched_grade_rule"] = "D"
+        result["risk_summary"] = "疑似风险，来源证据不明确，建议人工复核"
+        result["infringement_reason"] = "当前结果未提供明确IP/品牌/角色来源，不能按高风险等级处理。"
+        result["illustration_source"] = source or "未识别到明确IP来源"
+
+    if result.get("ip_grade") == "E" and has_protected_marker:
+        result["illustration_source"] = "未识别到明确IP来源"
+        result["risk_summary"] = "低风险，未识别到明确 IP 指向"
+        result["infringement_reason"] = "当前判定为 E 级时，不应引用规则库示例品牌作为商品来源；主要依据产品类型、功能或通用图案描述判断。"
+        result["tags"] = [
+            tag for tag in tags
+            if not contains_protected_ip_marker(str(tag))
+        ] if isinstance(tags, list) else []
+
+    return result
+
+
+def is_unknown_ip_source(text):
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in UNKNOWN_IP_SOURCE_MARKERS)
+
+
+def contains_protected_ip_marker(text):
+    haystack = str(text or "")
+    return any(marker.lower() in haystack.lower() for marker in PROTECTED_IP_MARKERS)
+
+
 def validate_material_result(result):
     result.setdefault("material_type", "其他")
     result.setdefault("material_category", "其他")
-    result.setdefault("material_reason", "")
+    if not result.get("material_reason"):
+        result["material_reason"] = result.get("material_summary") or ""
+    result.setdefault("material_summary", result.get("material_reason") or "")
     result["confidence"] = float(result.get("confidence", 0))
     result.setdefault("matched_tags", [])
     result.setdefault("matched_rules", [])
@@ -534,9 +741,9 @@ def update_product_success(cursor, product, source, analysis_type, result):
         )
 
 
-def run_analysis(cursor, source, product, analysis_type, write=False):
+def run_analysis(cursor, source, product, analysis_type, write=False, detail=False):
     input_snapshot = build_input_snapshot(product)
-    if analysis_type == "MATERIAL":
+    if analysis_type == "MATERIAL" and not detail:
         prefiltered = prefilter_material(product)
         if prefiltered:
             log_id = insert_log(
@@ -550,10 +757,11 @@ def run_analysis(cursor, source, product, analysis_type, write=False):
 
     rules = load_rules(cursor, analysis_type)
     experiences = load_experiences(cursor, analysis_type)
-    prompt = build_ip_prompt(product, rules, experiences) if analysis_type == "IP" else build_material_prompt(product, rules, experiences)
+    prompt = build_ip_prompt(product, rules, experiences, detail=detail) if analysis_type == "IP" else build_material_prompt(product, rules, experiences, detail=detail)
     request_payload = {
         "model": MINIMAX_MODEL,
         "prompt_version": PROMPT_VERSION,
+        "detail": detail,
         "system": prompt["system"],
         "user_text": prompt["user_text"],
         "has_image": bool(product.get("image_base64")),
