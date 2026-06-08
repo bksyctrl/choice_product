@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from decimal import Decimal
 from datetime import datetime
 
@@ -29,6 +30,8 @@ MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY") or os.getenv("minimax_api_key") o
 MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
 PROMPT_VERSION = "single_product_v1"
 MAX_LOG_TEXT_LENGTH = 120000
+IP_RULE_KEYWORD_HIT_THRESHOLD = float(os.getenv("IP_RULE_KEYWORD_HIT_THRESHOLD", "0.3"))
+IP_RULE_RECALL_MAX_RULES = max(1, int(os.getenv("IP_RULE_RECALL_MAX_RULES", "80")))
 UNKNOWN_IP_SOURCE_MARKERS = (
     "unknown",
     "not identified",
@@ -284,6 +287,112 @@ def load_experiences(cursor, analysis_type, limit=20):
     return cursor.fetchall()
 
 
+def recall_ip_rules_by_keyword_hit(product, rules, threshold=IP_RULE_KEYWORD_HIT_THRESHOLD, max_rules=IP_RULE_RECALL_MAX_RULES):
+    scored_rules = score_ip_rules_by_keyword_hit(product, rules)
+    recalled = [rule for rule in scored_rules if rule.get("keyword_hit_score", 0) >= threshold]
+    return recalled[:max_rules]
+
+
+def score_ip_rules_by_keyword_hit(product, rules):
+    haystack_by_field = build_ip_keyword_haystack(product)
+    all_text = "\n".join(haystack_by_field.values())
+    scored = []
+    for rule in rules:
+        keywords = extract_rule_keywords(rule)
+        matched = []
+        matched_fields = {}
+        for keyword in keywords:
+            normalized_keyword = normalize_keyword(keyword)
+            if not normalized_keyword:
+                continue
+            hit_fields = [
+                field
+                for field, text in haystack_by_field.items()
+                if normalized_keyword in text
+            ]
+            if hit_fields:
+                matched.append(keyword)
+                matched_fields[keyword] = hit_fields
+        total = len(keywords)
+        score = round(len(matched) / total, 4) if total else 0
+        enriched = dict(rule)
+        enriched["keyword_hit_score"] = score
+        enriched["keyword_total"] = total
+        enriched["matched_keyword_count"] = len(matched)
+        enriched["matched_keywords"] = matched
+        enriched["matched_keyword_fields"] = matched_fields
+        enriched["keyword_haystack_length"] = len(all_text)
+        scored.append(enriched)
+    return sorted(
+        scored,
+        key=lambda item: (
+            item.get("keyword_hit_score", 0),
+            item.get("matched_keyword_count", 0),
+            str(item.get("rule_code") or ""),
+        ),
+        reverse=True,
+    )
+
+
+def build_ip_keyword_haystack(product):
+    return {
+        "title": normalize_keyword_text(product.get("title") or ""),
+        "attributes": normalize_keyword_text(product.get("attributes") or ""),
+        "selling_points": normalize_keyword_text(product.get("selling_points") or ""),
+    }
+
+
+def extract_rule_keywords(rule):
+    raw_keywords = rule.get("keywords")
+    values = []
+    if isinstance(raw_keywords, str) and raw_keywords.strip():
+        try:
+            parsed = json.loads(raw_keywords)
+        except Exception:
+            parsed = raw_keywords
+    else:
+        parsed = raw_keywords
+
+    if isinstance(parsed, list):
+        values.extend(parsed)
+    elif isinstance(parsed, dict):
+        for value in parsed.values():
+            if isinstance(value, list):
+                values.extend(value)
+            else:
+                values.append(value)
+    elif parsed:
+        values.extend(re.split(r"[,，、;/\n\r]+", str(parsed)))
+
+    if not values:
+        values.extend([rule.get("rule_name"), rule.get("ip_type")])
+
+    keywords = []
+    seen = set()
+    for value in values:
+        keyword = normalize_keyword(value)
+        if not keyword or keyword in seen:
+            continue
+        seen.add(keyword)
+        keywords.append(keyword)
+    return keywords
+
+
+def normalize_keyword(value):
+    text = normalize_keyword_text(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"[a-z0-9]+", text) and len(text) < 2:
+        return ""
+    return text
+
+
+def normalize_keyword_text(value):
+    text = str(value or "").lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def prefilter_material(product):
     text_parts = {
         "title": product.get("title") or "",
@@ -350,6 +459,14 @@ def build_ip_prompt(product, rules, experiences):
                 "date_record": product.get("date_record"),
                 "title": product.get("title") or "",
                 "selling_points": product.get("selling_points") or "",
+                "attributes": product.get("attributes") or "",
+            },
+            "rule_recall": {
+                "method": "keyword_hit_rate",
+                "threshold": IP_RULE_KEYWORD_HIT_THRESHOLD,
+                "max_rules": IP_RULE_RECALL_MAX_RULES,
+                "scored_fields": ["title", "attributes", "selling_points"],
+                "note": "rules are recalled from IP rule library by keyword hit score before AI analysis; matched_rules must only use recalled rule_code",
             },
             "rules": rules,
             "experiences": experiences,
@@ -378,6 +495,14 @@ def build_material_prompt(product, rules, experiences):
                 "date_record": product.get("date_record"),
                 "title": product.get("title") or "",
                 "selling_points": product.get("selling_points") or "",
+                "attributes": product.get("attributes") or "",
+            },
+            "rule_recall": {
+                "method": "keyword_hit_rate",
+                "threshold": IP_RULE_KEYWORD_HIT_THRESHOLD,
+                "max_rules": IP_RULE_RECALL_MAX_RULES,
+                "scored_fields": ["title", "attributes", "selling_points"],
+                "note": "rules are recalled from IP rule library by keyword hit score before AI analysis; matched_rules must only use recalled rule_code",
             },
             "rules": rules,
             "experiences": experiences,
@@ -448,6 +573,14 @@ def build_ip_prompt(product, rules, experiences, detail=False):
                 "date_record": product.get("date_record"),
                 "title": product.get("title") or "",
                 "selling_points": product.get("selling_points") or "",
+                "attributes": product.get("attributes") or "",
+            },
+            "rule_recall": {
+                "method": "keyword_hit_rate",
+                "threshold": IP_RULE_KEYWORD_HIT_THRESHOLD,
+                "max_rules": IP_RULE_RECALL_MAX_RULES,
+                "scored_fields": ["title", "attributes", "selling_points"],
+                "note": "rules are recalled from IP rule library by keyword hit score before AI analysis; matched_rules must only use recalled rule_code",
             },
             "rules": rules,
             "experiences": experiences,
@@ -756,12 +889,22 @@ def run_analysis(cursor, source, product, analysis_type, write=False, detail=Fal
             return {"analysis_type": "MATERIAL", "result": prefiltered, "log_id": log_id, "prefiltered": True}
 
     rules = load_rules(cursor, analysis_type)
+    loaded_rule_count = len(rules)
+    if analysis_type == "IP":
+        rules = recall_ip_rules_by_keyword_hit(product, rules)
     experiences = load_experiences(cursor, analysis_type)
     prompt = build_ip_prompt(product, rules, experiences, detail=detail) if analysis_type == "IP" else build_material_prompt(product, rules, experiences, detail=detail)
     request_payload = {
         "model": MINIMAX_MODEL,
         "prompt_version": PROMPT_VERSION,
         "detail": detail,
+        "rule_recall": {
+            "enabled": analysis_type == "IP",
+            "loaded_rule_count": loaded_rule_count,
+            "recalled_rule_count": len(rules),
+            "keyword_hit_threshold": IP_RULE_KEYWORD_HIT_THRESHOLD if analysis_type == "IP" else None,
+            "max_rules": IP_RULE_RECALL_MAX_RULES if analysis_type == "IP" else None,
+        },
         "system": prompt["system"],
         "user_text": prompt["user_text"],
         "has_image": bool(product.get("image_base64")),

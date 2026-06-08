@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>选品审核平台</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.1.5">
+  <link rel="stylesheet" href="/static/styles.css?v=1.1.8">
 </head>
 <body>
   <div class="app hidden" id="appShell">
@@ -24,6 +24,7 @@
       </nav>
       <nav class="source-nav utility-nav">
         <button id="detailAnalysisNav" type="button">深度分析</button>
+        <button id="expertTeamNav" type="button">专家团队</button>
       </nav>
 
       <section class="filter-panel">
@@ -116,7 +117,7 @@
   <div id="toast" class="toast"></div>
 
   <script>
-    const state = { source: 'unified', mode: 'products', detailAnalysisType: 'ip', view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
+    const state = { source: 'unified', mode: 'products', currentUser: null, detailAnalysisType: 'ip', expertSessionId: null, expertSessions: [], expertMessages: [], expertImages: [], view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
     const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
     const $ = (id) => document.getElementById(id);
@@ -170,7 +171,10 @@
         const json = await res.json();
         if (!json.ok) throw new Error(json.error || '未登录');
         const user = json.data.user || {};
+        state.currentUser = user;
         $('currentUserName').textContent = user.display_name || user.username || '已登录';
+        const canUseExpertTeam = ['admin', 'manager'].includes(String(user.role || '').toLowerCase());
+        $('expertTeamNav').classList.toggle('hidden', !canUseExpertTeam);
         $('appShell').classList.remove('hidden');
         await loadDefaultDateAndData();
       } catch (error) {
@@ -186,6 +190,7 @@
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       btn.classList.add('active');
       $('detailAnalysisNav').classList.remove('active');
+      $('expertTeamNav').classList.remove('active');
       $('pageTitle').textContent = sourceText[state.source];
       $('exportReadyLink').href = `/api/products/${state.source}/export-ready-links`;
       loadDefaultDateAndData();
@@ -193,14 +198,322 @@
     $('detailAnalysisNav').addEventListener('click', () => {
       openDetailAnalysisWorkspace();
     });
+    $('expertTeamNav').addEventListener('click', () => {
+      if (!canUseExpertTeam()) {
+        showToast('当前账号没有专家团队权限');
+        return;
+      }
+      openExpertTeamWorkspace();
+    });
+
+    function canUseExpertTeam() {
+      return ['admin', 'manager'].includes(String(state.currentUser?.role || '').toLowerCase());
+    }
 
     function openDetailAnalysisWorkspace(type = state.detailAnalysisType || 'ip') {
       state.mode = 'detailAnalysis';
       state.detailAnalysisType = type;
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       $('detailAnalysisNav').classList.add('active');
+      $('expertTeamNav').classList.remove('active');
       renderDetailAnalysisPage();
       loadDetailAnalyses();
+    }
+
+    function openExpertTeamWorkspace() {
+      if (!canUseExpertTeam()) {
+        showToast('当前账号没有专家团队权限');
+        return;
+      }
+      state.mode = 'expertTeam';
+      document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
+      $('detailAnalysisNav').classList.remove('active');
+      $('expertTeamNav').classList.add('active');
+      renderExpertTeamPage();
+      loadExpertSessions();
+    }
+
+    function renderExpertTeamPage() {
+      $('pageTitle').textContent = '专家团队';
+      $('stats').innerHTML = '';
+      $('periodHint').textContent = '与专家领导层沟通，由它调度业务专家';
+      $('content').innerHTML = `
+        <section class="expert-team-page">
+          <div class="expert-team-layout">
+            <aside class="expert-team-panel">
+              <h3>团队结构</h3>
+              <div class="expert-session-box">
+                <div class="expert-session-head">
+                  <strong>会话记忆</strong>
+                  <span>session_id 控制</span>
+                </div>
+                <div class="expert-session-list">
+                  ${expertSessionsHtml()}
+                </div>
+              </div>
+              <div class="expert-role-group">
+                <strong>专家领导层</strong>
+                <span>首席项目规划专家</span>
+                <span>专家团队管理者</span>
+                <span>数据方法论负责人</span>
+                <span>用户体验负责人</span>
+              </div>
+              <div class="expert-role-group">
+                <strong>业务专家层</strong>
+                <span>数据分析专家</span>
+                <span>IP合规专家</span>
+                <span>材质/视觉专家</span>
+                <span>运营专家</span>
+                <span>商品产品经理专家</span>
+                <span>智能选品总评专家</span>
+                <span>技术架构专家</span>
+              </div>
+              <div class="expert-role-group">
+                <strong>执行交接对象</strong>
+                <span>技术执行人员A / Codex</span>
+                <span>业务执行团队</span>
+              </div>
+              <p class="expert-team-note">你先和专家领导层沟通，它会判断该调用哪些专家、谁具备执行能力，并在你确认执行后输出给A能听懂的执行交接单。</p>
+            </aside>
+            <section class="expert-chat">
+              <div class="expert-chat-head">
+                <div>
+                  <strong>团队对话</strong>
+                  <p>这套团队不只服务当前项目，也可以服务其他用户和其他项目。</p>
+                </div>
+                <button type="button" data-new-expert-session>新会话</button>
+              </div>
+              <div id="expertMessages" class="expert-messages">${expertMessagesHtml()}</div>
+              <div class="expert-input-row">
+                <div class="expert-input-main">
+                  <textarea id="expertMessageInput" rows="3" placeholder="例如：这个需求谁有能力执行？确认执行，把方案交给技术执行人员A；或者：这个商品需要哪些专家一起判断？"></textarea>
+                  <div class="expert-image-tools">
+                    <label class="expert-image-upload">
+                      添加图片
+                      <input id="expertImageInput" type="file" accept="image/*" multiple>
+                    </label>
+                    <span>支持 Ctrl+V 粘贴图片、拖拽图片到输入框、或点击添加图片</span>
+                  </div>
+                  <div id="expertImageTray" class="expert-image-tray">${expertImagesHtml()}</div>
+                </div>
+                <button id="sendExpertMessage" type="button" class="primary">发送</button>
+              </div>
+              <p class="expert-team-tip">提示：你可以直接说你的想法、目标、担心的问题；专家领导会先拆解，再安排业务专家。</p>
+            </section>
+          </div>
+        </section>`;
+      $('pageInfo').textContent = '专家团队';
+      $('prevPage').disabled = true;
+      $('nextPage').disabled = true;
+      $('sendExpertMessage').addEventListener('click', sendExpertTeamMessage);
+      $('expertMessageInput').addEventListener('keydown', event => {
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) sendExpertTeamMessage();
+      });
+      $('expertImageInput')?.addEventListener('change', event => {
+        addExpertImageFiles(event.target.files);
+        event.target.value = '';
+      });
+      $('expertImageTray')?.addEventListener('click', event => {
+        const btn = event.target.closest('[data-remove-expert-image]');
+        if (!btn) return;
+        state.expertImages.splice(Number(btn.dataset.removeExpertImage), 1);
+        renderExpertTeamPage();
+      });
+      const expertInputRow = document.querySelector('.expert-input-row');
+      expertInputRow?.addEventListener('paste', handleExpertImagePaste);
+      $('expertMessageInput')?.addEventListener('paste', handleExpertImagePaste);
+      expertInputRow?.addEventListener('dragover', event => {
+        event.preventDefault();
+        expertInputRow.classList.add('dragging');
+      });
+      expertInputRow?.addEventListener('dragleave', () => {
+        expertInputRow.classList.remove('dragging');
+      });
+      expertInputRow?.addEventListener('drop', event => {
+        event.preventDefault();
+        expertInputRow.classList.remove('dragging');
+        addExpertImageFiles(Array.from(event.dataTransfer?.files || []).filter(file => file.type.startsWith('image/')));
+      });
+      document.querySelector('[data-new-expert-session]')?.addEventListener('click', () => {
+        state.expertSessionId = null;
+        state.expertMessages = [];
+        state.expertImages = [];
+        renderExpertTeamPage();
+      });
+      document.querySelectorAll('[data-expert-session-id]').forEach(btn => btn.addEventListener('click', () => {
+        loadExpertSessionMessages(Number(btn.dataset.expertSessionId));
+      }));
+      document.querySelectorAll('[data-delete-expert-session]').forEach(btn => btn.addEventListener('click', event => {
+        event.stopPropagation();
+        deleteExpertSession(Number(btn.dataset.deleteExpertSession));
+      }));
+    }
+
+    function expertSessionsHtml() {
+      if (!state.expertSessions.length) {
+        return '<div class="expert-session-empty">暂无历史会话</div>';
+      }
+      return state.expertSessions.map(session => `
+        <button type="button" class="expert-session-item ${Number(session.id) === Number(state.expertSessionId) ? 'active' : ''}" data-expert-session-id="${session.id}">
+          <span>${escapeHtml(session.title || `会话 ${session.id}`)}</span>
+          <small>#${session.id}</small>
+          <i data-delete-expert-session="${session.id}" title="删除这段记忆">删除</i>
+        </button>`).join('');
+    }
+
+    async function loadExpertSessions() {
+      if (!canUseExpertTeam()) return;
+      try {
+        const res = await fetch('/api/expert-team/sessions', { credentials: 'same-origin' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '会话加载失败');
+        state.expertSessions = json.data.sessions || [];
+        renderExpertTeamPage();
+      } catch (error) {
+        showToast(`专家会话加载失败：${error.message}`);
+      }
+    }
+
+    async function loadExpertSessionMessages(sessionId) {
+      if (!sessionId) return;
+      try {
+        const res = await fetch(`/api/expert-team/sessions/${sessionId}/messages`, { credentials: 'same-origin' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '会话恢复失败');
+        state.expertSessionId = sessionId;
+        state.expertMessages = json.data.messages || [];
+        renderExpertTeamPage();
+        showToast(`已恢复会话 #${sessionId}`);
+      } catch (error) {
+        showToast(`恢复会话失败：${error.message}`);
+      }
+    }
+
+    async function deleteExpertSession(sessionId) {
+      if (!sessionId) return;
+      try {
+        const res = await fetch(`/api/expert-team/sessions/${sessionId}`, { method: 'DELETE', credentials: 'same-origin' });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '删除失败');
+        if (Number(state.expertSessionId) === Number(sessionId)) {
+          state.expertSessionId = null;
+          state.expertMessages = [];
+        }
+        state.expertSessions = state.expertSessions.filter(item => Number(item.id) !== Number(sessionId));
+        renderExpertTeamPage();
+        showToast(`已删除会话 #${sessionId}`);
+      } catch (error) {
+        showToast(`删除会话失败：${error.message}`);
+      }
+    }
+
+    function expertMessagesHtml() {
+      if (!state.expertMessages.length) {
+        return `
+          <div class="expert-welcome">
+            <strong>你现在是在和“专家领导层”对话</strong>
+            <p>它会先理解你的目标，再决定是否调用数据分析、IP合规、材质视觉、运营、商品产品经理、选品总评或技术架构专家。</p>
+          </div>`;
+      }
+      return state.expertMessages.map(item => `
+        <div class="expert-message ${item.role === 'user' ? 'user' : 'assistant'}">
+          <div class="expert-message-role">${item.role === 'user' ? '你' : '专家团队'}</div>
+          <div class="expert-message-content">${formatExpertMessage(item.content)}</div>
+        </div>`).join('');
+    }
+
+    function formatExpertMessage(text) {
+      return escapeHtml(text).replace(/\n/g, '<br>');
+    }
+
+    function expertImagesHtml() {
+      if (!state.expertImages.length) return '';
+      return state.expertImages.map((image, index) => `
+        <div class="expert-image-chip" title="${escapeHtml(image.name || 'image')}">
+          <img src="${image.data_url}" alt="${escapeHtml(image.name || 'image')}">
+          <button type="button" data-remove-expert-image="${index}" aria-label="移除图片">×</button>
+        </div>`).join('');
+    }
+
+    function addExpertImageFiles(files) {
+      Array.from(files || []).forEach(addExpertImageFile);
+    }
+
+    function addExpertImageFile(file) {
+      if (!file || !file.type.startsWith('image/')) return;
+      if (state.expertImages.length >= 6) {
+        showToast('一次最多添加 6 张图片');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        state.expertImages.push({
+          name: file.name || 'pasted-image',
+          mime_type: file.type,
+          size: file.size,
+          data_url: reader.result,
+        });
+        renderExpertTeamPage();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function handleExpertImagePaste(event) {
+      const files = Array.from(event.clipboardData?.files || []).filter(file => file.type.startsWith('image/'));
+      const itemFiles = Array.from(event.clipboardData?.items || [])
+        .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+        .map(item => item.getAsFile())
+        .filter(Boolean);
+      const images = [...files, ...itemFiles];
+      if (!images.length) return;
+      event.preventDefault();
+      addExpertImageFiles(images);
+    }
+
+    async function sendExpertTeamMessage() {
+      const input = $('expertMessageInput');
+      const message = input.value.trim();
+      const images = state.expertImages.map(image => ({ ...image }));
+      if (!message && !images.length) return showToast('请输入要讨论的问题或添加图片');
+      const displayMessage = message || '请分析我发送的图片';
+      state.expertMessages.push({ role: 'user', content: displayMessage + (images.length ? `\n[已附加 ${images.length} 张图片]` : '') });
+      input.value = '';
+      state.expertImages = [];
+      renderExpertTeamPage();
+      state.expertMessages.push({ role: 'assistant', content: '专家团队正在讨论...' });
+      renderExpertTeamPage();
+      try {
+        const res = await fetch('/api/expert-team/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            session_id: state.expertSessionId,
+            project_code: 'choice_product',
+            project_context: '当前项目是选品与数据监控系统，但专家团队需要作为可复用团队能力，面向所有用户和项目。',
+            message: displayMessage,
+            images,
+          }),
+        });
+        const raw = await res.text();
+        let json;
+        try {
+          json = JSON.parse(raw);
+        } catch (_error) {
+          const preview = raw.replace(/\s+/g, ' ').slice(0, 120);
+          throw new Error(`接口返回的不是JSON，HTTP ${res.status}：${preview}`);
+        }
+        if (!json.ok) throw new Error(json.error || '专家团队回复失败');
+        state.expertSessionId = json.data.session?.id || state.expertSessionId;
+        state.expertMessages = state.expertMessages.filter(item => item.content !== '专家团队正在讨论...');
+        state.expertMessages.push({ role: 'assistant', content: json.data.message || '' });
+        renderExpertTeamPage();
+        loadExpertSessions();
+      } catch (error) {
+        state.expertMessages = state.expertMessages.filter(item => item.content !== '专家团队正在讨论...');
+        state.expertMessages.push({ role: 'assistant', content: `专家团队暂时无法回复：${error.message}` });
+        renderExpertTeamPage();
+      }
     }
     document.querySelectorAll('.view-switch button').forEach(btn => btn.addEventListener('click', () => {
       state.view = btn.dataset.view;

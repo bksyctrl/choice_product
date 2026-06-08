@@ -1,0 +1,21 @@
+server:
+  port: ${AGENT_CENTER_PORT:5010}
+
+spring:
+  application:
+    name: choice-product-agent-center
+  datasource:
+    url: jdbc:mysql://${DB_HOST:192.168.0.168}:${DB_PORT:3306}/${DB_NAME:ecommerce_workflow}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${DB_USER:ITaimysql}
+    password: ${DB_PASSWORD:Ai12345678@}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+agent:
+  llm:
+    base-url: ${MINIMAX_BASE_URL:https://api.minimax.io/v1}
+    api-key: ${MINIMAX_API_KEY:${minimax_api_key:}}
+    model: ${MINIMAX_MODEL:MiniMax-M2.7}
+  decision:
+    confidence-threshold: ${AGENT_CONFIDENCE_THRESHOLD:0.6}
+  rag:
+    top-k: ${AGENT_RAG_TOP_K:5}

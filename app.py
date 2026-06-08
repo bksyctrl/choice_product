@@ -67,6 +67,10 @@ AI_DAEMON_LOCK_RETRIES = max(1, int(os.getenv("AI_DAEMON_LOCK_RETRIES", "3")))
 AI_DAEMON_LOCK_WAIT_SECONDS = max(1, int(os.getenv("AI_DAEMON_LOCK_WAIT_SECONDS", "3")))
 AI_DAEMON_LATEST_ONLY = os.getenv("AI_DAEMON_LATEST_ONLY", "true").strip().lower() != "false"
 DETAIL_ANALYSIS_TABLE = "cp_user_detail_analysis"
+EXPERT_TEAM_SESSION_TABLE = "cp_expert_team_session"
+EXPERT_TEAM_MESSAGE_TABLE = "cp_expert_team_message"
+EXPERT_TEAM_ALLOWED_ROLES = {"admin", "manager"}
+PERMISSION_EXPERT_TEAM = "expert_team"
 DETAIL_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.getenv("DETAIL_ANALYSIS_CONCURRENCY", "2")))))
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
@@ -74,6 +78,10 @@ FASTMOSS_ANALYSIS_REUSE_SOURCES = ("fastmoss", "fastmoss_rank")
 
 
 class ApiAuthError(Exception):
+    pass
+
+
+class ApiPermissionError(Exception):
     pass
 
 SOURCES = {
@@ -198,10 +206,19 @@ def create_app():
     app.secret_key = os.getenv("SECRET_KEY", "choice-product-dev-secret")
     CORS(app, supports_credentials=True)
     ensure_detail_analysis_table()
+    ensure_expert_team_tables()
 
     @app.errorhandler(ApiAuthError)
     def handle_auth_error(_error):
         return api_error("未登录", 401)
+
+    @app.errorhandler(ApiPermissionError)
+    def handle_permission_error(_error):
+        return api_error("没有专家团队使用权限", 403)
+
+    @app.errorhandler(PermissionError)
+    def handle_legacy_permission_error(_error):
+        return api_error("没有专家团队使用权限", 403)
 
     @app.get("/")
     def index():
@@ -230,7 +247,7 @@ def create_app():
                 cursor.execute(
                     """
                     INSERT INTO app_user (username, password_hash, display_name, role, status)
-                    VALUES (%s, %s, %s, 'USER', 'ACTIVE')
+                    VALUES (%s, %s, %s, 'user', 'ACTIVE')
                     """,
                     (username, password_hash, display_name),
                 )
@@ -521,6 +538,169 @@ def create_app():
             rows = [normalize_detail_analysis_record(row) for row in cursor.fetchall()]
         return api_ok({"items": rows, "analysis_type": analysis_type})
 
+    @app.get("/api/expert-team/roles")
+    def expert_team_roles():
+        require_expert_team_permission()
+        return api_ok({"roles": expert_team_roles_payload()})
+
+    @app.get("/api/expert-team/sessions")
+    def expert_team_sessions():
+        user = require_expert_team_permission()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT id, title, project_code, created_at, updated_at
+                FROM {EXPERT_TEAM_SESSION_TABLE}
+                WHERE user_id = %s
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 30
+                """,
+                (user["id"],),
+            )
+            sessions = [normalize_expert_session(row) for row in cursor.fetchall()]
+        return api_ok({"sessions": sessions})
+
+    @app.get("/api/expert-team/sessions/<int:session_id>/messages")
+    def expert_team_messages(session_id):
+        user = require_expert_team_permission()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {EXPERT_TEAM_SESSION_TABLE} WHERE id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            if not cursor.fetchone():
+                return api_error("专家团队会话不存在", 404)
+            cursor.execute(
+                f"""
+                SELECT id, role, content, team_role, created_at
+                FROM {EXPERT_TEAM_MESSAGE_TABLE}
+                WHERE session_id = %s AND user_id = %s
+                ORDER BY id ASC
+                """,
+                (session_id, user["id"]),
+            )
+            messages = [normalize_expert_message(row) for row in cursor.fetchall()]
+        return api_ok({"messages": messages})
+
+    @app.delete("/api/expert-team/sessions/<int:session_id>")
+    def delete_expert_team_session(session_id):
+        user = require_expert_team_permission()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT id FROM {EXPERT_TEAM_SESSION_TABLE} WHERE id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            if not cursor.fetchone():
+                return api_error("专家团队会话不存在", 404)
+            cursor.execute(
+                f"DELETE FROM {EXPERT_TEAM_MESSAGE_TABLE} WHERE session_id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            cursor.execute(
+                f"DELETE FROM {EXPERT_TEAM_SESSION_TABLE} WHERE id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            conn.commit()
+        return api_ok({"deleted": True, "session_id": session_id})
+
+    @app.post("/api/expert-team/chat")
+    def expert_team_chat():
+        user = require_expert_team_permission()
+        payload = request.get_json(silent=True) or {}
+        message = stringify(payload.get("message")).strip()
+        images = payload.get("images") if isinstance(payload.get("images"), list) else []
+        image_count = len(images)
+        if not message and image_count:
+            message = f"请分析我发送的{image_count}张图片"
+        if not message:
+            return api_error("请输入要和专家团队讨论的问题", 400)
+        session_id = parse_int(payload.get("session_id"))
+        project_code = stringify(payload.get("project_code")).strip() or "choice_product"
+        project_context = stringify(payload.get("project_context")).strip()
+
+        with db() as conn, conn.cursor() as cursor:
+            if session_id:
+                cursor.execute(
+                    f"SELECT * FROM {EXPERT_TEAM_SESSION_TABLE} WHERE id = %s AND user_id = %s",
+                    (session_id, user["id"]),
+                )
+                if not cursor.fetchone():
+                    return api_error("专家团队会话不存在", 404)
+            else:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {EXPERT_TEAM_SESSION_TABLE}
+                      (user_id, username, title, project_code, project_context)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user["id"],
+                        user.get("username") or "",
+                        make_expert_session_title(message),
+                        project_code,
+                        project_context,
+                    ),
+                )
+                conn.commit()
+                session_id = cursor.lastrowid
+
+            cursor.execute(
+                f"""
+                INSERT INTO {EXPERT_TEAM_MESSAGE_TABLE}
+                  (session_id, user_id, role, team_role, content)
+                VALUES (%s, %s, 'user', 'user', %s)
+                """,
+                (session_id, user["id"], message),
+            )
+            conn.commit()
+
+            cursor.execute(
+                f"""
+                SELECT role, team_role, content
+                FROM {EXPERT_TEAM_MESSAGE_TABLE}
+                WHERE session_id = %s AND user_id = %s
+                ORDER BY id DESC
+                LIMIT 12
+                """,
+                (session_id, user["id"]),
+            )
+            history = list(reversed(cursor.fetchall()))
+
+        readonly_context = collect_expert_readonly_context(message)
+        if image_count:
+            readonly_context = (readonly_context + "\n\n" if readonly_context else "") + (
+                f"用户本轮随消息发送了{image_count}张图片。当前后端已接收图片上下文，"
+                "但专家团队视觉识别能力需要接入视觉模型后才能直接读取图片内容。"
+            )
+
+        try:
+            answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context))
+            status = "SUCCESS"
+        except Exception as exc:
+            answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
+            status = "FALLBACK"
+
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {EXPERT_TEAM_MESSAGE_TABLE}
+                  (session_id, user_id, role, team_role, content, meta_json)
+                VALUES (%s, %s, 'assistant', 'chief_planner', %s, %s)
+                """,
+                (session_id, user["id"], answer, json.dumps({"status": status, "readonly_context": readonly_context, "image_count": image_count}, ensure_ascii=False)),
+            )
+            cursor.execute(
+                f"UPDATE {EXPERT_TEAM_SESSION_TABLE} SET updated_at = NOW() WHERE id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            conn.commit()
+            cursor.execute(
+                f"SELECT * FROM {EXPERT_TEAM_SESSION_TABLE} WHERE id = %s AND user_id = %s",
+                (session_id, user["id"]),
+            )
+            session_row = cursor.fetchone()
+        return api_ok({"session": normalize_expert_session(session_row), "message": answer, "status": status})
+
     @app.patch("/api/products/<source>/<product_id>/status")
     def update_status(source, product_id):
         require_current_user()
@@ -754,6 +934,29 @@ def require_current_user():
     return user
 
 
+def require_expert_team_permission():
+    user = require_current_user()
+    if not has_user_permission(user, PERMISSION_EXPERT_TEAM):
+        return_error = api_error("没有专家团队使用权限", 403)
+        raise PermissionError(return_error)
+    return user
+
+
+def has_user_permission(user, permission):
+    if permission == PERMISSION_EXPERT_TEAM:
+        return stringify((user or {}).get("role")).strip().lower() in EXPERT_TEAM_ALLOWED_ROLES
+    return False
+
+
+def parse_int(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def ensure_detail_analysis_table():
     with db() as conn, conn.cursor() as cursor:
         cursor.execute(
@@ -781,6 +984,391 @@ def ensure_detail_analysis_table():
             """
         )
         conn.commit()
+
+
+def ensure_expert_team_tables():
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EXPERT_TEAM_SESSION_TABLE} (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              user_id BIGINT NOT NULL,
+              username VARCHAR(128) NOT NULL DEFAULT '',
+              title VARCHAR(255) NOT NULL DEFAULT '',
+              project_code VARCHAR(64) NOT NULL DEFAULT 'general',
+              project_context LONGTEXT NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              KEY idx_user_updated (user_id, updated_at),
+              KEY idx_project (project_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EXPERT_TEAM_MESSAGE_TABLE} (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              session_id BIGINT NOT NULL,
+              user_id BIGINT NOT NULL,
+              role VARCHAR(20) NOT NULL,
+              team_role VARCHAR(64) NOT NULL DEFAULT '',
+              content LONGTEXT NOT NULL,
+              meta_json LONGTEXT NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              KEY idx_session_id (session_id, id),
+              KEY idx_user_created (user_id, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+
+
+EXPERT_TEAM_ROLES = [
+    {
+        "code": "chief_planner",
+        "name": "首席项目规划专家",
+        "level": "leader",
+        "focus": "理解用户目标，拆解版本路线，决定先做什么、后做什么。",
+        "limits": "不直接替代具体数据/IP/材质专家做专业细节判断。",
+    },
+    {
+        "code": "expert_manager",
+        "name": "专家团队管理者",
+        "level": "leader",
+        "focus": "判断当前问题该调用哪些专家，识别专家能力边界和冲突。",
+        "limits": "不单独给商品最终上架结论。",
+    },
+    {
+        "code": "data_method_lead",
+        "name": "数据方法论负责人",
+        "level": "leader",
+        "focus": "定义指标口径、分析框架、异常判断和数据证据标准。",
+        "limits": "不判断 IP 侵权和图案来源。",
+    },
+    {
+        "code": "ux_lead",
+        "name": "用户体验负责人",
+        "level": "leader",
+        "focus": "降低用户阅读成本，设计更清楚的前端展示和交互路径。",
+        "limits": "不决定数据库字段和业务风控规则。",
+    },
+    {
+        "code": "data_analyst",
+        "name": "数据分析专家",
+        "level": "executor",
+        "focus": "销量、环比、商品卡占比、视频/直播结构、达人带货、异常波动。",
+        "limits": "不能单独给最终选品结论，不负责 IP/材质判断。",
+    },
+    {
+        "code": "ip_compliance",
+        "name": "IP合规专家",
+        "level": "executor",
+        "focus": "图片来源、作品/角色/品牌命中、侵权风险、IP等级和复核建议。",
+        "limits": "不负责销量潜力判断。",
+    },
+    {
+        "code": "material_visual",
+        "name": "材质/视觉专家",
+        "level": "executor",
+        "focus": "材质、图案复杂度、Logo/插画、工厂可生产性、素材提取价值。",
+        "limits": "不负责销售趋势和达人分析。",
+    },
+    {
+        "code": "operations",
+        "name": "运营专家",
+        "level": "executor",
+        "focus": "上架优先级、TikTok运营路径、达人/商品卡策略、监控预警动作。",
+        "limits": "不负责代码实现和底层表结构。",
+    },
+    {
+        "code": "product_manager",
+        "name": "商品产品经理专家",
+        "level": "executor",
+        "focus": "商品定位、用户痛点、卖点清晰度、差异化、目标人群。",
+        "limits": "这里是商品侧产品经理，不是系统代码维护角色。",
+    },
+    {
+        "code": "selection_reviewer",
+        "name": "智能选品总评专家",
+        "level": "executor",
+        "focus": "综合数据、IP、材质、运营、产品判断，输出是否值得选和复核点。",
+        "limits": "必须引用其他专家证据，不能凭空下结论。",
+    },
+    {
+        "code": "system_architect",
+        "name": "技术架构专家",
+        "level": "executor",
+        "focus": "系统结构、接口、数据库、任务队列、可扩展性和技术债。",
+        "limits": "不直接判断商品商业价值。",
+    },
+]
+
+
+EXPERT_EXECUTION_HANDOFF_RULES = """
+专家团队执行交接规则：
+1. 专家团队本身不直接写代码、不写库、不改线上数据，但必须判断“谁具备执行能力”。
+2. 当用户表达“可以执行、开始执行、落地、修改、让A做、交给技术人员、你手下人员去做”等意图时，必须输出《执行交接单》。
+3. 《执行交接单》必须让执行者A可以直接听懂，不能只说方向，必须包含：
+   - 执行者A是谁：技术执行人员A/Codex/业务技术团队/业务运营团队/数据分析执行者等。
+   - 为什么A有能力：A需要具备哪些技能、能访问哪些资源、能执行哪些动作。
+   - 不应该交给谁：哪些专家只负责判断，不负责执行。
+   - 执行目标：这次要完成什么，完成后用户能看到什么。
+   - 执行范围：涉及页面、接口、数据库表、字段、权限、只读工具或业务流程。
+   - 操作步骤：按 1、2、3 写清楚，尽量具体到文件、接口、字段、按钮、校验点。
+   - 输入资料：A需要从用户、数据库、接口或截图拿到什么。
+   - 验收标准：用户如何判断做完了，至少列出可测试的结果。
+   - 风险边界：哪些不能做，哪些需要用户确认后再做。
+4. 如果当前信息不足，仍然要先给出“可执行的第一步交接单”，并说明A需要补读哪些数据。
+5. 如果任务是商品分析，执行者通常是业务专家；如果任务是系统改造，执行者通常是技术执行人员A/Codex/业务技术团队。
+""".strip()
+
+
+def expert_team_roles_payload():
+    return EXPERT_TEAM_ROLES
+
+
+def normalize_expert_session(row):
+    if not row:
+        return None
+    return {
+        "id": row.get("id"),
+        "title": row.get("title") or "专家团队会话",
+        "project_code": row.get("project_code") or "general",
+        "created_at": stringify(row.get("created_at")),
+        "updated_at": stringify(row.get("updated_at")),
+    }
+
+
+def normalize_expert_message(row):
+    return {
+        "id": row.get("id"),
+        "role": row.get("role"),
+        "team_role": row.get("team_role") or "",
+        "content": row.get("content") or "",
+        "created_at": stringify(row.get("created_at")),
+    }
+
+
+def make_expert_session_title(message):
+    text = re.sub(r"\s+", " ", stringify(message)).strip()
+    return text[:40] or "专家团队会话"
+
+
+def build_expert_team_system_prompt(user, project_code, project_context):
+    role_lines = []
+    for role in EXPERT_TEAM_ROLES:
+        role_lines.append(
+            f"- {role['name']}({role['code']}，{role['level']}): 擅长{role['focus']} 边界：{role['limits']}"
+        )
+    context = project_context or "当前项目是 choice_product 选品与数据监控系统，但专家团队要保持通用能力，不能只围绕单一项目。"
+    return f"""
+你是一个“AI专家团队”的专家领导层，直接服务当前用户，而不是只服务某个固定项目。
+
+你的核心职责：
+1. 先理解用户真实意图、长期目标和当前项目上下文。
+2. 判断应该调用哪些专家，以及每个专家的任务边界。
+3. 不让执行专家各说各话，要给出统一、清楚、可执行的团队结论。
+4. 输出要短、清楚、有重点，优先降低用户阅读成本。
+5. 如果用户问的是项目建设，你要从系统产品、技术架构、数据架构、AI效率、UX角度组织团队。
+6. 如果用户问的是商品分析，你要调度数据、IP、材质、运营、商品产品经理、选品总评专家。
+
+当前用户：
+- user_id: {user.get('id')}
+- username: {user.get('username')}
+
+当前项目上下文：
+- project_code: {project_code}
+- context: {context}
+
+专家能力档案：
+{chr(10).join(role_lines)}
+
+回复格式：
+- 先给“团队判断”
+- 再给“应该调用的专家”
+- 再给“执行顺序”
+- 最后给“你现在可以怎么和团队继续对话”
+
+不要假装已经调用外部工具或数据库；如果需要具体商品数据、代码或截图，要明确说明需要用户提供或让系统接入。
+""".strip()
+
+
+def call_expert_team_ai(user, message, history, project_code, project_context, readonly_context=""):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY")
+    messages = [{"role": "system", "content": build_expert_team_system_prompt(user, project_code, project_context)}]
+    messages.append({"role": "system", "content": EXPERT_EXECUTION_HANDOFF_RULES})
+    if readonly_context:
+        messages.append({
+            "role": "system",
+            "content": (
+                "以下是系统白名单只读工具在本轮对话中读取到的结果。"
+                "你可以引用这些结果，但不能声称自己执行了写入、修改、删除、上线、提交代码等动作。\n\n"
+                f"{readonly_context}"
+            ),
+        })
+    for item in history[-10:]:
+        role = "assistant" if item.get("role") == "assistant" else "user"
+        messages.append({"role": role, "content": stringify(item.get("content"))})
+    messages.append({"role": "user", "content": message})
+    response = requests.post(
+        f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": MINIMAX_MODEL, "messages": messages, "temperature": 0.2, "stream": False},
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def sanitize_expert_team_answer(text):
+    cleaned = stringify(text)
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^\s*<think>[\s\S]*?(?=(\*\*|团队判断|执行交接单|《执行交接单》|$))", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned or stringify(text).strip()
+
+
+def fallback_expert_team_answer(message, error):
+    return (
+        "团队判断：专家团队接口已收到你的问题，但当前 AI 服务暂时不可用，先给你一个本地兜底建议。\n\n"
+        "应该调用的专家：首席项目规划专家、专家团队管理者、数据方法论负责人、技术架构专家。\n\n"
+        "执行顺序：先明确你的目标和使用场景，再拆分为业务专家任务，最后由技术架构专家判断如何落到系统模块和数据库。\n\n"
+        f"当前问题：{message}\n\n"
+        f"服务状态：{error}"
+    )
+
+
+def collect_expert_readonly_context(message):
+    text = stringify(message)
+    lower = text.lower()
+    trigger_words = [
+        "查", "查看", "数据", "字段", "接口", "回执", "商品", "属性", "卖点",
+        "attributes", "selling_points", "product_id", "fastmoss", "kalodata", "统一表",
+        "fastmoss_product_aggregate", "fastmoss_product_rank_aggregate", "kalodata_youwei_product",
+    ]
+    if not any(word.lower() in lower for word in trigger_words):
+        return ""
+
+    product_ids = list(dict.fromkeys(re.findall(r"\b\d{10,}\b", text)))[:5]
+    requested_sources = []
+    for source, meta in SOURCES.items():
+        table = meta["table"]
+        if source.lower() in lower or table.lower() in lower:
+            requested_sources.append(source)
+    if "统一表" in text and "unified" not in requested_sources:
+        requested_sources.append("unified")
+    if not requested_sources:
+        requested_sources = ["unified"]
+    requested_sources = requested_sources[:3]
+
+    context_lines = ["【只读工具结果】本轮仅执行白名单只读查询，未写入、未修改、未删除任何数据。"]
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            for source in requested_sources:
+                meta = SOURCES[source]
+                table = meta["table"]
+                columns = fetch_table_columns(cursor, table)
+                context_lines.append(f"\n数据源：{source}，表：{table}")
+                if columns:
+                    wanted = [
+                        meta.get("id"),
+                        meta.get("date"),
+                        meta.get("title"),
+                        meta.get("attributes"),
+                        meta.get("selling_points"),
+                        meta.get("price"),
+                        meta.get("sold"),
+                        meta.get("total_sold"),
+                    ]
+                    present = [col for col in wanted if col and col in columns]
+                    context_lines.append(f"可用关键字段：{', '.join(present) if present else '未命中关键字段'}")
+                    append_column_fill_stats(cursor, context_lines, table, columns, meta)
+                    if product_ids:
+                        append_product_readonly_samples(cursor, context_lines, table, columns, meta, product_ids)
+                else:
+                    context_lines.append("字段读取失败或表不存在。")
+    except Exception as exc:
+        context_lines.append(f"\n只读工具读取失败：{exc}")
+    return "\n".join(context_lines)
+
+
+def fetch_table_columns(cursor, table):
+    allowed_tables = {meta["table"] for meta in SOURCES.values()}
+    if table not in allowed_tables:
+        return set()
+    cursor.execute(f"SHOW COLUMNS FROM `{table}`")
+    return {row.get("Field") for row in cursor.fetchall() if row.get("Field")}
+
+
+def append_column_fill_stats(cursor, context_lines, table, columns, meta):
+    stats_cols = [col for col in [meta.get("attributes"), meta.get("selling_points")] if col and col in columns]
+    if not stats_cols:
+        return
+    select_parts = ["COUNT(*) AS total_rows"]
+    for col in stats_cols:
+        alias = f"{safe_alias(col)}_filled"
+        select_parts.append(f"SUM(CASE WHEN `{col}` IS NOT NULL AND TRIM(CAST(`{col}` AS CHAR)) <> '' THEN 1 ELSE 0 END) AS `{alias}`")
+    cursor.execute(f"SELECT {', '.join(select_parts)} FROM `{table}`")
+    row = cursor.fetchone() or {}
+    parts = [f"总行数 {row.get('total_rows', 0)}"]
+    for col in stats_cols:
+        parts.append(f"{col}有值 {row.get(safe_alias(col) + '_filled', 0)}")
+    context_lines.append("字段填充概览：" + "，".join(parts))
+
+
+def append_product_readonly_samples(cursor, context_lines, table, columns, meta, product_ids):
+    product_col = meta.get("id")
+    date_col = meta.get("date")
+    if not product_col or product_col not in columns:
+        return
+    wanted = [
+        product_col,
+        date_col,
+        meta.get("title"),
+        meta.get("attributes"),
+        meta.get("selling_points"),
+        meta.get("price"),
+        meta.get("sold"),
+        meta.get("total_sold"),
+    ]
+    selected = [col for col in wanted if col and col in columns]
+    if not selected:
+        return
+    placeholders = ", ".join(["%s"] * len(product_ids))
+    select_sql = ", ".join(f"`{col}`" for col in selected)
+    order_sql = f"ORDER BY `{date_col}` DESC" if date_col and date_col in columns else ""
+    cursor.execute(
+        f"""
+        SELECT {select_sql}
+        FROM `{table}`
+        WHERE `{product_col}` IN ({placeholders})
+        {order_sql}
+        LIMIT 5
+        """,
+        product_ids,
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        context_lines.append(f"按商品ID未查到样本：{', '.join(product_ids)}")
+        return
+    context_lines.append("商品样本：")
+    for row in rows:
+        summary = []
+        for col in selected:
+            summary.append(f"{col}={truncate_text(row.get(col), 120)}")
+        context_lines.append("- " + "；".join(summary))
+
+
+def safe_alias(value):
+    return re.sub(r"\W+", "_", stringify(value), flags=re.UNICODE).strip("_") or "field"
+
+
+def truncate_text(value, limit=120):
+    text = stringify(value).replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
 
 
 def fetch_detail_analysis_record(cursor, user_id, source, product_id, date_record, analysis_type):
@@ -903,11 +1491,12 @@ def normalize_detail_analysis_record(row):
 
 
 def public_user(user):
+    role = stringify(user.get("role") or "user").strip().lower()
     return {
         "id": user.get("id"),
         "username": user.get("username"),
         "display_name": user.get("display_name") or user.get("username"),
-        "role": user.get("role") or "USER",
+        "role": role or "user",
     }
 
 

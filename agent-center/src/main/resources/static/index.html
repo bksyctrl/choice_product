@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>专家团队</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", Arial, sans-serif;
+      color: #172033;
+      background: #f3f6fb;
+    }
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+    }
+    .sidebar {
+      background: #101a2b;
+      color: #fff;
+      padding: 24px 20px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+    .logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: #2774e6;
+      font-weight: 800;
+    }
+    .brand strong { display: block; font-size: 18px; }
+    .brand span { display: block; margin-top: 4px; color: #8fa0b8; font-size: 13px; }
+    .panel {
+      border-top: 1px solid #2d3a50;
+      padding-top: 18px;
+    }
+    .panel h3 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: #dbe7ff;
+    }
+    .role-list {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+    .role {
+      padding: 10px 12px;
+      border: 1px solid #2d3a50;
+      border-radius: 6px;
+      background: #162238;
+      color: #d7e3f7;
+      font-size: 13px;
+    }
+    .note {
+      line-height: 1.7;
+      color: #9badc6;
+      font-size: 13px;
+    }
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    .topbar {
+      height: 72px;
+      padding: 16px 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #d9e2f0;
+      background: #fff;
+    }
+    .topbar h1 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .topbar p {
+      margin: 4px 0 0;
+      color: #6b7c93;
+      font-size: 13px;
+    }
+    .session-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .session-actions input {
+      width: 220px;
+      height: 36px;
+      border: 1px solid #cfd9e8;
+      border-radius: 6px;
+      padding: 0 10px;
+      color: #26364d;
+    }
+    button {
+      height: 36px;
+      border: 1px solid #cfd9e8;
+      border-radius: 6px;
+      padding: 0 14px;
+      background: #fff;
+      color: #1d3557;
+      cursor: pointer;
+    }
+    button.primary {
+      border-color: #1f6bdd;
+      background: #1f6bdd;
+      color: #fff;
+    }
+    button:disabled {
+      opacity: .55;
+      cursor: not-allowed;
+    }
+    .chat {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 24px 28px;
+    }
+    .messages {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      display: grid;
+      align-content: start;
+      gap: 14px;
+      padding-bottom: 18px;
+    }
+    .message {
+      max-width: 880px;
+      border: 1px solid #d9e2f0;
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px 16px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      box-shadow: 0 8px 20px rgba(15, 30, 55, .04);
+    }
+    .message.user {
+      justify-self: end;
+      background: #eaf2ff;
+      border-color: #bfd6ff;
+    }
+    .role-name {
+      margin-bottom: 6px;
+      color: #6b7c93;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .composer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      padding: 14px;
+      border: 1px solid #d9e2f0;
+      border-radius: 8px;
+      background: #fff;
+    }
+    .composer-main {
+      min-width: 0;
+    }
+    .composer-tools {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+      color: #8190a5;
+      font-size: 12px;
+    }
+    .upload-btn {
+      display: inline-flex;
+      align-items: center;
+      height: 30px;
+      border: 1px solid #cfd9e8;
+      border-radius: 6px;
+      padding: 0 10px;
+      background: #f8fbff;
+      color: #1d3557;
+      cursor: pointer;
+      user-select: none;
+    }
+    .upload-btn input {
+      display: none;
+    }
+    textarea {
+      width: 100%;
+      min-height: 72px;
+      max-height: 180px;
+      resize: vertical;
+      border: 0;
+      outline: none;
+      font: inherit;
+      line-height: 1.6;
+      color: #172033;
+    }
+    .image-tray {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .image-chip {
+      position: relative;
+      width: 74px;
+      height: 74px;
+      border: 1px solid #d4deec;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #f6f8fc;
+    }
+    .image-chip img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .image-chip button {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 22px;
+      height: 22px;
+      min-width: 0;
+      padding: 0;
+      border-color: rgba(18, 31, 52, .2);
+      background: rgba(255, 255, 255, .92);
+      color: #26364d;
+      line-height: 20px;
+    }
+    .composer.dragging {
+      border-color: #1f6bdd;
+      box-shadow: 0 0 0 3px rgba(31, 107, 221, .12);
+    }
+    .meta {
+      margin-top: 8px;
+      color: #8190a5;
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .main { height: 100vh; }
+      .topbar { height: auto; align-items: flex-start; gap: 12px; flex-direction: column; }
+      .session-actions { width: 100%; }
+      .session-actions input { flex: 1; width: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">CP</div>
+        <div>
+          <strong>专家团队</strong>
+          <span>Java Agent 中台</span>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>专家领导层</h3>
+        <div class="role-list">
+          <div class="role">首席项目规划专家</div>
+          <div class="role">专家团队管理者</div>
+          <div class="role">数据方法论负责人</div>
+          <div class="role">用户体验负责人</div>
+        </div>
+        <h3>业务专家层</h3>
+        <div class="role-list">
+          <div class="role">数据分析专家</div>
+          <div class="role">IP 合规专家</div>
+          <div class="role">材质/视觉专家</div>
+          <div class="role">运营专家</div>
+          <div class="role">技术架构专家</div>
+        </div>
+        <p class="note">你先说目标或问题，CEO 会经过合规、RAG、决策、分发，再把任务交给合适的专家或生成执行交接单。</p>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1>专家团队对话</h1>
+          <p>当前连接：<span id="status">检查中...</span></p>
+        </div>
+        <div class="session-actions">
+          <input id="sessionId" value="demo-session" aria-label="sessionId">
+          <button id="clearBtn" type="button">清空记忆</button>
+        </div>
+      </header>
+      <section class="chat">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <div class="composer-main">
+            <textarea id="messageInput" placeholder="输入你想和专家团队讨论的问题，例如：帮我判断这个需求应该调用哪些专家，并生成执行交接单。也可以复制图片后 Ctrl+V 粘贴。"></textarea>
+            <div class="composer-tools">
+              <label class="upload-btn">
+                添加图片
+                <input id="imageInput" type="file" accept="image/*" multiple>
+              </label>
+              <span>支持 Ctrl+V 粘贴、拖拽图片到输入区、或点击添加图片</span>
+            </div>
+            <div id="imageTray" class="image-tray"></div>
+          </div>
+          <button id="sendBtn" class="primary" type="button">发送</button>
+        </div>
+        <div class="meta">提示：同一个 sessionId 会保留当前服务运行期间的短期记忆；支持 Ctrl+V 粘贴图片，当前先随消息提交给专家上下文，视觉识别模型将在后续接入。</div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const messages = [];
+    const attachedImages = [];
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function renderMessages() {
+      $('messages').innerHTML = messages.map(item => `
+        <article class="message ${item.role === 'user' ? 'user' : ''}">
+          <div class="role-name">${item.role === 'user' ? '你' : '专家团队'}</div>
+          <div>${escapeHtml(item.content)}</div>
+        </article>
+      `).join('');
+      $('messages').scrollTop = $('messages').scrollHeight;
+    }
+
+    function renderImages() {
+      $('imageTray').innerHTML = attachedImages.map((item, index) => `
+        <div class="image-chip" title="${escapeHtml(item.name)}">
+          <img src="${item.dataUrl}" alt="${escapeHtml(item.name)}">
+          <button type="button" data-remove-image="${index}" aria-label="移除图片">×</button>
+        </div>
+      `).join('');
+    }
+
+    function addImageFile(file) {
+      if (!file || !file.type.startsWith('image/')) return;
+      if (attachedImages.length >= 6) {
+        alert('一次最多粘贴 6 张图片');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        attachedImages.push({
+          name: file.name || 'pasted-image',
+          mimeType: file.type,
+          size: file.size,
+          dataUrl: reader.result
+        });
+        renderImages();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function addImageFiles(files) {
+      Array.from(files || []).forEach(addImageFile);
+    }
+
+    async function checkStatus() {
+      try {
+        const res = await fetch('/api/agent/handlers');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        $('status').textContent = '已连接';
+      } catch (error) {
+        $('status').textContent = '连接失败';
+      }
+    }
+
+    async function sendMessage() {
+      const text = $('messageInput').value.trim();
+      if (!text && !attachedImages.length) return;
+      const imagesForRequest = attachedImages.map(item => ({ ...item }));
+      $('messageInput').value = '';
+      attachedImages.length = 0;
+      renderImages();
+      $('sendBtn').disabled = true;
+      messages.push({
+        role: 'user',
+        content: text + (imagesForRequest.length ? `\n[已附加 ${imagesForRequest.length} 张图片]` : '')
+      });
+      messages.push({ role: 'assistant', content: '专家团队正在判断...' });
+      renderMessages();
+
+      try {
+        const res = await fetch('/api/agent/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: $('sessionId').value.trim() || 'demo-session',
+            userId: 1,
+            message: text || '请分析我粘贴的图片',
+            context: {
+              images: imagesForRequest
+            }
+          })
+        });
+        const json = await res.json();
+        messages.pop();
+        messages.push({
+          role: 'assistant',
+          content: json.message || json.error || '专家团队没有返回内容'
+        });
+      } catch (error) {
+        messages.pop();
+        messages.push({ role: 'assistant', content: '请求失败：' + error.message });
+      } finally {
+        $('sendBtn').disabled = false;
+        renderMessages();
+      }
+    }
+
+    async function clearSession() {
+      const sessionId = $('sessionId').value.trim() || 'demo-session';
+      await fetch('/api/agent/sessions/' + encodeURIComponent(sessionId), { method: 'DELETE' });
+      messages.length = 0;
+      messages.push({ role: 'assistant', content: '当前会话记忆已清空。你可以重新开始和专家团队沟通。' });
+      renderMessages();
+    }
+
+    $('sendBtn').addEventListener('click', sendMessage);
+    $('clearBtn').addEventListener('click', clearSession);
+    $('imageInput').addEventListener('change', (event) => {
+      addImageFiles(event.target.files);
+      event.target.value = '';
+    });
+    $('imageTray').addEventListener('click', (event) => {
+      const button = event.target.closest('[data-remove-image]');
+      if (!button) return;
+      attachedImages.splice(Number(button.dataset.removeImage), 1);
+      renderImages();
+    });
+    function handlePaste(event) {
+      const files = Array.from(event.clipboardData?.files || [])
+        .filter(file => file.type.startsWith('image/'));
+      const itemFiles = Array.from(event.clipboardData?.items || [])
+        .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+        .map(item => item.getAsFile())
+        .filter(Boolean);
+      const allFiles = [...files, ...itemFiles];
+      if (!allFiles.length) return;
+      event.preventDefault();
+      addImageFiles(allFiles);
+    }
+    document.addEventListener('paste', handlePaste);
+    $('messageInput').addEventListener('paste', handlePaste);
+
+    const composer = document.querySelector('.composer');
+    composer.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      composer.classList.add('dragging');
+    });
+    composer.addEventListener('dragleave', () => {
+      composer.classList.remove('dragging');
+    });
+    composer.addEventListener('drop', (event) => {
+      event.preventDefault();
+      composer.classList.remove('dragging');
+      addImageFiles(Array.from(event.dataTransfer?.files || []).filter(file => file.type.startsWith('image/')));
+    });
+    $('messageInput').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        sendMessage();
+      }
+    });
+
+    messages.push({ role: 'assistant', content: '你好，我是专家团队入口。你可以告诉我你的目标、问题或想执行的方案，我会先判断该调用哪些专家，再给出下一步。' });
+    renderMessages();
+    checkStatus();
+  </script>
+</body>
+</html>

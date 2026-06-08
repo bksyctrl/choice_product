@@ -2009,6 +2009,300 @@ dialog::backdrop {
   font-size: 13px;
 }
 
+.expert-team-page {
+  display: grid;
+  gap: 16px;
+}
+
+.expert-team-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  gap: 16px;
+}
+
+.expert-team-panel,
+.expert-chat {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.expert-team-panel {
+  padding: 18px;
+}
+
+.expert-team-panel h3 {
+  margin: 0 0 14px;
+  font-size: 16px;
+}
+
+.expert-session-box {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.expert-session-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.expert-session-head strong {
+  color: #0f172a;
+}
+
+.expert-session-head span,
+.expert-session-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.expert-session-list {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.expert-session-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #f8fafc;
+  color: #334155;
+  text-align: left;
+}
+
+.expert-session-item.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.expert-session-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.expert-session-item small {
+  color: var(--muted);
+}
+
+.expert-session-item i {
+  color: #dc2626;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.expert-role-group {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.expert-role-group strong {
+  color: #0f172a;
+}
+
+.expert-role-group span {
+  display: block;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 13px;
+}
+
+.expert-team-note,
+.expert-team-tip {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.expert-chat {
+  display: grid;
+  grid-template-rows: auto minmax(360px, 1fr) auto auto;
+  min-height: 620px;
+}
+
+.expert-chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.expert-chat-head p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.expert-messages {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 20px;
+  overflow: auto;
+}
+
+.expert-welcome {
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  padding: 18px;
+  background: #f8fafc;
+  color: #334155;
+}
+
+.expert-welcome p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.expert-message {
+  max-width: 82%;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #f8fafc;
+}
+
+.expert-message.user {
+  justify-self: end;
+  border-color: #bcd7ff;
+  background: #eef6ff;
+}
+
+.expert-message.assistant {
+  justify-self: start;
+}
+
+.expert-message-role {
+  margin-bottom: 6px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.expert-message-content {
+  color: #0f172a;
+  line-height: 1.65;
+  white-space: normal;
+}
+
+.expert-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px;
+  gap: 10px;
+  padding: 16px 20px 8px;
+  border-top: 1px solid var(--line);
+}
+
+.expert-input-main {
+  min-width: 0;
+}
+
+.expert-input-row textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  line-height: 1.5;
+}
+
+.expert-input-row button {
+  min-height: 42px;
+  align-self: end;
+}
+
+.expert-input-row.dragging {
+  background: #f0f7ff;
+}
+
+.expert-image-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.expert-image-upload {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #f8fafc;
+  color: #1d4ed8;
+  cursor: pointer;
+  user-select: none;
+}
+
+.expert-image-upload input {
+  display: none;
+}
+
+.expert-image-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.expert-image-chip {
+  position: relative;
+  width: 76px;
+  height: 76px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.expert-image-chip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.expert-image-chip button {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  min-height: 22px;
+  height: 22px;
+  padding: 0;
+  border-color: rgba(15, 23, 42, .18);
+  background: rgba(255, 255, 255, .92);
+  color: #0f172a;
+  line-height: 20px;
+}
+
+.expert-chat .expert-team-tip {
+  padding: 0 20px 18px;
+}
+
 @media (max-width: 1100px) {
   .app {
     grid-template-columns: 1fr;
@@ -2033,6 +2327,10 @@ dialog::backdrop {
   }
   
   .detail-analysis-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .expert-team-layout {
     grid-template-columns: 1fr;
   }
 
