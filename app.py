@@ -1540,6 +1540,7 @@ def dispatch_expert_handlers(ceo_decision, message, readonly_context="", base_fi
                 "summary": f"Handler 执行失败：{exc}",
                 "data": {},
             }
+        result = enhance_expert_handler_result(result, handler_code, decision, message, readonly_context, base_files or [])
         results.append(result)
     return {
         "stage": "Action Execution",
@@ -1604,6 +1605,151 @@ def handle_ux_lead(handler_code, decision, message, readonly_context, base_files
             ]
         },
     }
+
+
+EXPERT_CLOSURE_PROFILES = {
+    "project_file_scout": {
+        "capability": "只读检索项目文件与上下文",
+        "evidence_required": "必须返回已读取文件、命中片段或未命中说明",
+        "cannot_claim": "不能声称已修改代码或已执行数据库写入",
+        "next_action": "把定位结果交给技术架构专家或执行适配器",
+    },
+    "system_architect": {
+        "capability": "判断接口、字段、数据库、任务队列、前后端链路",
+        "evidence_required": "必须引用文件、接口、字段、配置或查询结果",
+        "cannot_claim": "未读代码/未查配置时不能断言系统缺失某能力",
+        "next_action": "输出可执行落点，交给 Codex 执行适配器或标记缺口",
+    },
+    "ux_lead": {
+        "capability": "检查用户阅读成本、页面提示、最终回复是否可读",
+        "evidence_required": "必须说明用户能看到什么、点击哪里、如何验收",
+        "cannot_claim": "不能替代技术执行结果说已完成",
+        "next_action": "把用户可见要求交给前端/回复校验器",
+    },
+    "data_analysis": {
+        "capability": "分析销量、环比、队列效率、覆盖率、异常波动",
+        "evidence_required": "必须优先使用数据库统计、配置值或明确口径",
+        "cannot_claim": "没查库时不能给出总量、覆盖率、瓶颈结论",
+        "next_action": "输出需要查询的指标或基于已查数据给出结论",
+    },
+    "ip_compliance": {
+        "capability": "判断 IP 来源、侵权风险、等级和复核建议",
+        "evidence_required": "必须基于标题、属性、卖点、图片线索、规则库或经验库",
+        "cannot_claim": "无法识别来源时不能直接打高风险 A/S，也不能编造来源",
+        "next_action": "给出等级、来源、侵权判断和是否需要人工复核",
+    },
+    "material_visual": {
+        "capability": "判断材质、工厂可生产性、视觉复杂度、图案/Logo/插画",
+        "evidence_required": "必须基于标题、属性、卖点、图片线索或材质规则",
+        "cannot_claim": "不能替代 IP 合规判断侵权等级",
+        "next_action": "给出一两句材质总结或详细分析请求",
+    },
+    "operations": {
+        "capability": "制定上架、达人、商品卡、监控和预警动作",
+        "evidence_required": "必须引用商品状态、销售指标或用户运营目标",
+        "cannot_claim": "不能在没有数据依据时断言必爆或必亏",
+        "next_action": "输出可执行运营动作和优先级",
+    },
+    "product_manager": {
+        "capability": "判断商品定位、痛点、卖点、差异化和目标人群",
+        "evidence_required": "必须引用标题、属性、卖点、价格或竞品线索",
+        "cannot_claim": "不能替代系统产品经理维护代码路线",
+        "next_action": "输出商品侧改进建议或卖点重组",
+    },
+    "selection_reviewer": {
+        "capability": "综合各专家证据，给出选品总评",
+        "evidence_required": "必须引用数据/IP/材质/运营/产品中至少两个维度",
+        "cannot_claim": "不能脱离前序专家证据直接给最终结论",
+        "next_action": "输出是否值得选、风险点和复核点",
+    },
+    "codex_executor": {
+        "capability": "按白名单适配器写文件、验证、回传结果",
+        "evidence_required": "必须返回修改文件、验证结果或未命中适配器原因",
+        "cannot_claim": "没有 changed_files/verification 时不能说已完成代码修改",
+        "next_action": "执行适配器、补适配器或返回待补能力项",
+    },
+    "execution_handoff": {
+        "capability": "把执行结果包装成用户可审核结果",
+        "evidence_required": "必须基于真实 handler 状态",
+        "cannot_claim": "不能暴露内部调试状态给普通用户",
+        "next_action": "交给回复体验校验层",
+    },
+}
+
+
+def enhance_expert_handler_result(result, handler_code, decision, message, readonly_context, base_files):
+    enhanced = dict(result or {})
+    data = dict(enhanced.get("data") or {})
+    profile = EXPERT_CLOSURE_PROFILES.get(handler_code, {
+        "capability": "规划、分发或辅助判断",
+        "evidence_required": "必须说明依据和边界",
+        "cannot_claim": "不能把未验证结论当事实",
+        "next_action": "交给具备能力的专家或执行器",
+    })
+    evidence = build_handler_evidence(handler_code, data, readonly_context, base_files)
+    confidence = estimate_handler_confidence(handler_code, enhanced, evidence, readonly_context)
+    data.setdefault("closure", {
+        "capability": profile["capability"],
+        "evidence_required": profile["evidence_required"],
+        "cannot_claim": profile["cannot_claim"],
+        "evidence": evidence,
+        "confidence": confidence,
+        "next_action": profile["next_action"],
+        "verified": bool(evidence) or handler_code in {"ux_lead", "execution_handoff"},
+    })
+    enhanced["data"] = data
+    enhanced["quality"] = {
+        "closed_loop": data["closure"]["verified"],
+        "confidence": confidence,
+        "has_evidence": bool(evidence),
+    }
+    return enhanced
+
+
+def build_handler_evidence(handler_code, data, readonly_context, base_files):
+    evidence = []
+    if base_files:
+        evidence.append({"type": "base_files", "items": [safe_relpath(Path(item)) if isinstance(item, str) else stringify(item) for item in base_files[:6]]})
+    matched_files = data.get("matched_files") or []
+    if matched_files:
+        evidence.append({"type": "matched_files", "items": matched_files[:8]})
+    findings = data.get("findings") or data.get("principles") or []
+    if findings:
+        evidence.append({"type": "handler_findings", "items": findings[:6]})
+    if readonly_context:
+        context_files = []
+        for match in re.finditer(r"文件：([^\n]+)", stringify(readonly_context)):
+            file_name = match.group(1).strip()
+            if file_name not in context_files:
+                context_files.append(file_name)
+        if context_files:
+            evidence.append({"type": "readonly_context_files", "items": context_files[:8]})
+    if handler_code == "codex_executor":
+        changed_files = data.get("changed_files") or []
+        verification = data.get("verification") or {}
+        if changed_files:
+            evidence.append({"type": "changed_files", "items": changed_files})
+        if verification:
+            evidence.append({"type": "verification", "items": verification})
+    return evidence
+
+
+def estimate_handler_confidence(handler_code, result, evidence, readonly_context):
+    status = result.get("status")
+    if status == "FAILED":
+        return 0.0
+    if handler_code == "codex_executor":
+        data = result.get("data") or {}
+        verification = data.get("verification") or {}
+        if result.get("status") == "COMPLETED" and verification:
+            return 0.9
+        if result.get("status") in {"WAITING_ADAPTER", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
+            return 0.45
+    if evidence:
+        return 0.75
+    if readonly_context:
+        return 0.55
+    return 0.35
 
 
 def handle_codex_executor(handler_code, decision, message, readonly_context, base_files):
@@ -2403,24 +2549,47 @@ def build_agent_response_summary(decision, handler_results):
     waiting = [item for item in handler_results if item.get("status") in {"WAITING_EXECUTOR_BRIDGE", "WAITING_EXECUTOR_RECIPE", "WAITING_ADAPTER"}]
     failed = [item for item in handler_results if item.get("status") == "FAILED"]
     unsupported = [item for item in handler_results if item.get("status") in {"UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW"}]
+    quality = summarize_handler_quality(handler_results)
     if failed:
         success = False
         message = "部分 Handler 执行失败，已返回可见错误。"
     elif unsupported:
         success = True
-        message = "专家分发层已正常唤醒 Handler；业务执行层已接入，但当前任务没有命中可执行工作流，因此未写入文件。"
+        message = "专家团队已完成判断，但当前任务没有命中可自动执行的工作流，已标记为待补能力项。"
     elif waiting:
         success = True
-        message = "专家分发层已正常完成；WorkflowEngine 已启动实例并执行到能力适配器边界，当前等待安全执行适配器。"
+        message = "专家团队已完成判断，但当前任务缺少可自动落地的执行适配器，已标记为待补能力项。"
     else:
         success = True
-        message = "专家分发层和业务执行层已完成，并生成可反馈给用户的结果。"
+        message = "专家团队已完成分工、执行和结果校验，可反馈给用户审核。"
     return {
         "success": success,
         "message": message,
         "intent": decision.get("intent"),
         "mode": decision.get("mode"),
         "handler_statuses": [{"handler": item.get("handler"), "status": item.get("status")} for item in handler_results],
+        "quality": quality,
+    }
+
+
+def summarize_handler_quality(handler_results):
+    total = len(handler_results or [])
+    with_evidence = 0
+    closed_loop = 0
+    low_confidence = []
+    for item in handler_results or []:
+        quality = item.get("quality") or {}
+        if quality.get("has_evidence"):
+            with_evidence += 1
+        if quality.get("closed_loop"):
+            closed_loop += 1
+        if float(quality.get("confidence") or 0) < 0.5:
+            low_confidence.append(item.get("handler"))
+    return {
+        "handler_count": total,
+        "with_evidence": with_evidence,
+        "closed_loop": closed_loop,
+        "low_confidence_handlers": [item for item in low_confidence if item],
     }
 
 
@@ -2462,7 +2631,7 @@ def build_expert_post_learning(session_id, message, ceo_decision, expert_executi
         "recorded": True,
         "scope": "session_isolated",
         "insight": (
-            "当用户要求系统升级 Agent 团队时，不能停在方案层；必须展示 CEO 决策、Dispatcher 分发、Handler 执行结果、Response Delivery 和 Post-Learning。"
+            "专家团队必须形成闭环：先查证据，再判断能力，再执行或标记待补能力，最后只给用户可审核结果；内部流程不直接展示给用户。"
         ),
         "intent": (ceo_decision or {}).get("intent"),
         "handler_count": (expert_execution or {}).get("handler_count"),
@@ -2495,6 +2664,8 @@ def build_expert_team_system_prompt(user, project_code, project_context):
 5. 如果用户问的是项目建设，你要从系统产品、技术架构、数据架构、AI效率、UX角度组织团队。
 6. 如果用户问的是商品分析，你要调度数据、IP、材质、运营、商品产品经理、选品总评专家。
 7. 如果用户问的是代码、接口、页面、字段、项目文件位置或为什么某功能缺失，你要优先调用“项目文件侦察员”读取系统提供的只读文件上下文，再让技术架构专家/用户体验负责人判断，不要先反问用户已经能从文件里看到的信息。
+8. 必须遵守闭环纪律：没有文件证据、数据库证据、配置证据或 Handler 执行结果时，不能把推测说成事实。
+9. 每次回答都要区分“已确认事实 / 合理推断 / 待验证事项 / 下一步动作”，但不要机械套模板；能直接给结论时先给结论。
 
 当前用户：
 - user_id: {user.get('id')}
@@ -2508,17 +2679,24 @@ def build_expert_team_system_prompt(user, project_code, project_context):
 {chr(10).join(role_lines)}
 
 回复格式：
-- 先给“执行状态”：说明 Dispatcher 和 Handler 是否已执行；如果 Action Execution 已写入文件，要明确写“已执行/已修改”；如果未写入，只能说“未命中可执行工作流”，不要再写“等待技术执行Agent接入”。
-- 再给“CEO决策”：说明意图 intent、模式 mode、是否需要用户补充；默认不要让用户补充材料。
-- 再给“专家分发”：必须引用系统提供的 Handler 执行结果，列出哪个 Handler 已执行、状态是什么。
-- 再给“交付结果”：直接给用户可查看、可审核的结论/方案/任务回执。
-- 最后给“用户只需审核”：只说明用户需要确认执行或审核结果，不要要求用户粘贴代码、找接口、找技术人员、判断能力或整理项目材料。
+- 面向用户时，不展示 WorkflowEngine、Dispatcher、Handler、CEO决策、IntentHandlerFactory、第6层、第7层等内部词。
+- 优先输出用户能理解的结论：已经确认了什么、为什么、完成了什么、用户在哪里查看。
+- 如果 Action Execution 已写入文件，要明确写“已执行/已修改”，并给修改文件和验证结果。
+- 如果未写入，只能说“当前还没有覆盖到对应的自动执行能力，已记录为待补能力项”，不要再写“等待技术执行Agent接入”。
+- 不要要求用户粘贴代码、找接口、找技术人员、判断能力或整理项目材料。
 
 不要假装已经调用外部工具或数据库；但如果系统消息里提供了“只读工具结果/项目文件侦察结果”，你可以引用其中的文件路径、行号和结论。不得声称自己执行了写入、修改、删除、上线、提交代码等动作。
 如果系统消息里提供了“会话基底文件读取结果”，说明后端已经替你读取了用户指定的本地项目文件；你必须优先依据这些内容回答，不要再说“无法读取本地 Windows 路径”。
 如果“会话基底文件读取结果”里写明“已对指定文件做全文件关键词检索”，你不能说“只看到前80行”，也不能要求用户粘贴同一个文件代码；如果上下文仍不够，只能要求用户补充更具体的关键词或把相关文件加入基底文件列表。
 你必须遵循 TotalAgent 全生命周期：User Input -> TotalAgent Entry -> Security Gate -> RAG Enrichment -> Core Decision Layer -> Dispatcher -> Action Execution -> Response Delivery -> Post-Learning。用户只提供需求、查看结果、审核结果；其他文件检索、字段判断、能力判断、专家分发和执行交接由系统承担。
 如果系统明确告诉你“执行器已经写入文件并通过验证”，你必须把修改文件、命中工作流和验证结果反馈给用户。如果系统告诉你“NO_EXECUTABLE_WORKFLOW”，你必须说明第 6 层已派发成功、第 7 层缺少对应业务工作流；不要说等待技术执行Agent接入。禁止让用户自己找技术人员、自己打开文件、自己改代码。
+专家闭环纪律：
+- 数据分析专家：没查库、没配置、没口径时，不能给数量和覆盖率结论。
+- IP合规专家：必须区分明确IP命中、疑似风格、无法识别；无法识别不能直接打 A/S。
+- 材质/视觉专家：必须区分工厂材质、非工厂材质、疑似材质；只给材质结论，不越权判断IP侵权。
+- 技术架构专家：没读到文件/接口/配置时，不能说“缺失”或“已实现”，只能说“待验证”。
+- 项目文件侦察员：只负责读文件和定位片段，不能替执行器宣布完成。
+- Codex执行桥：只有返回 changed_files 或 verification 时，才允许说已执行或已验证。
 """.strip()
 
 
@@ -2598,8 +2776,12 @@ def remove_internal_workflow_diagnostics(text):
         "WorkflowEngine",
         "WAITING_ADAPTER",
         "IntentHandlerFactory",
+        "Dispatcher",
+        "Handler",
         "CEO决策",
         "专家分发",
+        "Action Execution",
+        "Response Delivery",
         "第 6 层",
         "第 7 层",
         "安全执行适配器",
@@ -2625,11 +2807,15 @@ def sanitize_expert_message_for_display(text):
         "WorkflowEngine",
         "WAITING_ADAPTER",
         "IntentHandlerFactory",
+        "Dispatcher",
+        "Handler",
         "codex_executor",
         "workflow_engine",
         "execution_handoff",
         "CEO决策",
         "专家分发",
+        "Action Execution",
+        "Response Delivery",
         "第 6 层",
         "第 7 层",
         "安全执行适配器",
@@ -2663,7 +2849,7 @@ def ensure_expert_execution_status(answer, ceo_decision=None, expert_execution=N
     codex_result = get_codex_executor_result(expert_execution)
     if codex_result and codex_result.get("status") in {"COMPLETED", "UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER"}:
         stale_words = ["等待技术执行Agent接入", "等待 Codex 执行桥", "未修改，仅生成", "执行交接单"]
-        internal_words = ["WorkflowEngine", "WAITING_ADAPTER", "IntentHandlerFactory", "第 6 层", "第 7 层"]
+        internal_words = ["WorkflowEngine", "WAITING_ADAPTER", "IntentHandlerFactory", "Dispatcher", "Handler", "CEO决策", "第 6 层", "第 7 层"]
         if any(word in text for word in stale_words + internal_words) or not text:
             return build_codex_executor_status_answer(ceo_decision, expert_execution)
     if "执行状态" in text:
@@ -2680,11 +2866,15 @@ class ExpertResponseValidator:
         "WorkflowEngine",
         "WAITING_ADAPTER",
         "IntentHandlerFactory",
+        "Dispatcher",
+        "Handler",
         "codex_executor",
         "workflow_engine",
         "execution_handoff",
         "CEO决策",
         "专家分发",
+        "Action Execution",
+        "Response Delivery",
         "第 6 层",
         "第 7 层",
         "安全执行适配器",
@@ -2716,6 +2906,10 @@ class ExpertResponseValidator:
             reasons.append("包含内部工作流或调试信息")
         if any(term in output for term in self.user_burden_terms):
             reasons.append("把系统内部执行责任转嫁给用户")
+        strong_claim_terms = ["缺失", "没有实现", "未实现", "不属实", "属实", "已实现", "已存在", "只有一套"]
+        has_evidence = response_has_execution_evidence(expert_execution)
+        if any(term in output for term in strong_claim_terms) and not has_evidence:
+            reasons.append("包含强事实结论，但缺少文件/数据库/执行证据")
 
         score = estimate_answer_alignment_score(original_input, output)
         if not codex_result and score < 0.08:
@@ -2835,6 +3029,20 @@ def build_user_facing_execution_answer(ceo_decision=None, expert_execution=None,
         "这次回复已被校验层拦截，没有直接展示内部执行信息。\n\n"
         f"原因：{reason_text or '输出不符合用户可读标准'}。"
     )
+
+
+def response_has_execution_evidence(expert_execution):
+    for item in (expert_execution or {}).get("results") or []:
+        quality = item.get("quality") or {}
+        if quality.get("has_evidence") or quality.get("closed_loop"):
+            return True
+        data = item.get("data") or {}
+        if data.get("changed_files") or data.get("verification"):
+            return True
+        closure = data.get("closure") or {}
+        if closure.get("evidence"):
+            return True
+    return False
 
 
 def estimate_answer_alignment_score(original_input, answer):
