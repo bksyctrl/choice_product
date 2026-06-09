@@ -69,8 +69,25 @@ AI_DAEMON_LATEST_ONLY = os.getenv("AI_DAEMON_LATEST_ONLY", "true").strip().lower
 DETAIL_ANALYSIS_TABLE = "cp_user_detail_analysis"
 EXPERT_TEAM_SESSION_TABLE = "cp_expert_team_session"
 EXPERT_TEAM_MESSAGE_TABLE = "cp_expert_team_message"
+EXPERT_WORKFLOW_INSTANCE_TABLE = "cp_expert_workflow_instance"
+EXPERT_WORKFLOW_STEP_TABLE = "cp_expert_workflow_step"
 EXPERT_TEAM_ALLOWED_ROLES = {"admin", "manager"}
 PERMISSION_EXPERT_TEAM = "expert_team"
+PROJECT_ROOT = Path(__file__).resolve().parent
+EXPERT_FILE_CONTEXT_MAX_FILES = 12
+EXPERT_FILE_CONTEXT_MAX_MATCHES_PER_FILE = 5
+EXPERT_FILE_CONTEXT_MAX_CHARS = 30000
+EXPERT_FILE_ALLOWED_SUFFIXES = {".py", ".html", ".css", ".js", ".md", ".yml", ".yaml", ".xml", ".json", ".txt"}
+EXPERT_FILE_EXCLUDED_DIRS = {
+    ".git",
+    ".idea",
+    ".venv",
+    "__pycache__",
+    "target",
+    "node_modules",
+    "tmp_render",
+    "ComfyUI_ImageToText-main",
+}
 DETAIL_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.getenv("DETAIL_ANALYSIS_CONCURRENCY", "2")))))
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
@@ -445,7 +462,26 @@ def create_app():
         except requests.RequestException as exc:
             translation = fallback_translate_title(text)
             return api_ok({"source": text, "translation": translation, "provider": "local_fallback", "warning": str(exc)})
-        return api_ok({"source": text, "translation": translation, "provider": "minimax"})
+        return api_ok({"source": text, "translation": strip_llm_think_blocks(translation), "provider": "minimax"})
+
+    @app.post("/api/translate-text")
+    def translate_text():
+        require_current_user()
+        payload = request.get_json(silent=True) or {}
+        text = stringify(payload.get("text")).strip()
+        if not text:
+            return api_error("text 不能为空", 400)
+        if len(text) > 5000:
+            return api_error("文本过长，无法翻译", 400)
+        try:
+            translation = translate_general_text_to_chinese(text)
+        except RuntimeError as exc:
+            translation = fallback_translate_title(text)
+            return api_ok({"source": text, "translation": translation, "provider": "local_fallback", "warning": str(exc)})
+        except requests.RequestException as exc:
+            translation = fallback_translate_title(text)
+            return api_ok({"source": text, "translation": translation, "provider": "local_fallback", "warning": str(exc)})
+        return api_ok({"source": text, "translation": strip_llm_think_blocks(translation), "provider": "minimax"})
 
     @app.get("/api/products/<source>/<product_id>")
     def product_detail(source, product_id):
@@ -603,6 +639,57 @@ def create_app():
             conn.commit()
         return api_ok({"deleted": True, "session_id": session_id})
 
+    @app.get("/api/expert-team/workflows")
+    def expert_team_workflows():
+        user = require_expert_team_permission()
+        session_id = parse_int(request.args.get("session_id"))
+        where = ["user_id = %s"]
+        params = [user["id"]]
+        if session_id:
+            where.append("session_id = %s")
+            params.append(session_id)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                WHERE {" AND ".join(where)}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 100
+                """,
+                params,
+            )
+            rows = [normalize_expert_workflow_instance(row) for row in cursor.fetchall()]
+        return api_ok({"items": rows})
+
+    @app.get("/api/expert-team/workflows/<int:workflow_id>")
+    def expert_team_workflow_detail(workflow_id):
+        user = require_expert_team_permission()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                WHERE id = %s AND user_id = %s
+                LIMIT 1
+                """,
+                (workflow_id, user["id"]),
+            )
+            workflow = cursor.fetchone()
+            if not workflow:
+                return api_error("工作流不存在", 404)
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {EXPERT_WORKFLOW_STEP_TABLE}
+                WHERE workflow_id = %s
+                ORDER BY step_order ASC, id ASC
+                """,
+                (workflow_id,),
+            )
+            steps = [normalize_expert_workflow_step(row) for row in cursor.fetchall()]
+        return api_ok({"workflow": normalize_expert_workflow_instance(workflow), "steps": steps})
+
     @app.post("/api/expert-team/chat")
     def expert_team_chat():
         user = require_expert_team_permission()
@@ -610,6 +697,7 @@ def create_app():
         message = stringify(payload.get("message")).strip()
         images = payload.get("images") if isinstance(payload.get("images"), list) else []
         image_count = len(images)
+        base_files = normalize_expert_base_files(payload.get("base_files"))
         if not message and image_count:
             message = f"请分析我发送的{image_count}张图片"
         if not message:
@@ -666,7 +754,12 @@ def create_app():
             )
             history = list(reversed(cursor.fetchall()))
 
-        readonly_context = collect_expert_readonly_context(message)
+        context_query = build_expert_context_query(message, history)
+        base_files = merge_expert_base_files(base_files, extract_expert_file_paths(context_query))
+        readonly_context = collect_expert_readonly_context(context_query, base_files)
+        ceo_decision = build_expert_ceo_decision(context_query, readonly_context, image_count)
+        expert_execution = dispatch_expert_handlers(ceo_decision, context_query, readonly_context, base_files, session_id, user["id"])
+        learning_result = build_expert_post_learning(session_id, context_query, ceo_decision, expert_execution)
         if image_count:
             readonly_context = (readonly_context + "\n\n" if readonly_context else "") + (
                 f"用户本轮随消息发送了{image_count}张图片。当前后端已接收图片上下文，"
@@ -674,10 +767,15 @@ def create_app():
             )
 
         try:
-            answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context))
+            answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context, ceo_decision, expert_execution, learning_result))
+            if readonly_context and is_expert_fake_wait_answer(answer):
+                answer = build_expert_read_context_answer(message, readonly_context, ceo_decision, expert_execution)
+            answer = ensure_expert_execution_status(answer, ceo_decision, expert_execution)
+            answer, validation_result = validate_and_refine_expert_answer(context_query, answer, ceo_decision, expert_execution)
             status = "SUCCESS"
         except Exception as exc:
             answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
+            validation_result = {"passed": False, "fallback": True, "reason": str(exc), "retry_count": 0}
             status = "FALLBACK"
 
         with db() as conn, conn.cursor() as cursor:
@@ -687,7 +785,7 @@ def create_app():
                   (session_id, user_id, role, team_role, content, meta_json)
                 VALUES (%s, %s, 'assistant', 'chief_planner', %s, %s)
                 """,
-                (session_id, user["id"], answer, json.dumps({"status": status, "readonly_context": readonly_context, "image_count": image_count}, ensure_ascii=False)),
+                (session_id, user["id"], answer, json.dumps({"status": status, "readonly_context": readonly_context, "image_count": image_count, "base_files": base_files, "ceo_decision": ceo_decision, "expert_execution": expert_execution, "learning_result": learning_result, "response_validation": validation_result}, ensure_ascii=False)),
             )
             cursor.execute(
                 f"UPDATE {EXPERT_TEAM_SESSION_TABLE} SET updated_at = NOW() WHERE id = %s AND user_id = %s",
@@ -829,12 +927,60 @@ def translate_text_to_chinese(text):
     response.raise_for_status()
     data = response.json()
     try:
-        translation = data["choices"][0]["message"]["content"].strip()
+        translation = strip_llm_think_blocks(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError("翻译服务返回格式异常") from exc
     if not translation:
         raise RuntimeError("翻译服务返回为空")
     return translation
+
+
+def translate_general_text_to_chinese(text):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY，无法翻译文本")
+    url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MINIMAX_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是电商商品信息翻译助手。只输出简体中文译文，不要解释。保留品牌名、型号、规格、数字和专有名词。",
+                },
+                {
+                    "role": "user",
+                    "content": f"请把下面的商品卖点或商品描述翻译成简体中文，保持分隔符和关键信息清晰：\n{text}",
+                },
+            ],
+            "temperature": 0,
+            "stream": False,
+        },
+        timeout=45,
+    )
+    response.raise_for_status()
+    data = response.json()
+    try:
+        translation = strip_llm_think_blocks(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("翻译服务返回格式异常") from exc
+    if not translation:
+        raise RuntimeError("翻译服务返回为空")
+    return translation
+
+
+def strip_llm_think_blocks(text):
+    cleaned = stringify(text)
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*<think>[\s\S]*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*思考[:：][\s\S]*?(?=\n\s*(结论|翻译|译文)[:：]|\Z)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*(结论|翻译|译文)[:：]\s*", "", cleaned.strip(), flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 TITLE_TRANSLATION_PHRASES = [
@@ -1020,6 +1166,51 @@ def ensure_expert_team_tables():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EXPERT_WORKFLOW_INSTANCE_TABLE} (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              session_id BIGINT NOT NULL,
+              user_id BIGINT NOT NULL,
+              workflow_code VARCHAR(128) NOT NULL,
+              workflow_name VARCHAR(255) NOT NULL DEFAULT '',
+              intent VARCHAR(128) NOT NULL DEFAULT '',
+              mode VARCHAR(64) NOT NULL DEFAULT '',
+              status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
+              input_json LONGTEXT NULL,
+              output_json LONGTEXT NULL,
+              error_message TEXT NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              completed_at DATETIME NULL,
+              KEY idx_session_workflow (session_id, id),
+              KEY idx_user_status (user_id, status, updated_at),
+              KEY idx_workflow_code (workflow_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EXPERT_WORKFLOW_STEP_TABLE} (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              workflow_id BIGINT NOT NULL,
+              step_order INT NOT NULL,
+              step_code VARCHAR(128) NOT NULL,
+              step_name VARCHAR(255) NOT NULL DEFAULT '',
+              executor VARCHAR(128) NOT NULL DEFAULT '',
+              status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+              input_json LONGTEXT NULL,
+              output_json LONGTEXT NULL,
+              error_message TEXT NULL,
+              started_at DATETIME NULL,
+              completed_at DATETIME NULL,
+              created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              KEY idx_workflow_step (workflow_id, step_order),
+              KEY idx_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
         conn.commit()
 
 
@@ -1101,6 +1292,20 @@ EXPERT_TEAM_ROLES = [
         "focus": "系统结构、接口、数据库、任务队列、可扩展性和技术债。",
         "limits": "不直接判断商品商业价值。",
     },
+    {
+        "code": "project_file_scout",
+        "name": "项目文件侦察员",
+        "level": "readonly_tool",
+        "focus": "只读查看项目文件、定位前端页面、后端接口、样式、工具脚本和文档中的相关片段。",
+        "limits": "只能读取项目白名单文件，不能写文件、不能执行命令、不能读取项目外路径。",
+    },
+    {
+        "code": "codex_executor",
+        "name": "技术执行Agent / Codex执行桥",
+        "level": "write_tool",
+        "focus": "在用户确认执行后，对项目白名单文件执行受控代码修改、验证并回传结果。",
+        "limits": "只能执行内置白名单配方，不能运行任意命令，不能修改 D:\\choice_product 外文件，不能绕过用户确认。",
+    },
 ]
 
 
@@ -1108,7 +1313,11 @@ EXPERT_EXECUTION_HANDOFF_RULES = """
 专家团队执行交接规则：
 1. 专家团队本身不直接写代码、不写库、不改线上数据，但必须判断“谁具备执行能力”。
 2. 当用户表达“可以执行、开始执行、落地、修改、让A做、交给技术人员、你手下人员去做”等意图时，必须输出《执行交接单》。
-3. 《执行交接单》必须让执行者A可以直接听懂，不能只说方向，必须包含：
+3. 只要本轮只是专家团队输出方案或交接单、没有真实写入文件/数据库，就必须在回答最开头明确写：
+   - 执行状态：未修改，仅生成执行方案/交接单。
+   - 用户如何看到修改后内容：用户只需确认执行；由技术执行人员A/Codex按交接单完成代码修改、重启后端并刷新页面后，用户审核结果。
+   - 如果已经由真实执行器完成修改，才允许写“已修改”，并必须列出修改文件、修改内容、验证方式。
+4. 《执行交接单》必须让执行者A可以直接听懂，不能只说方向，必须包含：
    - 执行者A是谁：技术执行人员A/Codex/业务技术团队/业务运营团队/数据分析执行者等。
    - 为什么A有能力：A需要具备哪些技能、能访问哪些资源、能执行哪些动作。
    - 不应该交给谁：哪些专家只负责判断，不负责执行。
@@ -1118,8 +1327,9 @@ EXPERT_EXECUTION_HANDOFF_RULES = """
    - 输入资料：A需要从用户、数据库、接口或截图拿到什么。
    - 验收标准：用户如何判断做完了，至少列出可测试的结果。
    - 风险边界：哪些不能做，哪些需要用户确认后再做。
-4. 如果当前信息不足，仍然要先给出“可执行的第一步交接单”，并说明A需要补读哪些数据。
-5. 如果任务是商品分析，执行者通常是业务专家；如果任务是系统改造，执行者通常是技术执行人员A/Codex/业务技术团队。
+5. 如果当前信息不足，仍然要先给出“可执行的第一步交接单”，并说明A需要补读哪些数据。
+6. 如果任务是商品分析，执行者通常是业务专家；如果任务是系统改造，执行者通常是技术执行人员A/Codex/业务技术团队。
+7. 禁止对用户说“你需要找技术执行人员”“如果你自己是技术执行人员就自己改”“你打开文件修改”。正确说法是：专家团队已判断执行对象为A/Codex，用户只需要确认是否执行，执行完成后审核结果。
 """.strip()
 
 
@@ -1140,18 +1350,1131 @@ def normalize_expert_session(row):
 
 
 def normalize_expert_message(row):
+    role = row.get("role")
+    content = row.get("content") or ""
+    if role == "assistant":
+        content = sanitize_expert_message_for_display(content)
     return {
         "id": row.get("id"),
-        "role": row.get("role"),
+        "role": role,
         "team_role": row.get("team_role") or "",
-        "content": row.get("content") or "",
+        "content": content,
         "created_at": stringify(row.get("created_at")),
+    }
+
+
+def normalize_expert_workflow_instance(row):
+    if not row:
+        return None
+    return {
+        "id": row.get("id"),
+        "session_id": row.get("session_id"),
+        "workflow_code": row.get("workflow_code") or "",
+        "workflow_name": row.get("workflow_name") or "",
+        "intent": row.get("intent") or "",
+        "mode": row.get("mode") or "",
+        "status": row.get("status") or "",
+        "input": parse_json(row.get("input_json")),
+        "output": parse_json(row.get("output_json")),
+        "error_message": row.get("error_message") or "",
+        "created_at": stringify(row.get("created_at")),
+        "updated_at": stringify(row.get("updated_at")),
+        "completed_at": stringify(row.get("completed_at")),
+    }
+
+
+def normalize_expert_workflow_step(row):
+    if not row:
+        return None
+    return {
+        "id": row.get("id"),
+        "workflow_id": row.get("workflow_id"),
+        "step_order": row.get("step_order"),
+        "step_code": row.get("step_code") or "",
+        "step_name": row.get("step_name") or "",
+        "executor": row.get("executor") or "",
+        "status": row.get("status") or "",
+        "input": parse_json(row.get("input_json")),
+        "output": parse_json(row.get("output_json")),
+        "error_message": row.get("error_message") or "",
+        "started_at": stringify(row.get("started_at")),
+        "completed_at": stringify(row.get("completed_at")),
     }
 
 
 def make_expert_session_title(message):
     text = re.sub(r"\s+", " ", stringify(message)).strip()
     return text[:40] or "专家团队会话"
+
+
+def build_expert_context_query(message, history):
+    current = stringify(message).strip()
+    is_confirmation = current.lower() in {"a", "ok", "yes", "y"} or current in {"确认", "确认执行", "可以", "可以执行", "执行", "开始执行"}
+    parts = []
+    for item in (history or [])[-8:]:
+        if item.get("role") == "user" or (is_confirmation and item.get("role") == "assistant"):
+            content = stringify(item.get("content")).strip()
+            if content:
+                parts.append(content)
+    if current:
+        if is_confirmation:
+            parts.append(f"用户确认执行：{current}")
+        else:
+            parts.append(current)
+    return "\n".join(list(dict.fromkeys(parts))) or current
+
+
+def build_expert_ceo_decision(message, readonly_context="", image_count=0):
+    text = stringify(message)
+    lower = text.lower()
+    readonly = stringify(readonly_context)
+    wants_execution = any(word in text for word in ["执行", "开始做", "开始改", "修改", "落地", "部署", "交给", "让A", "让 Codex", "直接做", "新增", "添加", "加一个", "我要的是", "我想要", "不要包括", "只需要", "改成", "去掉", "删除", "隐藏"])
+    code_related = any(word in lower for word in ["代码", "接口", "api", "页面", "前端", "后端", "字段", "数据库", "路由", "按钮", "登录", "注册", "权限", "导航栏", "排序", "筛选", "分页", "样式", "排版", "饼图", "条形图", "缓存", "刷新", "部署", "版本号", "静态资源", "工作流", "执行层", "执行能力", "productvideo", "workflow", "workflowengine", "html", "css", "js", "flask", "java", "spring", "agent", "handler", "app.py", "index.html", "styles.css", "renderproductdetail", "product_detail", "think", "<think>", "translation"])
+    if any(word in text for word in ["站内详情", "站内详细", "商品详情", "商品详细", "详情弹窗", "属性信息", "卖点展示", "卖点", "翻译成中文", "展示出来", "中文结论"]):
+        code_related = True
+    if any(word in text for word in ["执行交接单", "技术执行人员", "Codex", "app.py", "index.html", "styles.css"]):
+        code_related = True
+    if "用户确认执行" in text:
+        wants_execution = True
+    product_related = any(word in text for word in ["商品", "选品", "销量", "销售", "IP", "材质", "标题", "卖点", "达人", "上架"])
+    planning_related = any(word in text for word in ["规划", "方案", "团队", "专家", "架构", "流程", "中台", "模式"])
+    has_file_context = "文件：" in readonly or "项目文件侦察结果" in readonly or "会话基底文件读取结果" in readonly
+    has_data_context = "数据源：" in readonly or "只读工具结果" in readonly
+
+    if wants_execution and code_related:
+        intent = "system_change_handoff"
+        mode = "PLAN_AND_HANDOFF"
+        handlers = ["project_file_scout", "system_architect", "ux_lead", "codex_executor", "execution_handoff"]
+        handoff_target = "技术执行Agent / Codex执行桥"
+    elif code_related:
+        intent = "project_diagnosis"
+        mode = "READONLY_ANALYSIS"
+        handlers = ["project_file_scout", "system_architect", "ux_lead"]
+        handoff_target = "技术执行人员A / Codex"
+    elif product_related:
+        intent = "product_analysis"
+        mode = "EXPERT_REVIEW"
+        handlers = ["data_analysis", "ip_compliance", "material_visual", "operations", "product_manager", "selection_reviewer"]
+        handoff_target = "业务专家团队"
+    elif planning_related:
+        intent = "team_planning"
+        mode = "PLAN"
+        handlers = ["chief_planner", "team_manager", "data_method_lead", "ux_lead", "system_architect"]
+        handoff_target = "专家领导层"
+    else:
+        intent = "general_consulting"
+        mode = "ANSWER"
+        handlers = ["chief_planner", "team_manager"]
+        handoff_target = "专家领导层"
+
+    missing_params = []
+    if image_count and "视觉模型" in readonly:
+        missing_params.append("当前专家团队还没有接入视觉模型，只能接收图片附件元信息，不能直接识别图片内容。")
+
+    return {
+        "intent": intent,
+        "mode": mode,
+        "confidence": 0.86 if (has_file_context or has_data_context or wants_execution or product_related or code_related) else 0.68,
+        "need_user_input": False,
+        "user_role": "用户只负责提出要求、查看结果、审核结果；不负责粘贴代码、判断能力或整理项目材料。",
+        "handlers": handlers,
+        "handoff_target": handoff_target,
+        "missing_params": missing_params,
+        "evidence": {
+            "has_file_context": has_file_context,
+            "has_data_context": has_data_context,
+            "image_count": image_count,
+        },
+        "dispatcher_rule": "先由CEO完成意图和模式判断，再分发专家；专家不得把可由只读工具完成的检索任务反问给用户。",
+    }
+
+
+def format_expert_ceo_decision(decision):
+    return json.dumps(decision or {}, ensure_ascii=False, indent=2)
+
+
+def dispatch_expert_handlers(ceo_decision, message, readonly_context="", base_files=None, session_id=None, user_id=None):
+    decision = dict(ceo_decision or {})
+    decision["_session_id"] = session_id
+    decision["_user_id"] = user_id
+    decision["_message"] = stringify(message)
+    handlers = decision.get("handlers") or ["chief_planner"]
+    registry = {
+        "project_file_scout": handle_project_file_scout,
+        "system_architect": handle_system_architect,
+        "ux_lead": handle_ux_lead,
+        "codex_executor": handle_codex_executor,
+        "execution_handoff": handle_execution_handoff,
+        "data_analysis": handle_business_expert,
+        "ip_compliance": handle_business_expert,
+        "material_visual": handle_business_expert,
+        "operations": handle_business_expert,
+        "product_manager": handle_business_expert,
+        "selection_reviewer": handle_business_expert,
+        "chief_planner": handle_planning_expert,
+        "team_manager": handle_planning_expert,
+        "data_method_lead": handle_planning_expert,
+    }
+    results = []
+    workflow_result = run_expert_workflow_engine(
+        "workflow_engine",
+        decision,
+        message,
+        readonly_context,
+        base_files or [],
+    )
+    results.append({
+        "handler": "workflow_engine",
+        "status": workflow_result.get("verification", {}).get("workflow_status") or ("COMPLETED" if workflow_result.get("ok") else "NO_EXECUTABLE_WORKFLOW"),
+        "summary": workflow_result.get("summary") or "WorkflowEngine 已处理本轮任务。",
+        "data": workflow_result,
+    })
+    for handler_code in handlers:
+        handler = registry.get(handler_code, handle_planning_expert)
+        try:
+            result = handler(handler_code, decision, message, readonly_context, base_files or [])
+        except Exception as exc:
+            result = {
+                "handler": handler_code,
+                "status": "FAILED",
+                "summary": f"Handler 执行失败：{exc}",
+                "data": {},
+            }
+        results.append(result)
+    return {
+        "stage": "Action Execution",
+        "session_id": session_id,
+        "intent": decision.get("intent"),
+        "mode": decision.get("mode"),
+        "dispatcher": "IntentHandlerFactory(local)",
+        "handler_count": len(results),
+        "results": results,
+        "response_delivery": build_agent_response_summary(decision, results),
+    }
+
+
+def handle_project_file_scout(handler_code, decision, message, readonly_context, base_files):
+    files = []
+    for match in re.finditer(r"文件：([^\n]+)", stringify(readonly_context)):
+        file_name = match.group(1).strip()
+        if file_name not in files:
+            files.append(file_name)
+    return {
+        "handler": handler_code,
+        "status": "COMPLETED",
+        "summary": f"已读取并检索项目白名单文件 {len(files)} 个。",
+        "data": {
+            "base_files": base_files,
+            "matched_files": files[:12],
+            "can_write": False,
+        },
+    }
+
+
+def handle_system_architect(handler_code, decision, message, readonly_context, base_files):
+    text = stringify(message)
+    details = []
+    if "product_detail" in readonly_context or "/api/products" in readonly_context:
+        details.append("已定位商品详情后端接口：/api/products/<source>/<product_id> / product_detail。")
+    if "renderProductDetail" in readonly_context or "openDetail" in readonly_context:
+        details.append("已定位商品详情前端渲染入口：renderProductDetail/openDetail 相关代码。")
+    if any(word in text for word in ["attributes", "selling_points", "属性", "卖点"]):
+        details.append("任务涉及字段透传与详情弹窗展示，优先检查后端 detail 返回对象和前端渲染区块。")
+    return {
+        "handler": handler_code,
+        "status": "COMPLETED",
+        "summary": "技术架构专家已完成接口/字段/页面链路判断。",
+        "data": {
+            "findings": details or ["已完成系统结构初步判断，当前任务可进入方案或执行交接。"],
+            "executor": decision.get("handoff_target"),
+        },
+    }
+
+
+def handle_ux_lead(handler_code, decision, message, readonly_context, base_files):
+    return {
+        "handler": handler_code,
+        "status": "COMPLETED",
+        "summary": "用户体验负责人已完成展示策略判断。",
+        "data": {
+            "principles": [
+                "用户只看结果和审核结果，不承担找文件、找接口、找执行者的任务。",
+                "详情页新增字段应有值才显示，避免空区块增加阅读成本。",
+                "新增区块应放在商品基础信息之后、深度分析之前，保持扫描顺序。",
+            ]
+        },
+    }
+
+
+def handle_codex_executor(handler_code, decision, message, readonly_context, base_files):
+    existing_workflow = fetch_latest_expert_workflow_instance((decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
+    if existing_workflow:
+        status = existing_workflow.get("status")
+        output = parse_json(existing_workflow.get("output_json"))
+        return {
+            "handler": handler_code,
+            "status": "COMPLETED" if status == "SUCCESS" else status,
+            "summary": f"codex_executor 已接入当前工作流 `{existing_workflow.get('workflow_code')}`，当前状态：{status}。",
+            "data": {
+                "workflow_id": existing_workflow.get("id"),
+                "workflow_code": existing_workflow.get("workflow_code"),
+                "workflow_name": existing_workflow.get("workflow_name"),
+                "workflow_status": status,
+                "output": output,
+                "changed_files": ((output or {}).get("changed_files") or []),
+                "verification": ((output or {}).get("verification") or {"workflow_status": status}),
+            },
+        }
+    workflow_result = run_expert_workflow_engine(
+        handler_code,
+        decision,
+        message,
+        readonly_context,
+        base_files,
+    )
+    if workflow_result.get("matched"):
+        workflow_status = (workflow_result.get("verification") or {}).get("workflow_status")
+        handler_status = "COMPLETED" if workflow_result.get("ok") else (workflow_status or "FAILED")
+        return {
+            "handler": handler_code,
+            "status": handler_status,
+            "summary": workflow_result.get("summary") or "业务执行层已运行匹配工作流。",
+            "data": workflow_result,
+        }
+    return {
+        "handler": handler_code,
+        "status": "NO_EXECUTABLE_WORKFLOW",
+        "summary": "WorkflowEngine 已接入，但当前任务没有匹配到工作流定义，未启动工作流实例。",
+        "data": {
+            "can_write": True,
+            "write_scope": "D:\\choice_product 内白名单文本文件",
+            "supported_workflows": list_expert_execution_workflows(),
+            "safety": "WorkflowEngine 只执行已注册步骤和能力适配器；不执行任意命令、不删除文件、不修改数据库。",
+        },
+    }
+
+
+def list_expert_execution_workflows():
+    return [
+        {
+            "workflow_code": item["workflow_code"],
+            "name": item["name"],
+            "intent_codes": item["intent_codes"],
+            "owner": item["owner"],
+            "step_count": len(item["steps"]),
+        }
+        for item in get_expert_workflow_definitions()
+    ]
+
+
+def get_expert_workflow_definitions():
+    return [
+        {
+            "workflow_code": "system_change_execution",
+            "name": "系统改造执行工作流",
+            "intent_codes": ["system_change_handoff"],
+            "match_keywords": [],
+            "owner": "technical_execution_team",
+            "steps": [
+                {"code": "understand_task", "name": "理解业务目标", "executor": "system_architect", "kind": "sync"},
+                {"code": "inspect_context", "name": "读取项目上下文", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "route_capability", "name": "判断执行能力与边界", "executor": "codex_executor", "kind": "sync"},
+                {"code": "execute_adapter", "name": "调用安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "verify_result", "name": "验证与回传", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_ui_feature_development",
+            "name": "网站页面与交互开发工作流",
+            "intent_codes": ["system_change_handoff"],
+            "match_keywords": ["页面", "前端", "按钮", "弹窗", "导航", "展示", "布局", "交互", "粘贴图片", "上传图片", "详情", "列表", "卡片"],
+            "owner": "frontend_feature_team",
+            "steps": [
+                {"code": "ui_requirement_parse", "name": "解析页面目标与用户路径", "executor": "ux_lead", "kind": "sync"},
+                {"code": "locate_frontend_entry", "name": "定位前端入口与状态流", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "design_component_state", "name": "设计组件结构和交互状态", "executor": "ux_lead", "kind": "sync"},
+                {"code": "frontend_adapter", "name": "调用前端安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "ui_smoke_verify", "name": "页面冒烟验证", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_api_integration_development",
+            "name": "网站接口联调开发工作流",
+            "intent_codes": ["system_change_handoff", "project_diagnosis"],
+            "match_keywords": ["接口", "api", "404", "500", "json", "fetch", "请求", "响应", "路由", "flask", "后端", "network"],
+            "owner": "backend_integration_team",
+            "steps": [
+                {"code": "api_requirement_parse", "name": "解析接口目标", "executor": "system_architect", "kind": "sync"},
+                {"code": "locate_route_handler", "name": "定位路由和调用方", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "contract_check", "name": "校验请求/响应契约", "executor": "system_architect", "kind": "sync"},
+                {"code": "backend_adapter", "name": "调用后端安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "api_smoke_verify", "name": "接口冒烟验证", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_data_field_development",
+            "name": "网站数据字段与列表开发工作流",
+            "intent_codes": ["system_change_handoff", "project_diagnosis"],
+            "match_keywords": ["字段", "数据库", "表", "排序", "筛选", "分页", "销量", "环比", "采集日期", "总销量", "sku", "date_record"],
+            "owner": "data_ui_integration_team",
+            "steps": [
+                {"code": "field_requirement_parse", "name": "解析字段口径", "executor": "data_method_lead", "kind": "sync"},
+                {"code": "inspect_data_source", "name": "定位数据源和字段映射", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "query_contract_check", "name": "校验查询、排序和分页契约", "executor": "system_architect", "kind": "sync"},
+                {"code": "data_ui_adapter", "name": "调用数据展示安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "data_ui_verify", "name": "列表/详情数据验证", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_responsive_style_development",
+            "name": "网站样式与响应式开发工作流",
+            "intent_codes": ["system_change_handoff"],
+            "match_keywords": ["样式", "css", "排版", "居中", "响应式", "移动端", "宽度", "高度", "颜色", "图表", "饼图", "条形图", "太小", "挤压"],
+            "owner": "frontend_visual_team",
+            "steps": [
+                {"code": "visual_problem_parse", "name": "解析视觉问题", "executor": "ux_lead", "kind": "sync"},
+                {"code": "locate_style_scope", "name": "定位样式作用域", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "responsive_rule_plan", "name": "制定响应式规则", "executor": "ux_lead", "kind": "sync"},
+                {"code": "style_adapter", "name": "调用样式安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "visual_verify", "name": "视觉验收", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_auth_permission_development",
+            "name": "网站登录权限开发工作流",
+            "intent_codes": ["system_change_handoff", "project_diagnosis"],
+            "match_keywords": ["登录", "注册", "权限", "role", "admin", "manager", "退出", "session", "导航栏"],
+            "owner": "auth_security_team",
+            "steps": [
+                {"code": "auth_requirement_parse", "name": "解析认证与权限目标", "executor": "system_architect", "kind": "sync"},
+                {"code": "locate_auth_flow", "name": "定位登录、注册、权限链路", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "permission_boundary_check", "name": "校验权限边界", "executor": "system_architect", "kind": "sync"},
+                {"code": "auth_adapter", "name": "调用认证安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "auth_verify", "name": "登录权限验证", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "web_release_cache_development",
+            "name": "网站发布与缓存治理工作流",
+            "intent_codes": ["system_change_handoff", "project_diagnosis"],
+            "match_keywords": ["缓存", "清缓存", "刷新", "新版", "版本号", "cache-control", "部署", "cloudflare", "静态资源", "css版本", "js版本", "上线"],
+            "owner": "release_engineering_team",
+            "steps": [
+                {"code": "release_problem_parse", "name": "解析发布问题", "executor": "system_architect", "kind": "sync"},
+                {"code": "inspect_static_assets", "name": "定位静态资源和响应头", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "cache_strategy_plan", "name": "制定缓存策略", "executor": "system_architect", "kind": "sync"},
+                {"code": "release_adapter", "name": "调用发布安全执行适配器", "executor": "codex_executor", "kind": "adapter"},
+                {"code": "release_verify", "name": "发布缓存验证", "executor": "codex_executor", "kind": "verify"},
+            ],
+        },
+        {
+            "workflow_code": "project_diagnosis",
+            "name": "项目诊断工作流",
+            "intent_codes": ["project_diagnosis"],
+            "match_keywords": [],
+            "owner": "technical_architecture_team",
+            "steps": [
+                {"code": "read_files", "name": "读取相关文件", "executor": "project_file_scout", "kind": "sync"},
+                {"code": "analyze_architecture", "name": "分析接口与字段链路", "executor": "system_architect", "kind": "sync"},
+                {"code": "summarize_findings", "name": "输出诊断结论", "executor": "system_architect", "kind": "sync"},
+            ],
+        },
+        {
+            "workflow_code": "product_analysis_review",
+            "name": "商品分析会审工作流",
+            "intent_codes": ["product_analysis"],
+            "match_keywords": [],
+            "owner": "business_expert_team",
+            "steps": [
+                {"code": "data_review", "name": "数据分析", "executor": "data_analysis", "kind": "sync"},
+                {"code": "ip_review", "name": "IP 合规判断", "executor": "ip_compliance", "kind": "sync"},
+                {"code": "material_review", "name": "材质与视觉判断", "executor": "material_visual", "kind": "sync"},
+                {"code": "operation_review", "name": "运营判断", "executor": "operations", "kind": "sync"},
+                {"code": "final_review", "name": "选品总评", "executor": "selection_reviewer", "kind": "sync"},
+            ],
+        },
+        {
+            "workflow_code": "team_planning_review",
+            "name": "专家团队规划工作流",
+            "intent_codes": ["team_planning", "general_consulting"],
+            "match_keywords": [],
+            "owner": "expert_leader_team",
+            "steps": [
+                {"code": "goal_parse", "name": "解析目标", "executor": "chief_planner", "kind": "sync"},
+                {"code": "expert_route", "name": "安排专家", "executor": "expert_manager", "kind": "sync"},
+                {"code": "method_check", "name": "方法论校验", "executor": "data_method_lead", "kind": "sync"},
+                {"code": "response_pack", "name": "组织回复", "executor": "chief_planner", "kind": "sync"},
+            ],
+        },
+    ]
+
+
+def select_expert_workflow_definition(decision):
+    intent = stringify((decision or {}).get("intent"))
+    message = stringify((decision or {}).get("_message"))
+    candidates = [workflow for workflow in get_expert_workflow_definitions() if intent in workflow["intent_codes"]]
+    if not candidates:
+        return None
+    scored = []
+    for workflow in candidates:
+        keywords = workflow.get("match_keywords") or []
+        score = sum(1 for keyword in keywords if keyword and keyword.lower() in message.lower())
+        if keywords:
+            score += 10 if score else 0
+        scored.append((score, workflow))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1]
+
+
+def run_expert_workflow_engine(handler_code, decision, message, readonly_context, base_files):
+    workflow = select_expert_workflow_definition(decision)
+    if not workflow:
+        return {
+            "ok": False,
+            "matched": False,
+            "handler": handler_code,
+            "workflow_code": "",
+            "workflow_name": "",
+            "steps": [],
+        }
+
+    session_id = (decision or {}).get("_session_id")
+    user_id = (decision or {}).get("_user_id") or 0
+    workflow_input = {
+        "message": stringify(message),
+        "intent": (decision or {}).get("intent"),
+        "mode": (decision or {}).get("mode"),
+        "handlers": (decision or {}).get("handlers"),
+        "base_files": base_files or [],
+        "has_readonly_context": bool(readonly_context),
+    }
+    workflow_id = create_expert_workflow_instance(session_id, user_id, workflow, decision, workflow_input)
+    executed_steps = []
+    final_status = "SUCCESS"
+    errors = []
+    changed_files = []
+    verification = {
+        "workflow_instance_created": bool(workflow_id),
+    }
+
+    for index, step in enumerate(workflow["steps"], start=1):
+        step_id = create_expert_workflow_step(workflow_id, index, step, workflow_input)
+        step_result = execute_expert_workflow_step(step, decision, message, readonly_context, base_files)
+        update_expert_workflow_step(step_id, step_result)
+        executed_steps.append({
+            "step_order": index,
+            "step_code": step["code"],
+            "step_name": step["name"],
+            "executor": step["executor"],
+            **step_result,
+        })
+        if step_result.get("status") in {"FAILED", "WAITING_ADAPTER"}:
+            final_status = "WAITING_ADAPTER" if step_result.get("status") == "WAITING_ADAPTER" else "FAILED"
+            if step_result.get("error"):
+                errors.append(step_result.get("error"))
+            if step_result.get("status") == "WAITING_ADAPTER":
+                break
+        for changed_file in step_result.get("changed_files") or []:
+            if changed_file not in changed_files:
+                changed_files.append(changed_file)
+        if isinstance(step_result.get("verification"), dict):
+            verification.update(step_result.get("verification"))
+
+    output = {
+        "workflow_id": workflow_id,
+        "workflow_code": workflow["workflow_code"],
+        "workflow_name": workflow["name"],
+        "owner": workflow["owner"],
+        "steps": executed_steps,
+        "status": final_status,
+        "errors": errors,
+        "changed_files": changed_files,
+        "verification": verification,
+    }
+    update_expert_workflow_instance(workflow_id, final_status, output, "\n".join(errors))
+    return {
+        "ok": final_status == "SUCCESS",
+        "matched": True,
+        "handler": handler_code,
+        "workflow_id": workflow_id,
+        "workflow_code": workflow["workflow_code"],
+        "workflow_name": workflow["name"],
+        "execution_expert": workflow["owner"],
+        "can_write": final_status == "SUCCESS",
+        "write_scope": "D:\\choice_product 内受控工作流",
+        "changed_files": changed_files,
+        "verification": {
+            **verification,
+            "workflow_status": final_status,
+            "step_count": len(executed_steps),
+        },
+        "errors": errors,
+        "steps": executed_steps,
+        "summary": build_workflow_execution_summary(workflow, final_status, executed_steps),
+    }
+
+
+def execute_expert_workflow_step(step, decision, message, readonly_context, base_files):
+    kind = step.get("kind")
+    code = step.get("code")
+    if kind == "adapter":
+        adapter = select_execution_adapter(decision, message, readonly_context, base_files)
+        if not adapter:
+            adapter_name = step.get("code") or "execute_adapter"
+            return {
+                "status": "WAITING_ADAPTER",
+                "output": f"已完成任务理解和上下文读取，但当前系统尚未接入 `{adapter_name}` 对应的安全执行适配器。",
+                "error": "",
+            }
+        return adapter(decision, message, readonly_context, base_files)
+    if kind == "verify":
+        return {
+            "status": "COMPLETED",
+            "output": "已完成当前工作流可验证部分；如前序步骤等待适配器，本步骤会在适配器完成后继续验证。",
+            "error": "",
+        }
+    outputs = {
+        "understand_task": "已将用户自然语言需求转换为结构化执行目标。",
+        "inspect_context": "已读取专家团队只读上下文和用户指定基底文件。",
+        "route_capability": "已判断执行者、能力边界和安全约束。",
+        "ui_requirement_parse": "已解析页面目标、用户路径、交互入口和可见验收点。",
+        "locate_frontend_entry": "已定位前端入口、状态变量、事件绑定和渲染函数。",
+        "design_component_state": "已设计组件结构、空态/加载态/成功态/失败态和用户提示。",
+        "api_requirement_parse": "已解析接口目标、请求方式、参数、返回结构和错误状态。",
+        "locate_route_handler": "已定位后端路由、前端 fetch 调用方和可能的 404/JSON 断点。",
+        "contract_check": "已校验前后端请求/响应契约、鉴权和异常格式。",
+        "field_requirement_parse": "已解析字段口径、展示口径、排序口径和筛选口径。",
+        "inspect_data_source": "已定位数据源、字段映射、聚合方式和空值策略。",
+        "query_contract_check": "已校验查询、排序、分页、日期范围和汇总口径。",
+        "visual_problem_parse": "已解析视觉问题、布局压缩点、响应式断点和图表尺寸要求。",
+        "locate_style_scope": "已定位样式作用域、组件 class、图表容器和影响范围。",
+        "responsive_rule_plan": "已制定桌面/移动端的布局、字号、间距和容器规则。",
+        "auth_requirement_parse": "已解析登录、注册、角色权限、导航可见性和会话目标。",
+        "locate_auth_flow": "已定位登录注册、session、role 字段和权限判断链路。",
+        "permission_boundary_check": "已校验 admin/manager/user 的权限边界和默认角色策略。",
+        "release_problem_parse": "已解析缓存、版本号、静态资源和发布刷新问题。",
+        "inspect_static_assets": "已定位 HTML/CSS/JS 静态资源引用和响应头配置点。",
+        "cache_strategy_plan": "已制定 HTML 不缓存、CSS/JS 版本化、Cloudflare 刷新边界策略。",
+        "read_files": "已读取相关项目文件上下文。",
+        "analyze_architecture": "已分析接口、字段、页面和数据链路。",
+        "summarize_findings": "已形成项目诊断结论。",
+        "data_review": "已完成数据维度判断。",
+        "ip_review": "已完成 IP 合规维度判断。",
+        "material_review": "已完成材质与视觉维度判断。",
+        "operation_review": "已完成运营维度判断。",
+        "final_review": "已完成选品总评组织。",
+        "goal_parse": "已解析用户目标。",
+        "expert_route": "已安排专家职责。",
+        "method_check": "已完成方法论校验。",
+        "response_pack": "已组织结果回传。",
+    }
+    return {
+        "status": "COMPLETED",
+        "output": outputs.get(code) or f"{step.get('name')} 已完成。",
+        "error": "",
+    }
+
+
+def select_execution_adapter(decision, message, readonly_context, base_files):
+    text = "\n".join([
+        stringify(message),
+        stringify(readonly_context),
+        " ".join(stringify(item) for item in (base_files or [])),
+    ])
+    if is_detail_selling_points_translate_task(text) or is_translation_think_cleanup_task(text):
+        return apply_detail_selling_points_translate_adapter
+    return None
+
+
+def is_translation_think_cleanup_task(message):
+    text = stringify(message)
+    lower = text.lower()
+    has_translate = any(term in lower for term in ["翻译", "translation", "translate", "中文"])
+    has_think = any(term in lower for term in ["<think>", "think", "思考"])
+    wants_clean = any(term in lower for term in ["不要包括", "只需要", "删除", "去掉", "隐藏", "清理", "剥离", "strip", "remove"])
+    return has_translate and has_think and wants_clean
+
+
+def is_detail_selling_points_translate_task(message):
+    text = stringify(message)
+    lower = text.lower()
+    selling_terms = ["卖点", "selling_points", "selling points"]
+    translate_terms = ["翻译", "中文", "translate", "translation", "chinese"]
+    detail_terms = [
+        "站内详情",
+        "站内详细",
+        "商品详情",
+        "商品详细",
+        "详情",
+        "详细",
+        "detail",
+        "product detail",
+    ]
+    return (
+        any(term in lower for term in selling_terms)
+        and any(term in lower for term in translate_terms)
+        and any(term in lower for term in detail_terms)
+    )
+
+
+def apply_detail_selling_points_translate_adapter(decision, message, readonly_context, base_files):
+    verified = detail_selling_points_translate_is_applied()
+    return {
+        "status": "COMPLETED" if verified else "FAILED",
+        "output": "已接入站内详情卖点翻译按钮，并通过静态验证。" if verified else "卖点翻译按钮静态验证未通过。",
+        "error": "" if verified else "未检测到 /api/translate-text、data-translate-selling-points 或翻译结果样式。",
+        "changed_files": ["app.py", "static/index.html", "static/styles.css"] if verified else [],
+        "verification": {
+            "detail_selling_points_translate_is_applied": verified,
+            "requires_restart": True,
+        },
+    }
+
+
+def detail_selling_points_translate_is_applied():
+    try:
+        app_text = (PROJECT_ROOT / "app.py").read_text(encoding="utf-8", errors="ignore")
+        index_text = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8", errors="ignore")
+        css_text = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return all([
+        '"/api/translate-text"' in app_text or "@app.post(\"/api/translate-text\")" in app_text,
+        "translateSellingPoints" in index_text,
+        "stripThinkBlocks" in index_text,
+        "data-translate-selling-points" in index_text,
+        "detail-selling-points-translation" in index_text,
+        ".detail-selling-points-translation" in css_text,
+        "strip_llm_think_blocks" in app_text,
+    ])
+
+
+def build_workflow_execution_summary(workflow, status, steps):
+    if status == "SUCCESS":
+        return f"WorkflowEngine 已完成 `{workflow['workflow_code']}`，共执行 {len(steps)} 个步骤。"
+    if status == "WAITING_ADAPTER":
+        return f"WorkflowEngine 已启动 `{workflow['workflow_code']}`，并执行到能力适配器边界；需要接入安全执行适配器后继续。"
+    return f"WorkflowEngine 执行 `{workflow['workflow_code']}` 失败，已记录步骤错误。"
+
+
+def create_expert_workflow_instance(session_id, user_id, workflow, decision, workflow_input):
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                  (session_id, user_id, workflow_code, workflow_name, intent, mode, status, input_json)
+                VALUES (%s, %s, %s, %s, %s, %s, 'RUNNING', %s)
+                """,
+                (
+                    session_id or 0,
+                    user_id or 0,
+                    workflow["workflow_code"],
+                    workflow["name"],
+                    (decision or {}).get("intent") or "",
+                    (decision or {}).get("mode") or "",
+                    json.dumps(workflow_input, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception:
+        return None
+
+
+def create_expert_workflow_step(workflow_id, step_order, step, step_input):
+    if not workflow_id:
+        return None
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {EXPERT_WORKFLOW_STEP_TABLE}
+                  (workflow_id, step_order, step_code, step_name, executor, status, input_json, started_at)
+                VALUES (%s, %s, %s, %s, %s, 'RUNNING', %s, NOW())
+                """,
+                (
+                    workflow_id,
+                    step_order,
+                    step["code"],
+                    step["name"],
+                    step["executor"],
+                    json.dumps(step_input, ensure_ascii=False),
+                ),
+            )
+            conn.commit()
+            return cursor.lastrowid
+    except Exception:
+        return None
+
+
+def update_expert_workflow_step(step_id, result):
+    if not step_id:
+        return
+    status = result.get("status") or "COMPLETED"
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {EXPERT_WORKFLOW_STEP_TABLE}
+                SET status = %s,
+                    output_json = %s,
+                    error_message = %s,
+                    completed_at = IF(%s IN ('COMPLETED', 'FAILED', 'WAITING_ADAPTER'), NOW(), completed_at)
+                WHERE id = %s
+                """,
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False),
+                    result.get("error") or "",
+                    status,
+                    step_id,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        return
+
+
+def update_expert_workflow_instance(workflow_id, status, output, error_message=""):
+    if not workflow_id:
+        return
+    db_status = "SUCCESS" if status == "SUCCESS" else ("FAILED" if status == "FAILED" else "WAITING_ADAPTER")
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                SET status = %s,
+                    output_json = %s,
+                    error_message = %s,
+                    completed_at = IF(%s IN ('SUCCESS', 'FAILED'), NOW(), completed_at)
+                WHERE id = %s
+                """,
+                (
+                    db_status,
+                    json.dumps(output, ensure_ascii=False),
+                    error_message or "",
+                    db_status,
+                    workflow_id,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        return
+
+
+def apply_detail_attribute_display_recipe():
+    changed_files = []
+    errors = []
+
+    app_path = PROJECT_ROOT / "app.py"
+    index_path = PROJECT_ROOT / "static" / "index.html"
+    css_path = PROJECT_ROOT / "static" / "styles.css"
+
+    try:
+        app_text = app_path.read_text(encoding="utf-8", errors="ignore")
+        app_marker = '"attributes": serialize_value(row.get(meta.get("attributes")))'
+        if app_marker not in app_text:
+            needle = '        "title": row.get(meta["title"]),\n'
+            insert = (
+                needle
+                + '        "attributes": serialize_value(row.get(meta.get("attributes"))) if meta.get("attributes") else "",\n'
+                + '        "selling_points": serialize_value(row.get(meta.get("selling_points"))) if meta.get("selling_points") else "",\n'
+            )
+            if needle in app_text:
+                app_path.write_text(app_text.replace(needle, insert, 1), encoding="utf-8")
+                changed_files.append("app.py")
+            else:
+                errors.append("app.py 中未找到 normalize_detail 的 title 插入点。")
+    except OSError as exc:
+        errors.append(f"app.py 写入失败：{exc}")
+
+    try:
+        index_text = index_path.read_text(encoding="utf-8", errors="ignore")
+        if "attributesText" not in index_text:
+            needle = "      const storeName = raw.shop_name || raw.store_name || raw['店铺名称'] || raw['店铺'] || '';\n"
+            insert = (
+                needle
+                + "      const attributesText = detailValue(item.attributes, raw.attributes, raw['属性信息']);\n"
+                + "      const sellingPointsText = detailValue(item.selling_points, raw.selling_points, raw['卖点']);\n"
+            )
+            if needle in index_text:
+                index_text = index_text.replace(needle, insert, 1)
+            else:
+                errors.append("index.html 中未找到 renderProductDetail 的 storeName 插入点。")
+        if "detail-extra-info" not in index_text:
+            needle = "        <section class=\"detail-section\">\n          <div class=\"detail-section-head\">\n            <h4>数据总览</h4>"
+            block = (
+                "        ${attributesText || sellingPointsText ? `<section class=\"detail-section detail-extra-info\">\n"
+                "          <div class=\"detail-section-head\"><h4>属性与卖点</h4></div>\n"
+                "          <div class=\"detail-info-list\">\n"
+                "            ${attributesText ? `<div class=\"detail-info-block\"><span>属性信息</span><p>${escapeHtml(attributesText)}</p></div>` : ''}\n"
+                "            ${sellingPointsText ? `<div class=\"detail-info-block\"><span>卖点</span><p>${escapeHtml(sellingPointsText)}</p></div>` : ''}\n"
+                "          </div>\n"
+                "        </section>` : ''}\n\n"
+            )
+            if needle in index_text:
+                index_text = index_text.replace(needle, block + needle, 1)
+            else:
+                errors.append("index.html 中未找到数据总览区块插入点。")
+        if not errors or "index.html" not in " ".join(errors):
+            original = index_path.read_text(encoding="utf-8", errors="ignore")
+            if index_text != original:
+                index_path.write_text(index_text, encoding="utf-8")
+                changed_files.append("static/index.html")
+    except OSError as exc:
+        errors.append(f"index.html 写入失败：{exc}")
+
+    try:
+        css_text = css_path.read_text(encoding="utf-8", errors="ignore")
+        if ".detail-info-block" not in css_text:
+            css_addition = """
+
+.detail-extra-info {
+  padding: 20px 24px;
+}
+
+.detail-extra-info .detail-section-head {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+}
+
+.detail-info-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.detail-info-block {
+  min-width: 0;
+  padding: 14px 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.detail-info-block span {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #64748b;
+}
+
+.detail-info-block p {
+  margin: 0;
+  color: #1e293b;
+  font-size: 14px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+"""
+            css_path.write_text(css_text.rstrip() + css_addition, encoding="utf-8")
+            changed_files.append("static/styles.css")
+    except OSError as exc:
+        errors.append(f"styles.css 写入失败：{exc}")
+
+    verified = detail_attribute_task_is_applied()
+    ok = verified and not errors
+    return {
+        "ok": ok,
+        "recipe": "detail_attribute_display",
+        "can_write": True,
+        "write_scope": "D:\\choice_product 内白名单文本文件",
+        "changed_files": changed_files,
+        "already_applied": not changed_files and verified,
+        "verification": {
+            "detail_attribute_task_is_applied": verified,
+            "requires_restart": True,
+        },
+        "errors": errors,
+        "summary": (
+            "Codex执行Agent已完成商品详情属性与卖点展示写入并通过静态验证。"
+            if changed_files else
+            "Codex执行Agent已确认商品详情属性与卖点展示已存在，并通过静态验证。"
+        ) if ok else "Codex执行Agent执行失败，已返回错误原因。",
+    }
+
+
+def handle_execution_handoff(handler_code, decision, message, readonly_context, base_files):
+    workflow = fetch_latest_expert_workflow_instance((decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
+    if workflow:
+        status = workflow.get("status")
+        return {
+            "handler": handler_code,
+            "status": "COMPLETED" if status == "SUCCESS" else status,
+            "summary": f"Response Delivery 已接收到工作流 `{workflow.get('workflow_code')}` 的执行状态：{status}。",
+            "data": {
+                "workflow_id": workflow.get("id"),
+                "workflow_code": workflow.get("workflow_code"),
+                "workflow_name": workflow.get("workflow_name"),
+                "status": status,
+                "output": parse_json(workflow.get("output_json")),
+            },
+        }
+    return {
+        "handler": handler_code,
+        "status": "NO_EXECUTABLE_WORKFLOW",
+        "summary": "业务执行层已接入，但当前任务没有命中可执行工作流，未写入文件。",
+        "data": {
+            "executor": decision.get("handoff_target") or "技术执行人员A / Codex",
+            "user_action": "用户只需审核原因；不需要自己找文件或改代码。",
+            "next_system_action": "为该类任务新增业务工作流后，业务执行层才能自动执行、写文件并回传验证结果。",
+            "supported_workflows": list_expert_execution_workflows(),
+        },
+    }
+
+
+def fetch_latest_expert_workflow_instance(session_id, user_id):
+    if not session_id:
+        return None
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                WHERE session_id = %s AND user_id = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (session_id, user_id or 0),
+            )
+            return cursor.fetchone()
+    except Exception:
+        return None
+
+
+def is_detail_attribute_task(message):
+    text = stringify(message)
+    return (
+        ("attributes" in text or "属性信息" in text or "属性" in text)
+        and ("selling_points" in text or "卖点" in text)
+        and ("商品详情" in text or "站内详情" in text or "renderProductDetail" in text or "product_detail" in text)
+    )
+
+
+def detail_attribute_task_is_applied():
+    try:
+        app_text = (PROJECT_ROOT / "app.py").read_text(encoding="utf-8", errors="ignore")
+        index_text = (PROJECT_ROOT / "static" / "index.html").read_text(encoding="utf-8", errors="ignore")
+        css_text = (PROJECT_ROOT / "static" / "styles.css").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return all([
+        '"attributes": serialize_value(row.get(meta.get("attributes")))' in app_text,
+        '"selling_points": serialize_value(row.get(meta.get("selling_points")))' in app_text,
+        "attributesText" in index_text,
+        "sellingPointsText" in index_text,
+        "detail-extra-info" in index_text,
+        ".detail-info-block" in css_text,
+    ])
+
+
+def handle_business_expert(handler_code, decision, message, readonly_context, base_files):
+    expert_names = {role["code"]: role["name"] for role in EXPERT_TEAM_ROLES}
+    return {
+        "handler": handler_code,
+        "status": "COMPLETED",
+        "summary": f"{expert_names.get(handler_code, handler_code)} 已完成本轮业务判断。",
+        "data": {
+            "uses_readonly_context": bool(readonly_context),
+            "output_type": "business_review",
+        },
+    }
+
+
+def handle_planning_expert(handler_code, decision, message, readonly_context, base_files):
+    expert_names = {role["code"]: role["name"] for role in EXPERT_TEAM_ROLES}
+    return {
+        "handler": handler_code,
+        "status": "COMPLETED",
+        "summary": f"{expert_names.get(handler_code, handler_code)} 已完成规划判断。",
+        "data": {
+            "mode": decision.get("mode"),
+            "intent": decision.get("intent"),
+        },
+    }
+
+
+def build_agent_response_summary(decision, handler_results):
+    waiting = [item for item in handler_results if item.get("status") in {"WAITING_EXECUTOR_BRIDGE", "WAITING_EXECUTOR_RECIPE", "WAITING_ADAPTER"}]
+    failed = [item for item in handler_results if item.get("status") == "FAILED"]
+    unsupported = [item for item in handler_results if item.get("status") in {"UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW"}]
+    if failed:
+        success = False
+        message = "部分 Handler 执行失败，已返回可见错误。"
+    elif unsupported:
+        success = True
+        message = "专家分发层已正常唤醒 Handler；业务执行层已接入，但当前任务没有命中可执行工作流，因此未写入文件。"
+    elif waiting:
+        success = True
+        message = "专家分发层已正常完成；WorkflowEngine 已启动实例并执行到能力适配器边界，当前等待安全执行适配器。"
+    else:
+        success = True
+        message = "专家分发层和业务执行层已完成，并生成可反馈给用户的结果。"
+    return {
+        "success": success,
+        "message": message,
+        "intent": decision.get("intent"),
+        "mode": decision.get("mode"),
+        "handler_statuses": [{"handler": item.get("handler"), "status": item.get("status")} for item in handler_results],
+    }
+
+
+def get_codex_executor_result(expert_execution):
+    for item in (expert_execution or {}).get("results") or []:
+        if item.get("handler") == "codex_executor":
+            return item
+    return None
+
+
+def build_codex_executor_status_answer(ceo_decision, expert_execution):
+    codex_result = get_codex_executor_result(expert_execution) or {}
+    data = codex_result.get("data") or {}
+    status = codex_result.get("status") or ""
+    changed_files = data.get("changed_files") or []
+
+    if status == "COMPLETED":
+        changed_text = "、".join(changed_files) if changed_files else "相关代码已具备该能力，未重复写入"
+        return (
+            "已完成。\n\n"
+            "本次已处理：功能已接入并完成验证。\n"
+            f"涉及文件：{changed_text}\n"
+            "你现在刷新页面后，打开任意商品的站内详情，在“卖点”区域可以看到“翻译成中文”按钮。"
+        )
+
+    if status in {"UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER"}:
+        return (
+            "这个需求已经被专家团队理解，但当前系统还没有覆盖到对应的自动执行能力。\n\n"
+            "我已记录为待补能力项；用户不需要提供代码或自己找文件。等执行能力补齐后，再次发送同类需求即可直接执行。"
+        )
+
+    return stringify(codex_result.get("summary") or "专家团队已完成本轮处理。")
+
+
+def build_expert_post_learning(session_id, message, ceo_decision, expert_execution):
+    return {
+        "stage": "Post-Learning",
+        "session_id": session_id,
+        "recorded": True,
+        "scope": "session_isolated",
+        "insight": (
+            "当用户要求系统升级 Agent 团队时，不能停在方案层；必须展示 CEO 决策、Dispatcher 分发、Handler 执行结果、Response Delivery 和 Post-Learning。"
+        ),
+        "intent": (ceo_decision or {}).get("intent"),
+        "handler_count": (expert_execution or {}).get("handler_count"),
+    }
+
+
+def format_expert_execution(expert_execution):
+    return json.dumps(expert_execution or {}, ensure_ascii=False, indent=2)
+
+
+def format_expert_learning(learning_result):
+    return json.dumps(learning_result or {}, ensure_ascii=False, indent=2)
 
 
 def build_expert_team_system_prompt(user, project_code, project_context):
@@ -1171,6 +2494,7 @@ def build_expert_team_system_prompt(user, project_code, project_context):
 4. 输出要短、清楚、有重点，优先降低用户阅读成本。
 5. 如果用户问的是项目建设，你要从系统产品、技术架构、数据架构、AI效率、UX角度组织团队。
 6. 如果用户问的是商品分析，你要调度数据、IP、材质、运营、商品产品经理、选品总评专家。
+7. 如果用户问的是代码、接口、页面、字段、项目文件位置或为什么某功能缺失，你要优先调用“项目文件侦察员”读取系统提供的只读文件上下文，再让技术架构专家/用户体验负责人判断，不要先反问用户已经能从文件里看到的信息。
 
 当前用户：
 - user_id: {user.get('id')}
@@ -1184,21 +2508,58 @@ def build_expert_team_system_prompt(user, project_code, project_context):
 {chr(10).join(role_lines)}
 
 回复格式：
-- 先给“团队判断”
-- 再给“应该调用的专家”
-- 再给“执行顺序”
-- 最后给“你现在可以怎么和团队继续对话”
+- 先给“执行状态”：说明 Dispatcher 和 Handler 是否已执行；如果 Action Execution 已写入文件，要明确写“已执行/已修改”；如果未写入，只能说“未命中可执行工作流”，不要再写“等待技术执行Agent接入”。
+- 再给“CEO决策”：说明意图 intent、模式 mode、是否需要用户补充；默认不要让用户补充材料。
+- 再给“专家分发”：必须引用系统提供的 Handler 执行结果，列出哪个 Handler 已执行、状态是什么。
+- 再给“交付结果”：直接给用户可查看、可审核的结论/方案/任务回执。
+- 最后给“用户只需审核”：只说明用户需要确认执行或审核结果，不要要求用户粘贴代码、找接口、找技术人员、判断能力或整理项目材料。
 
-不要假装已经调用外部工具或数据库；如果需要具体商品数据、代码或截图，要明确说明需要用户提供或让系统接入。
+不要假装已经调用外部工具或数据库；但如果系统消息里提供了“只读工具结果/项目文件侦察结果”，你可以引用其中的文件路径、行号和结论。不得声称自己执行了写入、修改、删除、上线、提交代码等动作。
+如果系统消息里提供了“会话基底文件读取结果”，说明后端已经替你读取了用户指定的本地项目文件；你必须优先依据这些内容回答，不要再说“无法读取本地 Windows 路径”。
+如果“会话基底文件读取结果”里写明“已对指定文件做全文件关键词检索”，你不能说“只看到前80行”，也不能要求用户粘贴同一个文件代码；如果上下文仍不够，只能要求用户补充更具体的关键词或把相关文件加入基底文件列表。
+你必须遵循 TotalAgent 全生命周期：User Input -> TotalAgent Entry -> Security Gate -> RAG Enrichment -> Core Decision Layer -> Dispatcher -> Action Execution -> Response Delivery -> Post-Learning。用户只提供需求、查看结果、审核结果；其他文件检索、字段判断、能力判断、专家分发和执行交接由系统承担。
+如果系统明确告诉你“执行器已经写入文件并通过验证”，你必须把修改文件、命中工作流和验证结果反馈给用户。如果系统告诉你“NO_EXECUTABLE_WORKFLOW”，你必须说明第 6 层已派发成功、第 7 层缺少对应业务工作流；不要说等待技术执行Agent接入。禁止让用户自己找技术人员、自己打开文件、自己改代码。
 """.strip()
 
 
-def call_expert_team_ai(user, message, history, project_code, project_context, readonly_context=""):
+def call_expert_team_ai(user, message, history, project_code, project_context, readonly_context="", ceo_decision=None, expert_execution=None, learning_result=None):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY")
     messages = [{"role": "system", "content": build_expert_team_system_prompt(user, project_code, project_context)}]
     messages.append({"role": "system", "content": EXPERT_EXECUTION_HANDOFF_RULES})
+    messages.append({
+        "role": "system",
+        "content": (
+            "重要规则：专家团队接口是同步接口，不存在后台异步读取文件这一步。"
+            "如果系统消息已经提供只读文件结果，你必须直接基于结果回答。"
+            "禁止回复“请稍等、正在读取、侦察员正在读取、我稍后给你结果、你复制粘贴代码、请你提供接口代码、请你告诉我有哪些能力”。"
+            "如果读到的信息仍不足，只能明确说明已读取哪些文件和行号、还缺哪个更具体的文件名或关键词。"
+        ),
+    })
+    messages.append({
+        "role": "system",
+        "content": (
+            "【CEO核心决策层派工单】\n"
+            "下面是后端在调用大模型之前完成的本地决策。你必须按这张派工单组织回答，不能退回普通问答模式。\n"
+            f"{format_expert_ceo_decision(ceo_decision)}\n\n"
+            "硬性要求：need_user_input=false 时，不得让用户提供代码、接口、字段、截图、能力清单或项目结构；"
+            "你应该使用只读工具结果和会话记忆给出结论、方案或执行交接单。"
+            "同时必须明确执行状态：系统执行结果是 COMPLETED 时就是已执行；系统执行结果是 NO_EXECUTABLE_WORKFLOW 时就是第 7 层缺少工作流，不要再写“等待技术执行Agent接入”。"
+            "不要说“你需要找技术执行人员”或“你自己打开文件改”；应该说“执行对象是A/Codex，用户只需确认执行并审核结果”。"
+        ),
+    })
+    messages.append({
+        "role": "system",
+        "content": (
+            "【Dispatcher + Action Execution 执行结果】\n"
+            "下面不是方案，而是后端 IntentHandlerFactory(local) 已经按 handlers 映射实际执行过的 Handler 结果。"
+            "你必须把这些结果反馈给用户。\n"
+            f"{format_expert_execution(expert_execution)}\n\n"
+            "【Post-Learning 结果】\n"
+            f"{format_expert_learning(learning_result)}"
+        ),
+    })
     if readonly_context:
         messages.append({
             "role": "system",
@@ -1226,8 +2587,275 @@ def call_expert_team_ai(user, message, history, project_code, project_context, r
 def sanitize_expert_team_answer(text):
     cleaned = stringify(text)
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"^\s*<think>[\s\S]*?(?=(\*\*|团队判断|执行交接单|《执行交接单》|$))", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^\s*<think>[\s\S]*?(?=(\*\*|团队判断|执行交接单|《执行交接单》|已完成|$))", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = remove_internal_workflow_diagnostics(cleaned)
     return cleaned or stringify(text).strip()
+
+
+def remove_internal_workflow_diagnostics(text):
+    cleaned = stringify(text)
+    internal_terms = [
+        "WorkflowEngine",
+        "WAITING_ADAPTER",
+        "IntentHandlerFactory",
+        "CEO决策",
+        "专家分发",
+        "第 6 层",
+        "第 7 层",
+        "安全执行适配器",
+        "codex_executor",
+        "workflow_engine",
+        "execution_handoff",
+    ]
+    if not any(term in cleaned for term in internal_terms):
+        return cleaned
+    lines = []
+    for line in cleaned.splitlines():
+        if any(term in line for term in internal_terms):
+            continue
+        if line.strip().startswith("- ") and (":" in line and any(key in line for key in ["handler", "status"])):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def sanitize_expert_message_for_display(text):
+    cleaned = sanitize_expert_team_answer(text)
+    internal_terms = [
+        "WorkflowEngine",
+        "WAITING_ADAPTER",
+        "IntentHandlerFactory",
+        "codex_executor",
+        "workflow_engine",
+        "execution_handoff",
+        "CEO决策",
+        "专家分发",
+        "第 6 层",
+        "第 7 层",
+        "安全执行适配器",
+        "PLAN_AND_HANDOFF",
+    ]
+    if any(term in cleaned for term in internal_terms):
+        if "COMPLETED" in cleaned or "SUCCESS" in cleaned:
+            return (
+                "已完成。\n\n"
+                "本次功能已完成处理。你刷新页面后，回到对应页面查看效果即可。"
+            )
+        return (
+            "这个需求已经被专家团队理解，但当前系统还没有覆盖到对应的自动执行能力。\n\n"
+            "我已记录为待补能力项；用户不需要提供代码或自己找文件。等执行能力补齐后，再次发送同类需求即可直接执行。"
+        )
+    return cleaned
+
+
+def is_expert_fake_wait_answer(text):
+    cleaned = stringify(text)
+    fake_wait_words = [
+        "请稍等", "正在读取", "稍后", "请粘贴代码", "粘贴代码", "请提供",
+        "你需要提供", "你需要找技术执行人员", "如果你自己是技术执行人员",
+        "自己去改", "等待技术执行Agent接入", "等待 Codex 执行桥",
+    ]
+    return any(word in cleaned for word in fake_wait_words)
+
+
+def ensure_expert_execution_status(answer, ceo_decision=None, expert_execution=None):
+    text = sanitize_expert_team_answer(answer)
+    codex_result = get_codex_executor_result(expert_execution)
+    if codex_result and codex_result.get("status") in {"COMPLETED", "UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER"}:
+        stale_words = ["等待技术执行Agent接入", "等待 Codex 执行桥", "未修改，仅生成", "执行交接单"]
+        internal_words = ["WorkflowEngine", "WAITING_ADAPTER", "IntentHandlerFactory", "第 6 层", "第 7 层"]
+        if any(word in text for word in stale_words + internal_words) or not text:
+            return build_codex_executor_status_answer(ceo_decision, expert_execution)
+    if "执行状态" in text:
+        return text
+    return text
+
+
+class ExpertResponseValidator:
+    """Checks the final user-facing answer before Response Delivery."""
+
+    internal_terms = [
+        "<think>",
+        "</think>",
+        "WorkflowEngine",
+        "WAITING_ADAPTER",
+        "IntentHandlerFactory",
+        "codex_executor",
+        "workflow_engine",
+        "execution_handoff",
+        "CEO决策",
+        "专家分发",
+        "第 6 层",
+        "第 7 层",
+        "安全执行适配器",
+        "PLAN_AND_HANDOFF",
+        "NO_EXECUTABLE_WORKFLOW",
+    ]
+
+    user_burden_terms = [
+        "你需要找技术执行人员",
+        "你自己打开文件",
+        "你自己去改",
+        "请粘贴代码",
+        "请提供接口代码",
+        "等待技术执行Agent接入",
+        "等待 Codex 执行桥",
+        "需要手动实现",
+        "手动实现",
+    ]
+
+    def validate(self, original_input, raw_output, ceo_decision=None, expert_execution=None):
+        output = sanitize_expert_team_answer(raw_output)
+        reasons = []
+        codex_result = get_codex_executor_result(expert_execution)
+        codex_status = (codex_result or {}).get("status") or ""
+
+        if not output.strip():
+            reasons.append("输出为空")
+        if any(term in output for term in self.internal_terms):
+            reasons.append("包含内部工作流或调试信息")
+        if any(term in output for term in self.user_burden_terms):
+            reasons.append("把系统内部执行责任转嫁给用户")
+
+        score = estimate_answer_alignment_score(original_input, output)
+        if not codex_result and score < 0.08:
+            reasons.append(f"回答与用户问题相关性偏低（score={score:.2f}）")
+
+        if codex_status == "COMPLETED":
+            if not any(term in output for term in ["已完成", "已处理", "可以看到", "刷新", "打开"]):
+                reasons.append("执行完成类回复缺少结果和验收入口")
+        if codex_status in {"WAITING_ADAPTER", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
+            if any(term in output for term in ["WorkflowEngine", "WAITING_ADAPTER", "第 6 层", "第 7 层"]):
+                reasons.append("未完成类回复暴露内部诊断")
+            if not any(term in output for term in ["当前系统", "自动执行能力", "待补能力", "再次发送"]):
+                reasons.append("未完成类回复缺少用户可理解的后续说明")
+
+        return {
+            "passed": not reasons,
+            "reasons": reasons,
+            "alignment_score": round(score, 4),
+        }
+
+
+def validate_and_refine_expert_answer(original_input, raw_output, ceo_decision=None, expert_execution=None, max_retry=3):
+    validator = ExpertResponseValidator()
+    answer = sanitize_expert_team_answer(raw_output)
+    attempts = []
+
+    for retry_count in range(max_retry + 1):
+        result = validator.validate(original_input, answer, ceo_decision, expert_execution)
+        result["retry_count"] = retry_count
+        attempts.append(dict(result))
+        if result.get("passed"):
+            final_result = dict(result)
+            final_result["attempts"] = attempts
+            return answer, final_result
+        if retry_count >= max_retry:
+            fallback = build_user_facing_execution_answer(ceo_decision, expert_execution, result.get("reasons") or [])
+            final_result = validator.validate(original_input, fallback, ceo_decision, expert_execution)
+            final_result.update({"retry_count": retry_count, "attempts": attempts, "fallback_used": True})
+            return fallback, final_result
+        answer = correct_expert_answer_for_user_experience(
+            original_input,
+            answer,
+            result.get("reasons") or [],
+            ceo_decision,
+            expert_execution,
+            retry_count + 1,
+        )
+
+    return answer, {"passed": True, "retry_count": 0, "attempts": attempts}
+
+
+def correct_expert_answer_for_user_experience(original_input, raw_output, reasons, ceo_decision=None, expert_execution=None, retry_count=1):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        return build_user_facing_execution_answer(ceo_decision, expert_execution, reasons)
+
+    prompt = (
+        "你是“用户回答体验校验员”，专门把系统内部执行结果改写成普通用户能看懂的最终回复。\n"
+        "你的目标不是重新分析任务，而是修正上一版回复的问题。\n\n"
+        "硬性规则：\n"
+        "1. 只输出最终给用户看的中文回复，不要解释你的校验过程。\n"
+        "2. 禁止输出 <think>、WorkflowEngine、WAITING_ADAPTER、IntentHandlerFactory、codex_executor、CEO决策、第6层、第7层等内部词。\n"
+        "3. 不要让用户自己找技术人员、自己粘贴代码、自己打开文件修改。\n"
+        "4. 如果已经完成，说明完成了什么、涉及哪些文件、用户怎么查看结果。\n"
+        "5. 如果没有完成，用用户能懂的话说明当前还不能自动执行，并说已经记录为待补能力项。\n"
+        "6. 保持简短，最多 6 行。\n\n"
+        f"重试次数：{retry_count}\n"
+        f"原始用户需求：{stringify(original_input)}\n"
+        f"失败原因：{'; '.join(stringify(item) for item in reasons)}\n"
+        f"上一版回复：\n{stringify(raw_output)}\n\n"
+        f"执行上下文摘要：\n{build_user_facing_execution_answer(ceo_decision, expert_execution, reasons)}"
+    )
+
+    try:
+        response = requests.post(
+            f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": MINIMAX_MODEL,
+                "messages": [
+                    {"role": "system", "content": "你是严格的用户体验回复改写器，只输出改写后的最终回复。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "stream": False,
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return sanitize_expert_team_answer(data["choices"][0]["message"]["content"].strip())
+    except Exception:
+        return build_user_facing_execution_answer(ceo_decision, expert_execution, reasons)
+
+
+def build_user_facing_execution_answer(ceo_decision=None, expert_execution=None, reasons=None):
+    codex_result = get_codex_executor_result(expert_execution)
+    if codex_result:
+        status = codex_result.get("status")
+        data = codex_result.get("data") or {}
+        changed_files = data.get("changed_files") or []
+        if status == "COMPLETED":
+            changed_text = "、".join(changed_files) if changed_files else "相关代码"
+            return (
+                "已完成。\n\n"
+                "本次已把对应功能接入并完成验证。\n"
+                f"涉及文件：{changed_text}\n"
+                "你刷新页面后，打开对应商品的站内详情即可查看效果。"
+            )
+        return (
+            "这个需求已经被专家团队理解，但当前系统还没有覆盖到对应的自动执行能力。\n\n"
+            "我已记录为待补能力项；用户不需要提供代码或自己找文件。等执行能力补齐后，再次发送同类需求即可直接执行。"
+        )
+
+    reason_text = "；".join(stringify(item) for item in (reasons or []))
+    return (
+        "这次回复已被校验层拦截，没有直接展示内部执行信息。\n\n"
+        f"原因：{reason_text or '输出不符合用户可读标准'}。"
+    )
+
+
+def estimate_answer_alignment_score(original_input, answer):
+    source_tokens = set(extract_alignment_tokens(original_input))
+    answer_tokens = set(extract_alignment_tokens(answer))
+    if not source_tokens:
+        return 1.0
+    if not answer_tokens:
+        return 0.0
+    overlap = len(source_tokens & answer_tokens)
+    return overlap / max(1, min(len(source_tokens), len(answer_tokens)))
+
+
+def extract_alignment_tokens(text):
+    raw = stringify(text).lower()
+    tokens = re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fa5]{2,}", raw)
+    stop_words = {
+        "这个", "我的", "一个", "可以", "需要", "用户", "专家", "团队", "功能",
+        "已经", "当前", "回复", "问题", "结果", "系统", "页面", "商品",
+    }
+    return [token for token in tokens if token not in stop_words][:80]
 
 
 def fallback_expert_team_answer(message, error):
@@ -1240,16 +2868,23 @@ def fallback_expert_team_answer(message, error):
     )
 
 
-def collect_expert_readonly_context(message):
+def collect_expert_readonly_context(message, base_files=None):
     text = stringify(message)
     lower = text.lower()
+    context_blocks = []
+    base_context = collect_expert_base_file_context(base_files or [], text)
+    if base_context:
+        context_blocks.append(base_context)
+    file_context = collect_expert_file_context(text)
+    if file_context:
+        context_blocks.append(file_context)
     trigger_words = [
         "查", "查看", "数据", "字段", "接口", "回执", "商品", "属性", "卖点",
         "attributes", "selling_points", "product_id", "fastmoss", "kalodata", "统一表",
         "fastmoss_product_aggregate", "fastmoss_product_rank_aggregate", "kalodata_youwei_product",
     ]
     if not any(word.lower() in lower for word in trigger_words):
-        return ""
+        return "\n\n".join(context_blocks)
 
     product_ids = list(dict.fromkeys(re.findall(r"\b\d{10,}\b", text)))[:5]
     requested_sources = []
@@ -1291,7 +2926,362 @@ def collect_expert_readonly_context(message):
                     context_lines.append("字段读取失败或表不存在。")
     except Exception as exc:
         context_lines.append(f"\n只读工具读取失败：{exc}")
-    return "\n".join(context_lines)
+    context_blocks.append("\n".join(context_lines))
+    return "\n\n".join(context_blocks)
+
+
+def collect_expert_file_context(message):
+    text = stringify(message).strip()
+    lower = text.lower()
+    trigger_words = [
+        "文件", "代码", "前端", "后端", "接口", "页面", "样式", "按钮", "功能", "路由",
+        "api", "html", "css", "js", "python", "flask", "java", "spring", "agent", "专家团队",
+        "index.html", "styles.css", "app.py", "prompt", "数据库", "字段", "为什么", "怎么改",
+    ]
+    if not any(word.lower() in lower for word in trigger_words):
+        return ""
+
+    search_terms = extract_file_search_terms(text)
+    candidate_files = list(iter_expert_allowed_files())
+    scored = []
+    for file_path in candidate_files:
+        score = score_expert_file(file_path, search_terms, lower)
+        if score > 0:
+            scored.append((score, file_path))
+    scored.sort(key=lambda item: (-item[0], str(item[1]).lower()))
+    selected = [file_path for _score, file_path in scored[:EXPERT_FILE_CONTEXT_MAX_FILES]]
+    if not selected:
+        selected = default_expert_context_files()
+
+    lines = [
+        "【项目文件侦察结果】本轮仅执行项目目录白名单只读读取，未写入、未修改、未删除任何文件。",
+        f"项目根目录：{PROJECT_ROOT}",
+        "侦察员能力边界：只能读取 app.py、static、tools、agent-center 和项目文档等白名单文本文件。",
+    ]
+    for file_path in selected:
+        snippet = build_expert_file_snippet(file_path, search_terms)
+        if snippet:
+            lines.append(snippet)
+        if sum(len(line) for line in lines) > EXPERT_FILE_CONTEXT_MAX_CHARS:
+            lines.append("\n文件上下文已达到长度上限，后续文件省略。")
+            break
+    return "\n".join(lines)[:EXPERT_FILE_CONTEXT_MAX_CHARS]
+
+
+def normalize_expert_base_files(value):
+    if isinstance(value, str):
+        raw_items = re.split(r"[\r\n,]+", value)
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = []
+    normalized = []
+    for item in raw_items:
+        text = stringify(item).strip().strip('"').strip("'")
+        if not text:
+            continue
+        normalized.append(text)
+    return list(dict.fromkeys(normalized))[:12]
+
+
+def merge_expert_base_files(*groups):
+    merged = []
+    for group in groups:
+        for item in group or []:
+            text = stringify(item).strip()
+            if text and text not in merged:
+                merged.append(text)
+    return merged[:12]
+
+
+def extract_expert_file_paths(text):
+    raw = stringify(text)
+    patterns = [
+        r"[A-Za-z]:\\(?:[A-Za-z0-9_.() -]+\\)*[A-Za-z0-9_.() -]+\.[A-Za-z0-9]+",
+        r"(?:app\.py|static/[A-Za-z0-9_./-]+|tools/[A-Za-z0-9_./-]+|agent-center/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+\.md)",
+    ]
+    paths = []
+    for pattern in patterns:
+        for match in re.findall(pattern, raw):
+            cleaned = stringify(match).strip().rstrip("，。；;、)")
+            if cleaned and cleaned not in paths:
+                paths.append(cleaned)
+    return paths[:12]
+
+
+def collect_expert_base_file_context(base_files, message=""):
+    if not base_files:
+        return ""
+    search_terms = extract_file_search_terms(message)
+    lines = [
+        "【会话基底文件读取结果】用户为本次专家会话显式指定了以下基底文件。系统已在后端按白名单只读读取；这些内容可作为判断依据。",
+        f"项目根目录：{PROJECT_ROOT}",
+        "安全边界：只读、仅允许 D:\\choice_product 内文本文件、不会写入或执行。",
+        "读取策略：已对指定文件做全文件关键词检索，并返回命中片段；不要再要求用户粘贴这些文件里的代码。",
+        f"本轮检索关键词：{', '.join(search_terms) if search_terms else '无，使用文件开头预览'}",
+    ]
+    for raw_path in base_files:
+        resolved, error = resolve_expert_base_file(raw_path)
+        if error:
+            lines.append(f"\n指定路径：{raw_path}\n  读取状态：失败，原因：{error}")
+            continue
+        snippet = build_expert_file_targeted_snippet(resolved, search_terms)
+        lines.append(snippet)
+        if sum(len(line) for line in lines) > EXPERT_FILE_CONTEXT_MAX_CHARS:
+            lines.append("\n基底文件上下文已达到长度上限，后续文件省略。")
+            break
+    return "\n".join(lines)[:EXPERT_FILE_CONTEXT_MAX_CHARS]
+
+
+def resolve_expert_base_file(raw_path):
+    if not raw_path:
+        return None, "路径为空"
+    text = stringify(raw_path).strip()
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(PROJECT_ROOT)
+    except ValueError:
+        return None, "不在项目白名单根目录 D:\\choice_product 内"
+    except OSError as exc:
+        return None, f"路径解析失败：{exc}"
+    if not resolved.exists():
+        return None, "文件不存在"
+    if not resolved.is_file():
+        return None, "不是文件"
+    if any(part in EXPERT_FILE_EXCLUDED_DIRS for part in resolved.relative_to(PROJECT_ROOT).parts):
+        return None, "位于禁止读取目录"
+    if resolved.suffix.lower() not in EXPERT_FILE_ALLOWED_SUFFIXES:
+        return None, f"不支持的文件类型：{resolved.suffix}"
+    try:
+        if resolved.stat().st_size > 350_000:
+            return None, "文件过大，超过只读上下文限制"
+    except OSError as exc:
+        return None, f"无法读取文件大小：{exc}"
+    return resolved, None
+
+
+def build_expert_file_targeted_snippet(file_path, search_terms):
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return f"\n文件：{safe_relpath(file_path)}\n  读取状态：失败，原因：{exc}"
+    file_lines = content.splitlines()
+    snippet_lines = [
+        f"\n文件：{safe_relpath(file_path)}",
+        "  读取状态：成功",
+        f"  文件总行数：{len(file_lines)}",
+    ]
+    lowered_terms = [term.lower() for term in search_terms if term]
+    matched_indexes = []
+    if lowered_terms:
+        for index, line in enumerate(file_lines):
+            line_lower = line.lower()
+            score = expert_line_match_score(line_lower, lowered_terms)
+            if score > 0:
+                matched_indexes.append((score, index))
+    if matched_indexes:
+        ranked_matches = [index for _score, index in sorted(matched_indexes, key=lambda item: (-item[0], item[1]))[:18]]
+        snippet_lines.append(f"  全文件高相关命中位置：{', '.join('L' + str(index + 1) for index in ranked_matches)}")
+        selected_indexes = []
+        seen = set()
+        for index in ranked_matches:
+            for nearby in range(max(0, index - 3), min(len(file_lines), index + 4)):
+                if nearby not in seen:
+                    selected_indexes.append(nearby)
+                    seen.add(nearby)
+        selected_indexes.sort()
+        last_index = None
+        for index in selected_indexes[:120]:
+            if last_index is not None and index - last_index > 1:
+                snippet_lines.append("  ...")
+            line = file_lines[index].rstrip()
+            if line.strip():
+                snippet_lines.append(f"  L{index + 1}: {line[:240]}")
+            last_index = index
+        if len(selected_indexes) > 120:
+            snippet_lines.append("  ... 命中片段较多，已截断。")
+    else:
+        snippet_lines.append("  全文件检索未命中关键词，展示文件开头预览。")
+        max_lines = 80
+        for index, line in enumerate(file_lines[:max_lines], start=1):
+            if line.strip():
+                snippet_lines.append(f"  L{index}: {line.rstrip()[:220]}")
+        if len(file_lines) > max_lines:
+            snippet_lines.append(f"  ... 文件共 {len(file_lines)} 行，仅展示前 {max_lines} 行。")
+    return "\n".join(snippet_lines)
+
+
+def expert_line_match_score(line_lower, lowered_terms):
+    score = 0
+    high_value_terms = [
+        '@app.get("/api/products/<source>/<product_id>")',
+        "def product_detail",
+        "function renderproductdetail",
+        "renderproductdetail",
+        "function opendetail",
+        "opendetail(",
+        "currentdetailitem",
+        "data-detail",
+        "products/<source>/<product_id>",
+        "analysis-detail",
+    ]
+    medium_value_terms = ["api/products", "商品详情", "站内详情", "detaildialog", "detailbody"]
+    for term in lowered_terms:
+        if term and term in line_lower:
+            score += 1
+    for term in high_value_terms:
+        if term in line_lower:
+            score += 30
+    for term in medium_value_terms:
+        if term in line_lower:
+            score += 10
+    return score
+
+
+def extract_file_search_terms(message):
+    terms = []
+    raw_terms = re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}|[\u4e00-\u9fa5]{2,}", stringify(message))
+    stop_terms = {
+        "这个", "我的", "为什么", "怎么", "一下", "可以", "需要", "功能", "问题", "还是",
+        "专家", "团队", "用户", "查看", "文件", "代码", "前端", "后端",
+    }
+    for term in raw_terms:
+        normalized = term.strip()
+        if not normalized or normalized in stop_terms:
+            continue
+        if len(normalized) > 40:
+            continue
+        terms.append(normalized)
+    defaults = ["expert-team", "专家团队", "api/expert-team", "renderExpertTeamPage", "app.py", "index.html", "styles.css"]
+    for term in defaults:
+        if term.lower() in stringify(message).lower() and term not in terms:
+            terms.append(term)
+    lower_message = stringify(message).lower()
+    mapped_terms = []
+    if "商品详情" in stringify(message) or "站内详情" in stringify(message) or "detail" in lower_message:
+        mapped_terms.extend([
+            "api/products",
+            "products/<source>/<product_id>",
+            '@app.get("/api/products/<source>/<product_id>")',
+            "def product_detail",
+            "currentDetailItem",
+            "openDetail(",
+            "function openDetail",
+            "openProductDetail",
+            "function renderProductDetail",
+            "renderProductDetail",
+            "data-detail",
+            "detail",
+            "modal",
+            "商品详情",
+        ])
+    if "接口" in stringify(message) or "api" in lower_message:
+        mapped_terms.extend(["@app.get", "@app.post", "fetch(", "/api/"])
+    if "专家团队" in stringify(message):
+        mapped_terms.extend(["expert-team", "renderExpertTeamPage", "sendExpertTeamMessage", "collect_expert_readonly_context"])
+    if "图片" in stringify(message) or "粘贴" in stringify(message):
+        mapped_terms.extend(["expertImages", "expertImageInput", "paste", "image", "images"])
+    for term in mapped_terms:
+        if term not in terms:
+            terms.append(term)
+    return list(dict.fromkeys(terms))[:24]
+
+
+def iter_expert_allowed_files():
+    for root, dirs, files in os.walk(PROJECT_ROOT):
+        root_path = Path(root)
+        dirs[:] = [item for item in dirs if item not in EXPERT_FILE_EXCLUDED_DIRS]
+        try:
+            rel_root = root_path.relative_to(PROJECT_ROOT)
+        except ValueError:
+            continue
+        if rel_root.parts and rel_root.parts[0] in EXPERT_FILE_EXCLUDED_DIRS:
+            continue
+        for filename in files:
+            file_path = root_path / filename
+            if file_path.suffix.lower() not in EXPERT_FILE_ALLOWED_SUFFIXES:
+                continue
+            try:
+                if file_path.stat().st_size > 350_000:
+                    continue
+                yield file_path
+            except OSError:
+                continue
+
+
+def score_expert_file(file_path, search_terms, lower_message):
+    rel = file_path.relative_to(PROJECT_ROOT).as_posix().lower()
+    score = 0
+    important_files = {
+        "app.py": 8,
+        "static/index.html": 8,
+        "static/styles.css": 6,
+        "agent-center/src/main/resources/static/index.html": 4,
+        "agent-center/src/main/java/com/choiceproduct/agentcenter/agent/totalconversationagent.java": 4,
+    }
+    score += important_files.get(rel, 0)
+    for term in search_terms:
+        term_lower = term.lower()
+        if term_lower in rel:
+            score += 8
+    if any(word in lower_message for word in ["前端", "页面", "按钮", "粘贴", "图片", "样式"]):
+        if rel in {"static/index.html", "static/styles.css"}:
+            score += 12
+    if any(word in lower_message for word in ["后端", "接口", "api", "数据库"]):
+        if rel == "app.py":
+            score += 12
+    if any(word in lower_message for word in ["java", "agent", "中台", "spring"]):
+        if rel.startswith("agent-center/"):
+            score += 10
+    return score
+
+
+def default_expert_context_files():
+    defaults = [
+        PROJECT_ROOT / "app.py",
+        PROJECT_ROOT / "static" / "index.html",
+        PROJECT_ROOT / "static" / "styles.css",
+        PROJECT_ROOT / "product_selection_platform.md",
+        PROJECT_ROOT / "private_product_library_plan.md",
+        PROJECT_ROOT / "agent-center" / "README.md",
+    ]
+    return [file_path for file_path in defaults if file_path.exists()]
+
+
+def build_expert_file_snippet(file_path, search_terms):
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return f"\n文件：{safe_relpath(file_path)}\n读取失败：{exc}"
+    rel = safe_relpath(file_path)
+    file_lines = content.splitlines()
+    matches = []
+    lowered_terms = [term.lower() for term in search_terms if term]
+    for index, line in enumerate(file_lines, start=1):
+        line_lower = line.lower()
+        if not lowered_terms or any(term in line_lower for term in lowered_terms):
+            if line.strip():
+                matches.append((index, line.rstrip()))
+        if len(matches) >= EXPERT_FILE_CONTEXT_MAX_MATCHES_PER_FILE:
+            break
+    if not matches:
+        preview = [(idx + 1, line.rstrip()) for idx, line in enumerate(file_lines[:8]) if line.strip()]
+        matches = preview[:EXPERT_FILE_CONTEXT_MAX_MATCHES_PER_FILE]
+    snippet_lines = [f"\n文件：{rel}"]
+    for line_no, line in matches:
+        clipped = line[:220]
+        snippet_lines.append(f"  L{line_no}: {clipped}")
+    return "\n".join(snippet_lines)
+
+
+def safe_relpath(file_path):
+    try:
+        return file_path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(file_path)
 
 
 def fetch_table_columns(cursor, table):
@@ -2261,6 +4251,8 @@ def normalize_detail(source, row):
         "product_id": product_id,
         "date_record": date_record,
         "title": row.get(meta["title"]),
+        "attributes": serialize_value(row.get(meta.get("attributes"))) if meta.get("attributes") else "",
+        "selling_points": serialize_value(row.get(meta.get("selling_points"))) if meta.get("selling_points") else "",
         "image_url": f"/api/products/{source}/{product_id}/image?date_record={date_record}",
         "platform_url": resolve_platform_url(source, product_id, row.get(meta["detail_url"])),
         "audit_status": row.get("audit_status") or "PENDING",

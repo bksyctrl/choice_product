@@ -117,7 +117,7 @@
   <div id="toast" class="toast"></div>
 
   <script>
-    const state = { source: 'unified', mode: 'products', currentUser: null, detailAnalysisType: 'ip', expertSessionId: null, expertSessions: [], expertMessages: [], expertImages: [], view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
+    const state = { source: 'unified', mode: 'products', currentUser: null, detailAnalysisType: 'ip', expertSessionId: null, expertSessions: [], expertMessages: [], expertImages: [], expertBaseFiles: defaultExpertBaseFiles().join('\n'), view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
     const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
     const $ = (id) => document.getElementById(id);
@@ -251,6 +251,21 @@
                   ${expertSessionsHtml()}
                 </div>
               </div>
+              <div class="expert-base-files">
+                <div class="expert-session-head">
+                  <strong>基底文件</strong>
+                  <span>每行一个路径</span>
+                </div>
+                <textarea id="expertBaseFilesInput" rows="5" placeholder="例如：
+D:\\choice_product\\app.py
+D:\\choice_product\\static\\index.html
+D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</textarea>
+                <div class="expert-base-actions">
+                  <button type="button" data-expert-default-files>核心文件</button>
+                  <button type="button" data-expert-clear-files>清空</button>
+                </div>
+                <p class="expert-base-hint">发送消息前会先只读这些文件；仅允许读取 D:\\choice_product 内的文本文件。</p>
+              </div>
               <div class="expert-role-group">
                 <strong>专家领导层</strong>
                 <span>首席项目规划专家</span>
@@ -267,6 +282,7 @@
                 <span>商品产品经理专家</span>
                 <span>智能选品总评专家</span>
                 <span>技术架构专家</span>
+                <span>项目文件侦察员</span>
               </div>
               <div class="expert-role-group">
                 <strong>执行交接对象</strong>
@@ -306,6 +322,23 @@
       $('prevPage').disabled = true;
       $('nextPage').disabled = true;
       $('sendExpertMessage').addEventListener('click', sendExpertTeamMessage);
+      $('expertBaseFilesInput')?.addEventListener('input', event => {
+        state.expertBaseFiles = event.target.value;
+      });
+      document.querySelector('[data-expert-default-files]')?.addEventListener('click', () => {
+        state.expertBaseFiles = [
+          'D:\\choice_product\\app.py',
+          'D:\\choice_product\\static\\index.html',
+          'D:\\choice_product\\static\\styles.css',
+          'D:\\choice_product\\tools\\analyze_single_product.py',
+          'D:\\choice_product\\agent-center\\README.md',
+        ].join('\n');
+        renderExpertTeamPage();
+      });
+      document.querySelector('[data-expert-clear-files]')?.addEventListener('click', () => {
+        state.expertBaseFiles = '';
+        renderExpertTeamPage();
+      });
       $('expertMessageInput').addEventListener('keydown', event => {
         if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) sendExpertTeamMessage();
       });
@@ -412,7 +445,7 @@
         return `
           <div class="expert-welcome">
             <strong>你现在是在和“专家领导层”对话</strong>
-            <p>它会先理解你的目标，再决定是否调用数据分析、IP合规、材质视觉、运营、商品产品经理、选品总评或技术架构专家。</p>
+            <p>它会先理解你的目标，再决定是否调用数据分析、IP合规、材质视觉、运营、商品产品经理、选品总评、技术架构专家或项目文件侦察员。</p>
           </div>`;
       }
       return state.expertMessages.map(item => `
@@ -470,6 +503,25 @@
       addExpertImageFiles(images);
     }
 
+    function parseExpertBaseFiles() {
+      const picked = String(state.expertBaseFiles || '')
+        .split(/\r?\n|,/)
+        .map(item => item.trim())
+        .filter(Boolean)
+        .slice(0, 12);
+      return picked;
+    }
+
+    function defaultExpertBaseFiles() {
+      return [
+        'D:\\choice_product\\app.py',
+        'D:\\choice_product\\static\\index.html',
+        'D:\\choice_product\\static\\styles.css',
+        'D:\\choice_product\\tools\\analyze_single_product.py',
+        'D:\\choice_product\\agent-center\\README.md',
+      ];
+    }
+
     async function sendExpertTeamMessage() {
       const input = $('expertMessageInput');
       const message = input.value.trim();
@@ -480,7 +532,7 @@
       input.value = '';
       state.expertImages = [];
       renderExpertTeamPage();
-      state.expertMessages.push({ role: 'assistant', content: '专家团队正在讨论...' });
+      state.expertMessages.push({ role: 'assistant', content: 'CEO正在决策并分发专家...' });
       renderExpertTeamPage();
       try {
         const res = await fetch('/api/expert-team/chat', {
@@ -493,6 +545,7 @@
             project_context: '当前项目是选品与数据监控系统，但专家团队需要作为可复用团队能力，面向所有用户和项目。',
             message: displayMessage,
             images,
+            base_files: parseExpertBaseFiles(),
           }),
         });
         const raw = await res.text();
@@ -505,12 +558,12 @@
         }
         if (!json.ok) throw new Error(json.error || '专家团队回复失败');
         state.expertSessionId = json.data.session?.id || state.expertSessionId;
-        state.expertMessages = state.expertMessages.filter(item => item.content !== '专家团队正在讨论...');
+        state.expertMessages = state.expertMessages.filter(item => item.content !== 'CEO正在决策并分发专家...');
         state.expertMessages.push({ role: 'assistant', content: json.data.message || '' });
         renderExpertTeamPage();
         loadExpertSessions();
       } catch (error) {
-        state.expertMessages = state.expertMessages.filter(item => item.content !== '专家团队正在讨论...');
+        state.expertMessages = state.expertMessages.filter(item => item.content !== 'CEO正在决策并分发专家...');
         state.expertMessages.push({ role: 'assistant', content: `专家团队暂时无法回复：${error.message}` });
         renderExpertTeamPage();
       }
@@ -1064,6 +1117,7 @@
         $('detailDialog').close();
         openDetailAnalysisWorkspace(btn.dataset.openDetailAnalysis || state.detailAnalysisType);
       }));
+      document.querySelectorAll('[data-translate-selling-points]').forEach(btn => btn.addEventListener('click', () => translateSellingPoints(btn)));
     }
 
     function openReason(title, text, productTitle = '', grade = '', productId = '', dateRecord = '', source = '') {
@@ -1093,6 +1147,8 @@
       const title = item.title || raw.title || raw['商品标题'] || '';
       const category = raw.category || raw['类目'] || raw['商品类目'] || raw.category_name || '';
       const storeName = raw.shop_name || raw.store_name || raw['店铺名称'] || raw['店铺'] || '';
+      const attributesText = detailValue(item.attributes, raw.attributes, raw['属性信息']);
+      const sellingPointsText = detailValue(item.selling_points, raw.selling_points, raw['卖点']);
       
       const metricItems = [
         ['价格', detailValue(raw.real_price, raw.price, raw['价格'])],
@@ -1131,6 +1187,17 @@
             <div class="detail-metric-grid">${metricItems.map(([label, value]) => detailMetricCard(label, value)).join('')}</div>
           </section>
         </div>
+        ${(attributesText || sellingPointsText) ? `<section class="detail-section detail-extra-info">
+          <div class="detail-section-head"><h4>属性与卖点</h4></div>
+          <div class="detail-info-list">
+            ${attributesText ? `<div class="detail-info-block"><span>属性信息</span><p>${escapeHtml(attributesText)}</p></div>` : ''}
+            ${sellingPointsText ? `<div class="detail-info-block detail-selling-points-block">
+              <div class="detail-info-block-head"><span>卖点</span><button type="button" data-translate-selling-points="${escapeHtml(sellingPointsText)}">翻译成中文</button></div>
+              <p>${escapeHtml(sellingPointsText)}</p>
+              <div class="detail-selling-points-translation" aria-live="polite"></div>
+            </div>` : ''}
+          </div>
+        </section>` : ''}
         <section class="detail-section">
           <div class="detail-section-head">
             <div style="display:flex; align-items:center; gap:16px;">
@@ -1998,6 +2065,43 @@
       } finally {
         btn.disabled = false;
       }
+    }
+
+    async function translateSellingPoints(btn) {
+      const text = btn.dataset.translateSellingPoints || '';
+      const block = btn.closest('.detail-info-block');
+      const target = block?.querySelector('.detail-selling-points-translation');
+      if (!text) return showToast('暂无可翻译的卖点');
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = '翻译中...';
+      if (target) target.textContent = '正在翻译...';
+      try {
+        const res = await fetch('/api/translate-text', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text}),
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '翻译失败');
+        if (target) target.textContent = stripThinkBlocks(json.data.translation || '');
+        showToast('卖点已翻译成中文');
+      } catch (error) {
+        if (target) target.textContent = '';
+        showToast(error.message || '翻译失败');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+    }
+
+    function stripThinkBlocks(text) {
+      return String(text || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/^\s*<think>[\s\S]*$/gi, '')
+        .replace(/^\s*思考[:：][\s\S]*?(?=\n\s*(结论|翻译|译文)[:：]|\s*$)/i, '')
+        .replace(/^\s*(结论|翻译|译文)[:：]\s*/i, '')
+        .trim();
     }
 
     function buildTikTokShopUrl(productId) {
