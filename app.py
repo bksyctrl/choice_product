@@ -1,7 +1,9 @@
 import base64
+import difflib
 import io
 import json
 import os
+import py_compile
 import re
 import sys
 import threading
@@ -47,6 +49,9 @@ DB_CONFIG = {
     "database": os.getenv("DB_NAME", "ecommerce_workflow"),
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.DictCursor,
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
+    "read_timeout": int(os.getenv("DB_READ_TIMEOUT", "20")),
+    "write_timeout": int(os.getenv("DB_WRITE_TIMEOUT", "20")),
 }
 
 STATUS_VALUES = {"PENDING", "REVIEWING", "READY", "PUBLISHED", "OTHER"}
@@ -60,8 +65,8 @@ AI_DAEMON_SOURCES = [
 ]
 AI_DAEMON_ANALYSIS = os.getenv("AI_DAEMON_ANALYSIS", "both").strip().lower()
 AI_DAEMON_INTERVAL_SECONDS = int(os.getenv("AI_DAEMON_INTERVAL_SECONDS", "300"))
-AI_DAEMON_BATCH_SIZE = int(os.getenv("AI_DAEMON_BATCH_SIZE", "10"))
-AI_DAEMON_CONCURRENCY = max(1, min(5, int(os.getenv("AI_DAEMON_CONCURRENCY", "1"))))
+AI_DAEMON_BATCH_SIZE = max(30, int(os.getenv("AI_DAEMON_BATCH_SIZE", "30")))
+AI_DAEMON_CONCURRENCY = max(1, min(8, int(os.getenv("AI_DAEMON_CONCURRENCY", "8"))))
 AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false"
 AI_DAEMON_LOCK_RETRIES = max(1, int(os.getenv("AI_DAEMON_LOCK_RETRIES", "3")))
 AI_DAEMON_LOCK_WAIT_SECONDS = max(1, int(os.getenv("AI_DAEMON_LOCK_WAIT_SECONDS", "3")))
@@ -88,6 +93,50 @@ EXPERT_FILE_EXCLUDED_DIRS = {
     "tmp_render",
     "ComfyUI_ImageToText-main",
 }
+CODEPATCH_ALLOWED_SUFFIXES = EXPERT_FILE_ALLOWED_SUFFIXES | {".java", ".properties", ".toml", ".sql"}
+CODEPATCH_WRITE_ROOTS = (
+    "app.py",
+    "static",
+    "tools",
+    "agent-center/src/main",
+    "agent-center/pom.xml",
+    "agent-center/README.md",
+    "agent-center/1.1.2版本.md",
+    "requirements.txt",
+    ".env.example",
+    "product_selection_platform.md",
+    "private_product_library_plan.md",
+    "1.1版本-2026年5月30日.md",
+    "1.1.2版本.md",
+)
+CODEPATCH_NEVER_WRITE_DIRS = EXPERT_FILE_EXCLUDED_DIRS | {
+    "uploads",
+    "backups",
+}
+CODEPATCH_DANGEROUS_PATTERNS = [
+    r"\bos\.system\s*\(",
+    r"\bsubprocess\.",
+    r"\bshutil\.rmtree\s*\(",
+    r"\bos\.remove\s*\(",
+    r"\bos\.unlink\s*\(",
+    r"\bRemove-Item\b",
+    r"\brm\s+-rf\b",
+    r"\bdel\s+/[fsq]\b",
+    r"\bformat\s+[A-Za-z]:",
+]
+DB_READONLY_DIAGNOSTIC_PREFIXES = ("SHOW INDEX", "SHOW COLUMNS", "SHOW CREATE TABLE", "EXPLAIN SELECT")
+DB_READONLY_PERMISSION_PHRASES = [
+    "允许访问数据库",
+    "同意访问数据库",
+    "可以访问数据库",
+    "授权访问数据库",
+    "允许查数据库",
+    "同意查数据库",
+    "可以查库",
+    "授权查库",
+    "允许执行只读sql",
+    "允许执行只读 SQL",
+]
 DETAIL_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.getenv("DETAIL_ANALYSIS_CONCURRENCY", "2")))))
 _ai_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
@@ -766,17 +815,22 @@ def create_app():
                 "但专家团队视觉识别能力需要接入视觉模型后才能直接读取图片内容。"
             )
 
-        try:
-            answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context, ceo_decision, expert_execution, learning_result))
-            if readonly_context and is_expert_fake_wait_answer(answer):
-                answer = build_expert_read_context_answer(message, readonly_context, ceo_decision, expert_execution)
-            answer = ensure_expert_execution_status(answer, ceo_decision, expert_execution)
-            answer, validation_result = validate_and_refine_expert_answer(context_query, answer, ceo_decision, expert_execution)
+        if "【权限缺口】" in readonly_context:
+            answer = build_permission_required_answer(context_query, readonly_context)
+            validation_result = {"passed": True, "permission_required": True, "retry_count": 0}
             status = "SUCCESS"
-        except Exception as exc:
-            answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
-            validation_result = {"passed": False, "fallback": True, "reason": str(exc), "retry_count": 0}
-            status = "FALLBACK"
+        else:
+            try:
+                answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context, ceo_decision, expert_execution, learning_result))
+                if readonly_context and is_expert_fake_wait_answer(answer):
+                    answer = build_expert_read_context_answer(message, readonly_context, ceo_decision, expert_execution)
+                answer = ensure_expert_execution_status(answer, ceo_decision, expert_execution)
+                answer, validation_result = validate_and_refine_expert_answer(context_query, answer, ceo_decision, expert_execution)
+                status = "SUCCESS"
+            except Exception as exc:
+                answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
+                validation_result = {"passed": False, "fallback": True, "reason": str(exc), "retry_count": 0}
+                status = "FALLBACK"
 
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(
@@ -1414,6 +1468,8 @@ def build_expert_context_query(message, history):
     for item in (history or [])[-8:]:
         if item.get("role") == "user" or (is_confirmation and item.get("role") == "assistant"):
             content = stringify(item.get("content")).strip()
+            if content == current:
+                continue
             if content:
                 parts.append(content)
     if current:
@@ -1441,7 +1497,7 @@ def build_expert_ceo_decision(message, readonly_context="", image_count=0):
     has_file_context = "文件：" in readonly or "项目文件侦察结果" in readonly or "会话基底文件读取结果" in readonly
     has_data_context = "数据源：" in readonly or "只读工具结果" in readonly
 
-    if wants_execution and code_related:
+    if wants_execution and code_related and is_explicit_code_write_request(text):
         intent = "system_change_handoff"
         mode = "PLAN_AND_HANDOFF"
         handlers = ["project_file_scout", "system_architect", "ux_lead", "codex_executor", "execution_handoff"]
@@ -1489,6 +1545,24 @@ def build_expert_ceo_decision(message, readonly_context="", image_count=0):
     }
 
 
+def is_explicit_code_write_request(message):
+    text = stringify(message)
+    lower = text.lower()
+    write_terms = [
+        "修改代码", "改代码", "写入", "落地修改", "直接修改", "帮我改", "把代码", "补上",
+        "新增接口", "新增路由", "新增按钮", "删除按钮", "改成", "替换成", "接入", "实现",
+        "修复这个bug", "修复接口", "修复排序", "优化代码",
+    ]
+    if any(term in text for term in write_terms):
+        return True
+    if any(term in lower for term in ["patch", "codepatch", "apply patch", "commit"]):
+        return True
+    diagnostic_terms = ["为什么", "原因", "分析", "查看", "检查", "explain", "索引", "慢", "方案", "可行"]
+    if any(term in text.lower() for term in diagnostic_terms):
+        return False
+    return False
+
+
 def format_expert_ceo_decision(decision):
     return json.dumps(decision or {}, ensure_ascii=False, indent=2)
 
@@ -1523,6 +1597,8 @@ def dispatch_expert_handlers(ceo_decision, message, readonly_context="", base_fi
         readonly_context,
         base_files or [],
     )
+    decision["_current_workflow_id"] = workflow_result.get("workflow_id") if workflow_result.get("matched") else None
+    decision["_current_workflow_result"] = workflow_result if workflow_result.get("matched") else None
     results.append({
         "handler": "workflow_engine",
         "status": workflow_result.get("verification", {}).get("workflow_status") or ("COMPLETED" if workflow_result.get("ok") else "NO_EXECUTABLE_WORKFLOW"),
@@ -1743,7 +1819,7 @@ def estimate_handler_confidence(handler_code, result, evidence, readonly_context
         verification = data.get("verification") or {}
         if result.get("status") == "COMPLETED" and verification:
             return 0.9
-        if result.get("status") in {"WAITING_ADAPTER", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
+        if result.get("status") in {"WAITING_ADAPTER", "WAITING_USER_CONFIRMATION", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
             return 0.45
     if evidence:
         return 0.75
@@ -1753,7 +1829,8 @@ def estimate_handler_confidence(handler_code, result, evidence, readonly_context
 
 
 def handle_codex_executor(handler_code, decision, message, readonly_context, base_files):
-    existing_workflow = fetch_latest_expert_workflow_instance((decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
+    current_workflow_id = (decision or {}).get("_current_workflow_id")
+    existing_workflow = fetch_expert_workflow_instance_by_id(current_workflow_id, (decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
     if existing_workflow:
         status = existing_workflow.get("status")
         output = parse_json(existing_workflow.get("output_json"))
@@ -1768,6 +1845,7 @@ def handle_codex_executor(handler_code, decision, message, readonly_context, bas
                 "workflow_status": status,
                 "output": output,
                 "changed_files": ((output or {}).get("changed_files") or []),
+                "pending_confirmation": ((output or {}).get("pending_confirmation") or {}),
                 "verification": ((output or {}).get("verification") or {"workflow_status": status}),
             },
         }
@@ -1999,6 +2077,7 @@ def run_expert_workflow_engine(handler_code, decision, message, readonly_context
     final_status = "SUCCESS"
     errors = []
     changed_files = []
+    pending_confirmation = None
     verification = {
         "workflow_instance_created": bool(workflow_id),
     }
@@ -2014,11 +2093,13 @@ def run_expert_workflow_engine(handler_code, decision, message, readonly_context
             "executor": step["executor"],
             **step_result,
         })
-        if step_result.get("status") in {"FAILED", "WAITING_ADAPTER"}:
-            final_status = "WAITING_ADAPTER" if step_result.get("status") == "WAITING_ADAPTER" else "FAILED"
+        if step_result.get("status") in {"FAILED", "WAITING_ADAPTER", "WAITING_USER_CONFIRMATION"}:
+            final_status = step_result.get("status") if step_result.get("status") in {"WAITING_ADAPTER", "WAITING_USER_CONFIRMATION"} else "FAILED"
+            if step_result.get("pending_confirmation"):
+                pending_confirmation = step_result.get("pending_confirmation")
             if step_result.get("error"):
                 errors.append(step_result.get("error"))
-            if step_result.get("status") == "WAITING_ADAPTER":
+            if step_result.get("status") in {"WAITING_ADAPTER", "WAITING_USER_CONFIRMATION"}:
                 break
         for changed_file in step_result.get("changed_files") or []:
             if changed_file not in changed_files:
@@ -2035,6 +2116,7 @@ def run_expert_workflow_engine(handler_code, decision, message, readonly_context
         "status": final_status,
         "errors": errors,
         "changed_files": changed_files,
+        "pending_confirmation": pending_confirmation,
         "verification": verification,
     }
     update_expert_workflow_instance(workflow_id, final_status, output, "\n".join(errors))
@@ -2127,9 +2209,411 @@ def select_execution_adapter(decision, message, readonly_context, base_files):
         stringify(readonly_context),
         " ".join(stringify(item) for item in (base_files or [])),
     ])
+    if (decision or {}).get("intent") == "system_change_handoff" and (
+        is_explicit_code_write_request(text) or user_confirmed_extra_write_access(text)
+    ):
+        return apply_controlled_codepatch_adapter
     if is_detail_selling_points_translate_task(text) or is_translation_think_cleanup_task(text):
         return apply_detail_selling_points_translate_adapter
     return None
+
+
+def apply_controlled_codepatch_adapter(decision, message, readonly_context, base_files):
+    plan_result = generate_codepatch_plan(decision, message, readonly_context, base_files)
+    if not plan_result.get("ok"):
+        return {
+            "status": "WAITING_ADAPTER",
+            "output": plan_result.get("message") or "无法生成可执行补丁计划。",
+            "error": plan_result.get("error") or "",
+            "verification": {"codepatch_plan_generated": False},
+        }
+
+    plan = plan_result["plan"]
+    safety = validate_codepatch_plan_scope(plan, message)
+    if safety.get("status") == "WAITING_USER_CONFIRMATION":
+        return {
+            "status": "WAITING_USER_CONFIRMATION",
+            "output": "补丁计划包含默认白名单外的项目文件，等待用户确认后再写入。",
+            "error": "",
+            "pending_confirmation": {
+                "paths": safety.get("paths") or [],
+                "reason": safety.get("reason") or "需要用户确认额外写入范围。",
+            },
+            "verification": {
+                "codepatch_plan_generated": True,
+                "scope_checked": True,
+                "requires_user_confirmation": True,
+            },
+        }
+    if not safety.get("ok"):
+        return {
+            "status": "FAILED",
+            "output": "补丁计划未通过安全检查，未写入文件。",
+            "error": safety.get("reason") or "安全检查失败",
+            "verification": {"codepatch_plan_generated": True, "scope_checked": False},
+        }
+
+    apply_result = apply_codepatch_plan(plan)
+    if not apply_result.get("ok"):
+        return {
+            "status": "FAILED",
+            "output": "补丁应用失败，已保持文件不变。",
+            "error": apply_result.get("error") or "补丁应用失败",
+            "verification": apply_result.get("verification") or {},
+        }
+
+    verification = verify_codepatch_result(apply_result.get("changed_files") or [], plan)
+    status = "COMPLETED" if verification.get("passed") else "FAILED"
+    if status == "FAILED":
+        rollback_result = rollback_codepatch_changes(apply_result.get("originals") or {})
+        verification["rolled_back"] = rollback_result.get("ok")
+        if rollback_result.get("errors"):
+            verification.setdefault("errors", []).extend(rollback_result.get("errors"))
+    return {
+        "status": status,
+        "output": "受控 CodePatch 已完成写入并通过验证。" if status == "COMPLETED" else "补丁验证未通过，已尝试回滚本轮文件改动。",
+        "error": "" if status == "COMPLETED" else "; ".join(verification.get("errors") or []),
+        "changed_files": apply_result.get("changed_files") or [],
+        "diff": apply_result.get("diff") or {},
+        "verification": {
+            **verification,
+            "codepatch_plan_generated": True,
+            "scope_checked": True,
+            "operations": len(plan.get("operations") or []),
+        },
+    }
+
+
+def generate_codepatch_plan(decision, message, readonly_context, base_files):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        return {"ok": False, "message": "缺少 MINIMAX_API_KEY，无法生成通用补丁计划。"}
+
+    prompt = build_codepatch_planning_prompt(decision, message, readonly_context, base_files)
+    try:
+        response = requests.post(
+            f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": MINIMAX_MODEL,
+                "messages": [
+                    {"role": "system", "content": "你是严格的代码补丁规划器，只能输出 JSON，不要输出 markdown、解释或 <think>。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.05,
+                "stream": False,
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = data["choices"][0]["message"]["content"]
+        plan = parse_codepatch_json(raw)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "message": "调用模型生成补丁计划失败。"}
+
+    if not isinstance(plan, dict):
+        return {"ok": False, "message": "模型未返回合法 JSON 补丁计划。"}
+    operations = plan.get("operations")
+    if not isinstance(operations, list) or not operations:
+        return {"ok": False, "message": "补丁计划没有 operations，无法执行。"}
+    normalized = normalize_codepatch_plan(plan)
+    if not normalized.get("operations"):
+        return {"ok": False, "message": "补丁计划没有可执行的合法 operation。"}
+    return {"ok": True, "plan": normalized}
+
+
+def build_codepatch_planning_prompt(decision, message, readonly_context, base_files):
+    allowed_roots = "\n".join(f"- {item}" for item in CODEPATCH_WRITE_ROOTS)
+    allowed_suffixes = ", ".join(sorted(CODEPATCH_ALLOWED_SUFFIXES))
+    return f"""
+你要为 Choice Product 项目生成“结构化文件补丁计划”。
+
+硬性规则：
+1. 只输出一个 JSON 对象，不要 markdown，不要解释。
+2. JSON schema：
+{{
+  "summary": "本次要做什么",
+  "operations": [
+    {{
+      "op": "replace|insert_after|insert_before|append|create",
+      "path": "相对 D:/choice_product 的路径",
+      "old": "replace 时必须提供；insert 时可作为 anchor",
+      "anchor": "insert_after/insert_before 时必须提供",
+      "new": "replace/insert/create/append 的新内容",
+      "reason": "为什么改这个文件"
+    }}
+  ],
+  "verification": ["建议验证点"]
+}}
+3. 不允许生成删除文件、移动文件、运行命令、数据库写入、网络请求。
+4. 优先使用用户指定或只读上下文中已经出现的文件和函数，不能凭空创造不存在的入口。
+5. replace 的 old 必须是文件中能精确匹配的一段文本；insert 的 anchor 必须能精确匹配。
+6. 如果无法确定补丁，请返回 {{"summary":"无法安全生成补丁","operations":[],"verification":[]}}。
+
+默认写入白名单：
+{allowed_roots}
+
+允许文件后缀：{allowed_suffixes}
+
+CEO 决策：
+{format_expert_ceo_decision(decision)}
+
+用户需求：
+{stringify(message)}
+
+用户指定基底文件：
+{json.dumps(base_files or [], ensure_ascii=False)}
+
+只读项目上下文：
+{stringify(readonly_context)[:24000]}
+""".strip()
+
+
+def parse_codepatch_json(raw):
+    cleaned = sanitize_expert_team_answer(raw)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def normalize_codepatch_plan(plan):
+    normalized_ops = []
+    for item in plan.get("operations") or []:
+        if not isinstance(item, dict):
+            continue
+        op = stringify(item.get("op")).strip().lower()
+        path = stringify(item.get("path")).strip().replace("\\", "/").lstrip("/")
+        if op not in {"replace", "insert_after", "insert_before", "append", "create"} or not path:
+            continue
+        normalized_ops.append({
+            "op": op,
+            "path": path,
+            "old": stringify(item.get("old")),
+            "anchor": stringify(item.get("anchor")),
+            "new": stringify(item.get("new")),
+            "reason": stringify(item.get("reason")),
+        })
+    return {
+        "summary": stringify(plan.get("summary")).strip(),
+        "operations": normalized_ops,
+        "verification": plan.get("verification") if isinstance(plan.get("verification"), list) else [],
+    }
+
+
+def validate_codepatch_plan_scope(plan, message):
+    outside_whitelist = []
+    for operation in plan.get("operations") or []:
+        resolved, error = resolve_codepatch_path(operation.get("path"))
+        if error:
+            return {"ok": False, "reason": f"{operation.get('path')}: {error}"}
+        rel = safe_relpath(resolved)
+        if not is_codepatch_default_whitelisted(resolved):
+            outside_whitelist.append(rel)
+        danger = find_dangerous_codepatch_content(operation)
+        if danger:
+            return {"ok": False, "reason": f"{rel} 包含禁止内容：{danger}"}
+    outside_whitelist = list(dict.fromkeys(outside_whitelist))
+    if outside_whitelist and not user_confirmed_extra_write_access(message):
+        return {
+            "status": "WAITING_USER_CONFIRMATION",
+            "paths": outside_whitelist,
+            "reason": "这些文件在项目目录内，但不在默认 CodePatch 写入白名单中。",
+        }
+    return {"ok": True}
+
+
+def resolve_codepatch_path(raw_path):
+    text = stringify(raw_path).strip().replace("\\", "/").lstrip("/")
+    if not text:
+        return None, "路径为空"
+    candidate = Path(text)
+    if candidate.is_absolute():
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(PROJECT_ROOT)
+        except ValueError:
+            return None, "禁止修改项目目录外文件"
+        except OSError as exc:
+            return None, f"路径解析失败：{exc}"
+    else:
+        resolved = (PROJECT_ROOT / candidate).resolve(strict=False)
+        try:
+            resolved.relative_to(PROJECT_ROOT)
+        except ValueError:
+            return None, "禁止修改项目目录外文件"
+    rel_parts = resolved.relative_to(PROJECT_ROOT).parts
+    if any(part in CODEPATCH_NEVER_WRITE_DIRS for part in rel_parts):
+        return None, "位于禁止写入目录"
+    if resolved.suffix.lower() not in CODEPATCH_ALLOWED_SUFFIXES:
+        return None, f"不支持写入该文件类型：{resolved.suffix}"
+    return resolved, None
+
+
+def is_codepatch_default_whitelisted(file_path):
+    rel = safe_relpath(file_path).replace("\\", "/")
+    for root in CODEPATCH_WRITE_ROOTS:
+        root_norm = root.replace("\\", "/").rstrip("/")
+        if rel == root_norm or rel.startswith(root_norm + "/"):
+            return True
+    return False
+
+
+def user_confirmed_extra_write_access(message):
+    text = stringify(message)
+    confirm_terms = ["允许修改", "确认修改", "同意修改", "可以修改", "放行", "允许写入", "确认写入"]
+    scope_terms = ["白名单外", "这些文件", "上述文件", "项目内文件", "额外文件"]
+    return any(term in text for term in confirm_terms) and any(term in text for term in scope_terms)
+
+
+def find_dangerous_codepatch_content(operation):
+    content = "\n".join([
+        stringify(operation.get("old")),
+        stringify(operation.get("anchor")),
+        stringify(operation.get("new")),
+    ])
+    for pattern in CODEPATCH_DANGEROUS_PATTERNS:
+        if re.search(pattern, content, flags=re.IGNORECASE):
+            return pattern
+    return ""
+
+
+def apply_codepatch_plan(plan):
+    operations = plan.get("operations") or []
+    originals = {}
+    updates = {}
+    changed_files = []
+
+    try:
+        for operation in operations:
+            resolved, error = resolve_codepatch_path(operation.get("path"))
+            if error:
+                return {"ok": False, "error": f"{operation.get('path')}: {error}"}
+            rel = safe_relpath(resolved)
+            if resolved not in originals:
+                existed = resolved.exists()
+                content = resolved.read_text(encoding="utf-8", errors="ignore") if existed else ""
+                originals[resolved] = {"content": content, "existed": existed}
+                updates[resolved] = content
+            current = updates[resolved]
+            updated, changed, error = apply_codepatch_operation(current, operation, resolved.exists())
+            if error:
+                return {"ok": False, "error": f"{rel}: {error}"}
+            updates[resolved] = updated
+            if changed and rel not in changed_files:
+                changed_files.append(rel)
+
+        diff_map = {}
+        for resolved, updated in updates.items():
+            original = originals[resolved]["content"]
+            if original == updated:
+                continue
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(updated, encoding="utf-8")
+            rel = safe_relpath(resolved)
+            diff_map[rel] = "\n".join(difflib.unified_diff(
+                original.splitlines(),
+                updated.splitlines(),
+                fromfile=f"{rel} before",
+                tofile=f"{rel} after",
+                lineterm="",
+            ))[:12000]
+        return {"ok": True, "changed_files": list(diff_map.keys()), "diff": diff_map, "originals": originals}
+    except Exception as exc:
+        rollback_codepatch_changes(originals)
+        return {"ok": False, "error": str(exc), "verification": {"rolled_back": True}}
+
+
+def rollback_codepatch_changes(originals):
+    errors = []
+    for resolved, meta in (originals or {}).items():
+        try:
+            content = meta.get("content") if isinstance(meta, dict) else stringify(meta)
+            existed = bool(meta.get("existed")) if isinstance(meta, dict) else True
+            if existed:
+                resolved.write_text(content, encoding="utf-8")
+            elif resolved.exists():
+                resolved.unlink()
+        except Exception as exc:
+            errors.append(f"{safe_relpath(resolved)}: 回滚失败：{exc}")
+    return {"ok": not errors, "errors": errors}
+
+
+def apply_codepatch_operation(current, operation, file_exists):
+    op = operation.get("op")
+    old = stringify(operation.get("old"))
+    anchor = stringify(operation.get("anchor"))
+    new = stringify(operation.get("new"))
+    if op == "create":
+        if file_exists and current.strip():
+            return current, False, "create 目标文件已存在，拒绝覆盖"
+        return new, bool(new != current), ""
+    if op == "append":
+        if not new:
+            return current, False, "append 缺少 new 内容"
+        if new in current:
+            return current, False, ""
+        separator = "" if not current or current.endswith("\n") else "\n"
+        return current + separator + new, True, ""
+    if op == "replace":
+        if not old:
+            return current, False, "replace 缺少 old 内容"
+        if old not in current:
+            return current, False, "replace 的 old 内容未在文件中找到"
+        if current.count(old) > 1:
+            return current, False, "replace 的 old 内容匹配多处，拒绝模糊替换"
+        return current.replace(old, new, 1), old != new, ""
+    if op in {"insert_after", "insert_before"}:
+        if not anchor:
+            return current, False, "insert 缺少 anchor"
+        if anchor not in current:
+            return current, False, "insert 的 anchor 未在文件中找到"
+        if current.count(anchor) > 1:
+            return current, False, "insert 的 anchor 匹配多处，拒绝模糊插入"
+        if new in current:
+            return current, False, ""
+        replacement = anchor + new if op == "insert_after" else new + anchor
+        return current.replace(anchor, replacement, 1), True, ""
+    return current, False, f"不支持的操作：{op}"
+
+
+def verify_codepatch_result(changed_files, plan):
+    errors = []
+    checked = []
+    for rel in changed_files:
+        resolved, error = resolve_codepatch_path(rel)
+        if error:
+            errors.append(f"{rel}: {error}")
+            continue
+        checked.append(rel)
+        if resolved.suffix.lower() == ".py":
+            try:
+                py_compile.compile(str(resolved), doraise=True)
+            except Exception as exc:
+                errors.append(f"{rel}: Python 编译失败：{exc}")
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="ignore")
+        except OSError as exc:
+            errors.append(f"{rel}: 读取验证失败：{exc}")
+            continue
+        if find_dangerous_codepatch_content({"new": text}):
+            errors.append(f"{rel}: 验证发现禁止内容")
+    if not changed_files:
+        errors.append("补丁没有产生任何文件变化")
+    return {
+        "passed": not errors,
+        "checked_files": checked,
+        "errors": errors,
+        "suggested_checks": plan.get("verification") or [],
+    }
 
 
 def is_translation_think_cleanup_task(message):
@@ -2198,6 +2682,8 @@ def detail_selling_points_translate_is_applied():
 def build_workflow_execution_summary(workflow, status, steps):
     if status == "SUCCESS":
         return f"WorkflowEngine 已完成 `{workflow['workflow_code']}`，共执行 {len(steps)} 个步骤。"
+    if status == "WAITING_USER_CONFIRMATION":
+        return f"WorkflowEngine 已启动 `{workflow['workflow_code']}`，并等待用户确认额外写入范围。"
     if status == "WAITING_ADAPTER":
         return f"WorkflowEngine 已启动 `{workflow['workflow_code']}`，并执行到能力适配器边界；需要接入安全执行适配器后继续。"
     return f"WorkflowEngine 执行 `{workflow['workflow_code']}` 失败，已记录步骤错误。"
@@ -2266,7 +2752,7 @@ def update_expert_workflow_step(step_id, result):
                 SET status = %s,
                     output_json = %s,
                     error_message = %s,
-                    completed_at = IF(%s IN ('COMPLETED', 'FAILED', 'WAITING_ADAPTER'), NOW(), completed_at)
+                    completed_at = IF(%s IN ('COMPLETED', 'FAILED', 'WAITING_ADAPTER', 'WAITING_USER_CONFIRMATION'), NOW(), completed_at)
                 WHERE id = %s
                 """,
                 (
@@ -2285,7 +2771,7 @@ def update_expert_workflow_step(step_id, result):
 def update_expert_workflow_instance(workflow_id, status, output, error_message=""):
     if not workflow_id:
         return
-    db_status = "SUCCESS" if status == "SUCCESS" else ("FAILED" if status == "FAILED" else "WAITING_ADAPTER")
+    db_status = "SUCCESS" if status == "SUCCESS" else ("FAILED" if status == "FAILED" else ("WAITING_USER_CONFIRMATION" if status == "WAITING_USER_CONFIRMATION" else "WAITING_ADAPTER"))
     try:
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(
@@ -2445,7 +2931,8 @@ def apply_detail_attribute_display_recipe():
 
 
 def handle_execution_handoff(handler_code, decision, message, readonly_context, base_files):
-    workflow = fetch_latest_expert_workflow_instance((decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
+    current_workflow_id = (decision or {}).get("_current_workflow_id")
+    workflow = fetch_expert_workflow_instance_by_id(current_workflow_id, (decision or {}).get("_session_id"), (decision or {}).get("_user_id"))
     if workflow:
         status = workflow.get("status")
         return {
@@ -2487,6 +2974,25 @@ def fetch_latest_expert_workflow_instance(session_id, user_id):
                 LIMIT 1
                 """,
                 (session_id, user_id or 0),
+            )
+            return cursor.fetchone()
+    except Exception:
+        return None
+
+
+def fetch_expert_workflow_instance_by_id(workflow_id, session_id, user_id):
+    if not workflow_id or not session_id:
+        return None
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {EXPERT_WORKFLOW_INSTANCE_TABLE}
+                WHERE id = %s AND session_id = %s AND user_id = %s
+                LIMIT 1
+                """,
+                (workflow_id, session_id, user_id or 0),
             )
             return cursor.fetchone()
     except Exception:
@@ -2546,7 +3052,7 @@ def handle_planning_expert(handler_code, decision, message, readonly_context, ba
 
 
 def build_agent_response_summary(decision, handler_results):
-    waiting = [item for item in handler_results if item.get("status") in {"WAITING_EXECUTOR_BRIDGE", "WAITING_EXECUTOR_RECIPE", "WAITING_ADAPTER"}]
+    waiting = [item for item in handler_results if item.get("status") in {"WAITING_EXECUTOR_BRIDGE", "WAITING_EXECUTOR_RECIPE", "WAITING_ADAPTER", "WAITING_USER_CONFIRMATION"}]
     failed = [item for item in handler_results if item.get("status") == "FAILED"]
     unsupported = [item for item in handler_results if item.get("status") in {"UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW"}]
     quality = summarize_handler_quality(handler_results)
@@ -2608,11 +3114,23 @@ def build_codex_executor_status_answer(ceo_decision, expert_execution):
 
     if status == "COMPLETED":
         changed_text = "、".join(changed_files) if changed_files else "相关代码已具备该能力，未重复写入"
+        workflow_name = data.get("workflow_name") or data.get("workflow_code") or "本轮任务"
+        verification = data.get("verification") or {}
+        verified_text = "已完成验证" if verification else "已完成处理"
         return (
             "已完成。\n\n"
-            "本次已处理：功能已接入并完成验证。\n"
+            f"本次已处理：{workflow_name}，{verified_text}。\n"
             f"涉及文件：{changed_text}\n"
-            "你现在刷新页面后，打开任意商品的站内详情，在“卖点”区域可以看到“翻译成中文”按钮。"
+            "你现在可以刷新页面或重新发起同类请求，检查本轮需求对应的效果。"
+        )
+
+    if status == "WAITING_USER_CONFIRMATION":
+        pending = data.get("pending_confirmation") or {}
+        paths = "、".join(pending.get("paths") or [])
+        return (
+            "这个需求已经生成了可执行修改计划，但其中包含默认白名单外的项目文件。\n\n"
+            f"需要你确认是否允许修改：{paths or '待确认文件'}。\n"
+            "你回复“允许修改这些文件”后，专家团队会继续执行。"
         )
 
     if status in {"UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER"}:
@@ -2686,6 +3204,7 @@ def build_expert_team_system_prompt(user, project_code, project_context):
 - 不要要求用户粘贴代码、找接口、找技术人员、判断能力或整理项目材料。
 
 不要假装已经调用外部工具或数据库；但如果系统消息里提供了“只读工具结果/项目文件侦察结果”，你可以引用其中的文件路径、行号和结论。不得声称自己执行了写入、修改、删除、上线、提交代码等动作。
+如果系统消息里出现“【权限缺口】”，你必须明确说明：没有完成该任务不是因为配置不存在，而是因为当前会话没有获得对应访问权限。你只能给用户两个选择：一是提供可复制执行的只读 SQL/命令并让用户把结果贴回；二是询问用户是否允许本轮开通一次性只读权限，用户授权后系统再继续执行。禁止在未授权时输出数据库结论、索引结论、慢查询结论或“已完成”。
 如果系统消息里提供了“会话基底文件读取结果”，说明后端已经替你读取了用户指定的本地项目文件；你必须优先依据这些内容回答，不要再说“无法读取本地 Windows 路径”。
 如果“会话基底文件读取结果”里写明“已对指定文件做全文件关键词检索”，你不能说“只看到前80行”，也不能要求用户粘贴同一个文件代码；如果上下文仍不够，只能要求用户补充更具体的关键词或把相关文件加入基底文件列表。
 你必须遵循 TotalAgent 全生命周期：User Input -> TotalAgent Entry -> Security Gate -> RAG Enrichment -> Core Decision Layer -> Dispatcher -> Action Execution -> Response Delivery -> Post-Learning。用户只提供需求、查看结果、审核结果；其他文件检索、字段判断、能力判断、专家分发和执行交接由系统承担。
@@ -2723,7 +3242,7 @@ def call_expert_team_ai(user, message, history, project_code, project_context, r
             f"{format_expert_ceo_decision(ceo_decision)}\n\n"
             "硬性要求：need_user_input=false 时，不得让用户提供代码、接口、字段、截图、能力清单或项目结构；"
             "你应该使用只读工具结果和会话记忆给出结论、方案或执行交接单。"
-            "同时必须明确执行状态：系统执行结果是 COMPLETED 时就是已执行；系统执行结果是 NO_EXECUTABLE_WORKFLOW 时就是第 7 层缺少工作流，不要再写“等待技术执行Agent接入”。"
+            "同时必须明确执行状态：系统执行结果是 COMPLETED 时就是已执行；系统执行结果是 WAITING_USER_CONFIRMATION 时就是等待用户确认额外写入文件；系统执行结果是 NO_EXECUTABLE_WORKFLOW 时就是第 7 层缺少工作流，不要再写“等待技术执行Agent接入”。"
             "不要说“你需要找技术执行人员”或“你自己打开文件改”；应该说“执行对象是A/Codex，用户只需确认执行并审核结果”。"
         ),
     })
@@ -2775,6 +3294,7 @@ def remove_internal_workflow_diagnostics(text):
     internal_terms = [
         "WorkflowEngine",
         "WAITING_ADAPTER",
+        "WAITING_USER_CONFIRMATION",
         "IntentHandlerFactory",
         "Dispatcher",
         "Handler",
@@ -2803,6 +3323,11 @@ def remove_internal_workflow_diagnostics(text):
 
 def sanitize_expert_message_for_display(text):
     cleaned = sanitize_expert_team_answer(text)
+    if is_stale_detail_translation_answer(cleaned, {"status": "WAITING_ADAPTER"}):
+        return (
+            "这条历史回执来自旧版本的专家团队回复，已隐藏不相关的卖点翻译提示。\n\n"
+            "请以当前最新回复为准。"
+        )
     internal_terms = [
         "WorkflowEngine",
         "WAITING_ADAPTER",
@@ -2847,14 +3372,23 @@ def is_expert_fake_wait_answer(text):
 def ensure_expert_execution_status(answer, ceo_decision=None, expert_execution=None):
     text = sanitize_expert_team_answer(answer)
     codex_result = get_codex_executor_result(expert_execution)
-    if codex_result and codex_result.get("status") in {"COMPLETED", "UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER"}:
+    if codex_result and codex_result.get("status") in {"COMPLETED", "UNSUPPORTED_AUTOMATION", "NO_EXECUTABLE_WORKFLOW", "WAITING_ADAPTER", "WAITING_USER_CONFIRMATION"}:
         stale_words = ["等待技术执行Agent接入", "等待 Codex 执行桥", "未修改，仅生成", "执行交接单"]
         internal_words = ["WorkflowEngine", "WAITING_ADAPTER", "IntentHandlerFactory", "Dispatcher", "Handler", "CEO决策", "第 6 层", "第 7 层"]
-        if any(word in text for word in stale_words + internal_words) or not text:
+        if any(word in text for word in stale_words + internal_words) or is_stale_detail_translation_answer(text, codex_result) or not text:
             return build_codex_executor_status_answer(ceo_decision, expert_execution)
     if "执行状态" in text:
         return text
     return text
+
+
+def is_stale_detail_translation_answer(text, codex_result=None):
+    cleaned = stringify(text)
+    status = (codex_result or {}).get("status")
+    if status == "COMPLETED":
+        return False
+    stale_markers = ["站内详情", "卖点", "翻译成中文"]
+    return "已完成" in cleaned and all(marker in cleaned for marker in stale_markers)
 
 
 class ExpertResponseValidator:
@@ -2865,6 +3399,7 @@ class ExpertResponseValidator:
         "</think>",
         "WorkflowEngine",
         "WAITING_ADAPTER",
+        "WAITING_USER_CONFIRMATION",
         "IntentHandlerFactory",
         "Dispatcher",
         "Handler",
@@ -2914,14 +3449,19 @@ class ExpertResponseValidator:
         score = estimate_answer_alignment_score(original_input, output)
         if not codex_result and score < 0.08:
             reasons.append(f"回答与用户问题相关性偏低（score={score:.2f}）")
+        if codex_result and codex_status == "COMPLETED" and score < 0.08 and not is_explicit_code_write_request(original_input):
+            reasons.append(f"执行完成回复与当前问题不匹配（score={score:.2f}）")
 
         if codex_status == "COMPLETED":
             if not any(term in output for term in ["已完成", "已处理", "可以看到", "刷新", "打开"]):
                 reasons.append("执行完成类回复缺少结果和验收入口")
-        if codex_status in {"WAITING_ADAPTER", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
+        if codex_status in {"WAITING_ADAPTER", "WAITING_USER_CONFIRMATION", "NO_EXECUTABLE_WORKFLOW", "UNSUPPORTED_AUTOMATION"}:
             if any(term in output for term in ["WorkflowEngine", "WAITING_ADAPTER", "第 6 层", "第 7 层"]):
                 reasons.append("未完成类回复暴露内部诊断")
-            if not any(term in output for term in ["当前系统", "自动执行能力", "待补能力", "再次发送"]):
+            if codex_status == "WAITING_USER_CONFIRMATION":
+                if not any(term in output for term in ["确认", "允许", "白名单", "文件"]):
+                    reasons.append("等待确认类回复缺少明确的用户确认动作")
+            elif not any(term in output for term in ["当前系统", "自动执行能力", "待补能力", "再次发送"]):
                 reasons.append("未完成类回复缺少用户可理解的后续说明")
 
         return {
@@ -3013,11 +3553,12 @@ def build_user_facing_execution_answer(ceo_decision=None, expert_execution=None,
         changed_files = data.get("changed_files") or []
         if status == "COMPLETED":
             changed_text = "、".join(changed_files) if changed_files else "相关代码"
+            workflow_name = data.get("workflow_name") or data.get("workflow_code") or "本轮任务"
             return (
                 "已完成。\n\n"
-                "本次已把对应功能接入并完成验证。\n"
+                f"本次已处理：{workflow_name}。\n"
                 f"涉及文件：{changed_text}\n"
-                "你刷新页面后，打开对应商品的站内详情即可查看效果。"
+                "请刷新页面或重新触发本轮需求对应的功能进行验收。"
             )
         return (
             "这个需求已经被专家团队理解，但当前系统还没有覆盖到对应的自动执行能力。\n\n"
@@ -3076,6 +3617,102 @@ def fallback_expert_team_answer(message, error):
     )
 
 
+def build_permission_required_answer(message, readonly_context):
+    return (
+        "这一步还没有真正查数据库，原因不是数据库配置缺失，而是当前会话还没有获得数据库访问授权。\n\n"
+        "你有两个选择：\n"
+        "1. 我把需要执行的只读 SQL 给你，你在数据库工具里执行后把结果发回来，我继续分析。\n"
+        "2. 你回复“允许访问数据库”，我就在本轮会话里执行白名单只读诊断，只会跑 SHOW INDEX、SHOW COLUMNS、SHOW CREATE TABLE、EXPLAIN SELECT，不会写入或修改数据。\n\n"
+        "针对你这个慢接口问题，建议授权后先查：kalodata 表索引、列表接口真实排序字段、以及对应 EXPLAIN 执行计划。"
+    )
+
+
+def needs_database_runtime_access(message):
+    text = stringify(message)
+    lower = text.lower()
+    db_terms = ["数据库", "查库", "sql", "mysql", "explain", "show index", "show create table", "索引", "慢查询", "执行计划"]
+    action_terms = ["检查", "查看", "查一下", "执行", "跑一下", "分析", "为什么", "慢", "优化"]
+    return any(term in lower for term in db_terms) and any(term in lower for term in action_terms)
+
+
+def user_confirmed_database_read_access(message):
+    text = stringify(message)
+    lower = text.lower()
+    if any(phrase.lower() in lower for phrase in DB_READONLY_PERMISSION_PHRASES):
+        return True
+    short_yes = text.strip() in {"是", "可以", "同意", "允许", "确认", "yes", "ok", "OK"}
+    return short_yes and any(term in text for term in ["访问数据库", "查数据库", "查库", "只读SQL", "只读 SQL", "权限"])
+
+
+def build_database_permission_context(message):
+    return (
+        "【权限缺口】本轮问题需要访问数据库做只读诊断，但当前对话尚未获得用户的一次性数据库访问授权。\n"
+        "已确认：数据库连接配置存在于项目文件中，但“知道配置”不等于“已获准执行数据库查询”。\n"
+        "专家团队不能假装已经查库，也不能把推断说成事实。\n"
+        "可选路径：\n"
+        "1. 用户自己执行专家给出的只读 SQL，把结果贴回；专家继续分析。\n"
+        "2. 专家团队向用户请求一次性只读数据库访问授权；用户回复“允许访问数据库”后，系统继续执行 SHOW INDEX、SHOW COLUMNS、SHOW CREATE TABLE、EXPLAIN SELECT 等白名单只读诊断。\n"
+    )
+
+
+def extract_readonly_diagnostic_sqls(message):
+    text = stringify(message)
+    sqls = []
+    for match in re.finditer(r"(?is)\b(EXPLAIN\s+SELECT|SHOW\s+INDEX|SHOW\s+COLUMNS|SHOW\s+CREATE\s+TABLE)\b.*?(?=(?:\n\s*\n)|$)", text):
+        sql = match.group(0).strip().rstrip(";")
+        if sql and is_allowed_readonly_diagnostic_sql(sql):
+            sqls.append(sql)
+    return list(dict.fromkeys(sqls))[:3]
+
+
+def is_allowed_readonly_diagnostic_sql(sql):
+    normalized = re.sub(r"\s+", " ", stringify(sql).strip())
+    upper = normalized.upper()
+    if not any(upper.startswith(prefix) for prefix in DB_READONLY_DIAGNOSTIC_PREFIXES):
+        return False
+    forbidden = [" INSERT ", " UPDATE ", " DELETE ", " DROP ", " ALTER ", " CREATE INDEX ", " TRUNCATE ", " REPLACE ", " GRANT ", " REVOKE "]
+    if any(token in f" {upper} " for token in forbidden):
+        return False
+    return ";" not in normalized
+
+
+def append_database_permission_or_diagnostics(context_blocks, message, requested_sources):
+    if not needs_database_runtime_access(message):
+        return False
+    if not user_confirmed_database_read_access(message):
+        context_blocks.append(build_database_permission_context(message))
+        return True
+
+    lines = ["【数据库只读诊断结果】用户已授权本轮执行白名单只读数据库诊断；未写入、未修改、未删除任何数据。"]
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            for source in (requested_sources or ["unified"])[:3]:
+                meta = SOURCES.get(source)
+                if not meta:
+                    continue
+                table = meta["table"]
+                lines.append(f"\n数据源：{source}，表：{table}")
+                cursor.execute(f"SHOW INDEX FROM `{table}`")
+                indexes = cursor.fetchall() or []
+                if indexes:
+                    summary = []
+                    for row in indexes[:12]:
+                        summary.append(f"{row.get('Key_name')}({row.get('Column_name')})")
+                    lines.append("索引概览：" + "，".join(summary))
+                else:
+                    lines.append("索引概览：未读取到索引")
+
+            for sql in extract_readonly_diagnostic_sqls(message):
+                lines.append(f"\n执行SQL：{sql}")
+                cursor.execute(sql)
+                rows = cursor.fetchall() or []
+                lines.append("结果：" + json.dumps(rows[:8], ensure_ascii=False, default=str))
+    except Exception as exc:
+        lines.append(f"\n数据库只读诊断失败：{exc}")
+    context_blocks.append("\n".join(lines))
+    return True
+
+
 def collect_expert_readonly_context(message, base_files=None):
     text = stringify(message)
     lower = text.lower()
@@ -3105,6 +3742,10 @@ def collect_expert_readonly_context(message, base_files=None):
     if not requested_sources:
         requested_sources = ["unified"]
     requested_sources = requested_sources[:3]
+
+    permission_or_diagnostic_handled = append_database_permission_or_diagnostics(context_blocks, text, requested_sources)
+    if permission_or_diagnostic_handled and not user_confirmed_database_read_access(text):
+        return "\n\n".join(context_blocks)
 
     context_lines = ["【只读工具结果】本轮仅执行白名单只读查询，未写入、未修改、未删除任何数据。"]
     try:
@@ -5174,13 +5815,11 @@ def fetch_reusable_fastmoss_analysis(cursor, product_id):
 
 def needs_ai_analysis(cursor, source, product, analysis):
     current = fetch_current_analysis_state(cursor, source, product)
-    material = parse_json(current.get("material_analysis")) or {}
-    prefilter_hit = bool(material.get("pre_filter", {}).get("hit"))
     if analysis == "material":
         return is_blank(current.get("material_analysis"))
     if analysis == "ip":
-        return is_blank(current.get("ip_grade")) and not prefilter_hit
-    return is_blank(current.get("material_analysis")) or (is_blank(current.get("ip_grade")) and not prefilter_hit)
+        return is_blank(current.get("ip_grade"))
+    return is_blank(current.get("material_analysis")) or is_blank(current.get("ip_grade"))
 
 
 def is_blank(value):
@@ -5192,16 +5831,29 @@ def run_ai_product_flow(cursor, source, product, analysis, write):
         prefilter_result = run_material_prefilter(cursor, source, product, write=write)
         if prefilter_result:
             print(
-                "[AI_DAEMON] material prefilter hit, skip IP and material AI "
+                "[AI_DAEMON] material prefilter hit, skip material AI but continue IP analysis "
                 f"product_id={product['product_id']}",
                 flush=True,
             )
+            run_analysis(cursor, source, product, "IP", write=write)
             return
         run_analysis(cursor, source, product, "IP", write=write)
         run_analysis(cursor, source, product, "MATERIAL", write=write)
         return
 
+    if analysis == "ip":
+        run_analysis(cursor, source, product, "IP", write=write)
+        return
+
     if analysis == "material":
+        prefilter_result = run_material_prefilter(cursor, source, product, write=write)
+        if prefilter_result:
+            print(
+                "[AI_DAEMON] material prefilter hit, skip material AI "
+                f"product_id={product['product_id']}",
+                flush=True,
+            )
+            return
         run_analysis(cursor, source, product, "MATERIAL", write=write)
         return
 
