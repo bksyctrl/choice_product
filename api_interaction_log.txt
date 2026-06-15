@@ -1,0 +1,145 @@
+========================================================================
+[1] 第一次图生图 (Image-to-Image Generation) 请求
+========================================================================
+POST https://api.minimax.io/v1/image_generation
+Headers:
+  Authorization: Bearer <MINIMAX_API_KEY>
+  Content-Type: application/json
+
+Payload (JSON):
+{
+  "model": "image-01",
+  "prompt": "Extract the existing artwork/pattern printed on the product surface in THIS reference image.\nOutput only the extracted flat artwork asset, never a product photo or mockup.\nIf the source has one main graphic, text, flag, logo-style mark, or slogan, output that single graphic only, centered on plain white/transparent-looking background. Do NOT turn it into a repeated background pattern.\nIf the source has an all-over repeating textile pattern, output only that repeat pattern filling the square canvas.\nKeep exact subject identity, text content, layout, colors, darkness, saturation, texture grain, spacing and scale from the reference image.\nRemove the carrier and scene: clothing, bag, person, model, handle, strap, zipper, pocket, seam, hardware, tag, background, shadow.\nRemove unrelated watermarks, ads, prices, labels. If the text is the actual printed graphic on the product, keep the text exactly.\nDo not invent, redesign, recolor, add decorative backgrounds, add borders, add new motifs, or use any template from previous images.\nFailure: wrong subject, missing text/flag, repeated pattern when source is a single graphic, visible product, or mismatched color.",
+  "aspect_ratio": "1:1",
+  "subject_reference": [
+    {
+      "type": "character",
+      "image_file": "data:image/jpeg;base64,UklGRl62AQBXRUJQVlA4WAoAAAAgAAAARQUABwcASUNDUMgBAAAAAAHIAAAAAA..."
+    }
+  ],
+  "response_format": "base64",
+  "n": 1
+}
+
+
+========================================================================
+[2] 第一次图生图 (Image-to-Image Generation) 返回值
+========================================================================
+HTTP 200 OK
+{
+  "base_resp": {
+    "status_code": 0,
+    "status_msg": "success"
+  },
+  "data": {
+    "image_base64": [
+      "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP..." 
+    ]
+  },
+  "id": "req-12345678"
+}
+*(备注：代码会将返回的 base64 图片解码并保存)*
+
+
+========================================================================
+[3] 第一次 AI视觉质检评估 (Vision VQA) 请求
+========================================================================
+POST https://api.minimax.io/v1/text/chatcompletion_v2
+Headers:
+  Authorization: Bearer <MINIMAX_API_KEY>
+  Content-Type: application/json
+
+Payload (JSON):
+{
+  "model": "abab6.5s-chat",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a strict visual QA judge. Compare only the source artwork on the product and the generated extraction result."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "You will receive two images:\nImage 1: original product photo.\nImage 2: generated extraction result.\n\nOnly judge whether the artwork/pattern/illustration in Image 2 is the same as the artwork printed on the product in Image 1.\n\nJudge these points:\n1. Same artwork subject: text, letters, numbers, flag, slogan, animal, flower, geometric pattern, texture, etc.\n2. Same text content and layout if the original artwork contains text.\n3. Same main colors, darkness, saturation and material texture.\n4. Correct extraction format: a single original graphic should remain a single graphic; only a true repeating pattern should become a full-canvas pattern.\n5. No product carrier should remain: no clothing, bag, person, handle, zipper, pocket, background or mockup.\n\nReturn JSON only:\n{\n  \"is_same\": true/false,\n  \"match_score\": 0-100,\n  \"reason\": \"why they are not the same, or why they match\",\n  \"prompt_advice\": \"short advice for the next image-to-image prompt\"\n}"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/jpeg;base64,UklGRl62AQBXRUJQVlA4WAoAAAAgAAAARQUABwcASUNDUMgBAAAAAAHIAAAAAA..."
+          }
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP..."
+          }
+        }
+      ]
+    }
+  ],
+  "temperature": 0.0,
+  "stream": false
+}
+
+
+========================================================================
+[4] 第一次 AI视觉质检评估 (Vision VQA) 返回值
+========================================================================
+HTTP 200 OK
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"is_same\": false,\n  \"match_score\": 75,\n  \"reason\": \"The subject and text content match, but the generated image still contains part of the bag's strap and zipper. The color saturation is also slightly lower than the original.\",\n  \"prompt_advice\": \"Ensure the bag strap and zipper are completely removed. Increase color saturation slightly to match the original source.\"\n}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "created": 1718260000,
+  "id": "chat-001",
+  "model": "abab6.5s-chat",
+  "usage": {
+    "completion_tokens": 78,
+    "prompt_tokens": 642,
+    "total_tokens": 720
+  }
+}
+*(备注：由于 is_same 为 false 且 match_score=75 < 85，系统将触发重试。)*
+
+
+========================================================================
+[5] 第二次图生图 (Image-to-Image Generation) 请求 (重试机制介入)
+========================================================================
+*(由于上一次失败，原代码中会将 feedback 拼接到新的 Prompt 中)*
+
+POST https://api.minimax.io/v1/image_generation
+Payload (JSON):
+{
+  "model": "image-01",
+  "prompt": "Extract the existing artwork/pattern printed on the product surface in THIS reference image.\nOutput only the extracted flat artwork asset, never a product photo or mockup.\n[...保留原有约束...]\nFailure: wrong subject, missing text/flag, repeated pattern when source is a single graphic, visible product, or mismatched color.\nPrevious failed because: The subject and text content match, but the generated image still contains part of the bag's strap and zipper. The color saturation is also slightly lower than the original.；Ensure the bag strap and zipper are completely removed. Increase color saturation slightly to match the original source.. Fix this exactly in this attempt.",
+  "aspect_ratio": "1:1",
+  "subject_reference": [ ... ],
+  "response_format": "base64",
+  "n": 1
+}
+
+
+========================================================================
+[6] 第二次 AI视觉质检评估 (Vision VQA) 返回值
+========================================================================
+HTTP 200 OK
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"is_same\": true,\n  \"match_score\": 95,\n  \"reason\": \"The generated image accurately extracts the core artwork without any straps or zippers. The colors are vibrant and match the original exactly.\",\n  \"prompt_advice\": \"\"\n}"
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+*(备注：match_score=95 >= 85，通过打分。系统保存图片，结束循环并返回 url。)*

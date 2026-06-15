@@ -2,6 +2,7 @@ import base64
 import difflib
 import io
 import json
+import math
 import os
 import py_compile
 import re
@@ -19,7 +20,9 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session
 from flask_cors import CORS
+from openai import OpenAI
 from openpyxl import Workbook
+from PIL import Image, ImageFilter
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -34,7 +37,9 @@ from analyze_single_product import (  # noqa: E402
     MINIMAX_MODEL,
     PRODUCT_SOURCES as AI_PRODUCT_SOURCES,
     build_input_snapshot,
+    call_minimax as call_product_vision_minimax,
     load_product as load_ai_product,
+    parse_json_response as parse_product_json_response,
     resolve_minimax_api_key,
     run_analysis,
     run_material_prefilter,
@@ -71,6 +76,28 @@ AI_DAEMON_WRITE = os.getenv("AI_DAEMON_WRITE", "true").strip().lower() != "false
 AI_DAEMON_LOCK_RETRIES = max(1, int(os.getenv("AI_DAEMON_LOCK_RETRIES", "3")))
 AI_DAEMON_LOCK_WAIT_SECONDS = max(1, int(os.getenv("AI_DAEMON_LOCK_WAIT_SECONDS", "3")))
 AI_DAEMON_LATEST_ONLY = os.getenv("AI_DAEMON_LATEST_ONLY", "true").strip().lower() != "false"
+SCORE_DAEMON_ENABLED = os.getenv("SCORE_DAEMON_ENABLED", "true").strip().lower() != "false"
+SCORE_DAEMON_INTERVAL_SECONDS = int(os.getenv("SCORE_DAEMON_INTERVAL_SECONDS", "180"))
+SCORE_DAEMON_BATCH_SIZE = max(20, int(os.getenv("SCORE_DAEMON_BATCH_SIZE", "200")))
+SCORE_RECALC_MAX_ATTEMPTS = max(1, int(os.getenv("SCORE_RECALC_MAX_ATTEMPTS", "3")))
+SCORE_RECALC_LATEST_ONLY = os.getenv("SCORE_RECALC_LATEST_ONLY", "false").strip().lower() == "true"
+SCORE_AUTO_CREATE_INDEXES = os.getenv("SCORE_AUTO_CREATE_INDEXES", "false").strip().lower() == "true"
+ILLUSTRATION_DAEMON_ENABLED = os.getenv("ILLUSTRATION_DAEMON_ENABLED", "true").strip().lower() != "false"
+ILLUSTRATION_DAEMON_INTERVAL_SECONDS = int(os.getenv("ILLUSTRATION_DAEMON_INTERVAL_SECONDS", "120"))
+ILLUSTRATION_DAEMON_BATCH_SIZE = max(20, int(os.getenv("ILLUSTRATION_DAEMON_BATCH_SIZE", "120")))
+ILLUSTRATION_DAEMON_CONCURRENCY = max(1, min(8, int(os.getenv("ILLUSTRATION_DAEMON_CONCURRENCY", "4"))))
+ILLUSTRATION_DAEMON_SOURCES = [
+    item.strip()
+    for item in os.getenv("ILLUSTRATION_DAEMON_SOURCES", "pod_cross_category").split(",")
+    if item.strip()
+]
+ILLUSTRATION_DAEMON_LATEST_ONLY = os.getenv("ILLUSTRATION_DAEMON_LATEST_ONLY", "true").strip().lower() != "false"
+MINIMAX_IMAGE_GENERATION_URL = os.getenv("MINIMAX_IMAGE_GENERATION_URL", "https://api.minimax.io/v1/image_generation")
+MINIMAX_IMAGE_MODEL = os.getenv("MINIMAX_IMAGE_MODEL", "image-01")
+MINIMAX_IMAGE_SUBJECT_TYPE = os.getenv("MINIMAX_IMAGE_SUBJECT_TYPE", "character")
+MINIMAX_ILLUSTRATION_MAX_ATTEMPTS = max(1, min(5, int(os.getenv("MINIMAX_ILLUSTRATION_MAX_ATTEMPTS", "3"))))
+MINIMAX_ILLUSTRATION_PASS_SCORE = max(0, min(100, int(os.getenv("MINIMAX_ILLUSTRATION_PASS_SCORE", "85"))))
+POD_ILLUSTRATION_STALE_MINUTES = max(1, int(os.getenv("POD_ILLUSTRATION_STALE_MINUTES", "10")))
 DETAIL_ANALYSIS_TABLE = "cp_user_detail_analysis"
 EXPERT_TEAM_SESSION_TABLE = "cp_expert_team_session"
 EXPERT_TEAM_MESSAGE_TABLE = "cp_expert_team_message"
@@ -139,7 +166,19 @@ DB_READONLY_PERMISSION_PHRASES = [
 ]
 DETAIL_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(4, int(os.getenv("DETAIL_ANALYSIS_CONCURRENCY", "2")))))
 _ai_daemon_started = False
+_score_daemon_started = False
+_illustration_daemon_started = False
 _ai_daemon_current_concurrency = AI_DAEMON_CONCURRENCY
+SYSTEM_DAILY_STATS_LOG = PROJECT_ROOT / "logs" / "system_daily_stats.jsonl"
+GENERATED_ILLUSTRATION_DIR = PROJECT_ROOT / "static" / "generated" / "illustrations"
+GENERATED_ILLUSTRATION_URL_PREFIX = "/static/generated/illustrations"
+SYSTEM_DAILY_STATS_KEYS = (
+    "illustration_checked",
+    "ip_analyzed",
+    "material_analyzed",
+    "selection_scored",
+)
+_system_daily_stats_lock = threading.Lock()
 FASTMOSS_ANALYSIS_REUSE_SOURCES = ("fastmoss", "fastmoss_rank")
 
 
@@ -149,6 +188,96 @@ class ApiAuthError(Exception):
 
 class ApiPermissionError(Exception):
     pass
+
+
+def empty_daily_stats():
+    return {key: 0 for key in SYSTEM_DAILY_STATS_KEYS}
+
+
+def load_latest_daily_stats(target_date):
+    if not SYSTEM_DAILY_STATS_LOG.exists():
+        return empty_daily_stats()
+    latest = None
+    try:
+        with SYSTEM_DAILY_STATS_LOG.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if item.get("date") == target_date and isinstance(item.get("totals"), dict):
+                    latest = item["totals"]
+    except OSError:
+        return empty_daily_stats()
+    totals = empty_daily_stats()
+    if latest:
+        for key in SYSTEM_DAILY_STATS_KEYS:
+            totals[key] = int(float(latest.get(key) or 0))
+    return totals
+
+
+def record_daily_system_stats(event, delta=None, detail=None):
+    normalized_delta = empty_daily_stats()
+    for key, value in (delta or {}).items():
+        if key in normalized_delta:
+            normalized_delta[key] = int(float(value or 0))
+    if not any(normalized_delta.values()):
+        return
+    target_date = datetime.now().strftime("%Y-%m-%d")
+    with _system_daily_stats_lock:
+        totals = load_latest_daily_stats(target_date)
+        for key, value in normalized_delta.items():
+            totals[key] += value
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "date": target_date,
+            "event": event,
+            "delta": normalized_delta,
+            "totals": totals,
+            "detail": detail or {},
+        }
+        SYSTEM_DAILY_STATS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with SYSTEM_DAILY_STATS_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"[SYSTEM_DAILY_STATS] {event} delta={normalized_delta} totals={totals}", flush=True)
+
+
+def reset_stale_pod_illustration_tasks():
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE pod_illustration_task
+                SET status = 3,
+                    error_msg = '图生图任务超时未完成，已自动标记失败，可重新提取'
+                WHERE status IN (0, 1)
+                  AND updated_at < DATE_SUB(NOW(), INTERVAL %s MINUTE)
+                """,
+                (POD_ILLUSTRATION_STALE_MINUTES,),
+            )
+            cursor.execute(
+                """
+                UPDATE pod_cross_category_product p
+                JOIN pod_illustration_task t
+                  ON t.product_id = p.product_id
+                 AND t.date_record = p.date_record
+                SET p.illustration_status = 3
+                WHERE p.illustration_status = 1
+                  AND p.illustration_extractable = 1
+                  AND t.status = 3
+                  AND t.updated_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)
+                """,
+                (POD_ILLUSTRATION_STALE_MINUTES + 1,),
+            )
+            changed = cursor.rowcount
+            conn.commit()
+            if changed:
+                print(f"[POD_ILLUSTRATION] reset stale tasks changed={changed}", flush=True)
+    except Exception as exc:
+        print(f"[POD_ILLUSTRATION] reset stale tasks failed: {exc}", flush=True)
 
 SOURCES = {
     "unified": {
@@ -183,6 +312,13 @@ SOURCES = {
         "platform": "fastmoss",
         "selling_points": "selling_points",
         "attributes": "attributes",
+        "score": "selection_score",
+        "score_reason": "score_reason",
+        "sales_mom": "sales_mom",
+        "status": "illustration_status",
+        "illustration_result_url": "illustration_result_url",
+        "illustration_extractable": "illustration_extractable",
+        "illustration_extract_reason": "illustration_extract_reason",
     },
     "fastmoss": {
         "label": "FastMoss",
@@ -216,6 +352,13 @@ SOURCES = {
         "platform": "fastmoss",
         "selling_points": None,
         "attributes": None,
+        "score": "selection_score",
+        "score_reason": "score_reason",
+        "sales_mom": "sales_mom",
+        "status": "illustration_status",
+        "illustration_result_url": "illustration_result_url",
+        "illustration_extractable": "illustration_extractable",
+        "illustration_extract_reason": "illustration_extract_reason",
     },
     "kalodata": {
         "label": "Kalodata",
@@ -249,6 +392,57 @@ SOURCES = {
         "platform": "kalodata",
         "selling_points": "卖点",
         "attributes": "属性信息",
+        "score": "selection_score",
+        "score_reason": "score_reason",
+        "sales_mom": "sales_mom",
+        "status": "illustration_status",
+        "illustration_result_url": "illustration_result_url",
+        "illustration_extractable": "illustration_extractable",
+        "illustration_extract_reason": "illustration_extract_reason",
+    },
+    "pod_cross_category": {
+        "label": "POD素材榜",
+        "table": "pod_cross_category_product",
+        "id": "product_id",
+        "date": "date_record",
+        "title": "title",
+        "image": "image_base64",
+        "price": "real_price",
+        "rating": "rating",
+        "commission": "commission_rate",
+        "sold": "rank_sold_count",
+        "total_sold": "sold_count",
+        "sale_amount": "sale_amount",
+        "author_count": "author_count",
+        "base_price": "base_price",
+        "transport_fee": "transport_fee",
+        "video_ratio": None,
+        "product_card_ratio": None,
+        "distribution_30d": None,
+        "distribution_7d": None,
+        "distribution_90d": None,
+        "distribution_180d": None,
+        "overview_30d": None,
+        "overview_7d": None,
+        "overview_90d": None,
+        "overview_180d": None,
+        "sku_analysis_7d": "sku_analysis_7d",
+        "sku_analysis_28d": "sku_analysis_28d",
+        "detail_url": "detail_url",
+        "platform": "fastmoss",
+        "selling_points": None,
+        "attributes": None,
+        "score": "selection_score",
+        "score_reason": "score_reason",
+        "sales_mom": "sales_mom",
+        "status": "illustration_status",
+        "illustration_result_url": "illustration_result_url",
+        "illustration_extractable": "illustration_extractable",
+        "illustration_extract_reason": "illustration_extract_reason",
+        "category_l1": "category_l1",
+        "category_l2": "category_l2",
+        "category_l3": "category_l3",
+        "aweme_count": "aweme_count",
     },
 }
 
@@ -271,6 +465,8 @@ def create_app():
     app = Flask(__name__, static_folder="static", template_folder="static")
     app.secret_key = os.getenv("SECRET_KEY", "choice-product-dev-secret")
     CORS(app, supports_credentials=True)
+    ensure_pod_cross_category_tables()
+    ensure_selection_score_columns()
     ensure_detail_analysis_table()
     ensure_expert_team_tables()
 
@@ -363,6 +559,8 @@ def create_app():
     def products():
         require_current_user()
         source = normalize_source(request.args.get("source"))
+        if source == "pod_cross_category":
+            reset_stale_pod_illustration_tasks()
         period = normalize_period(request.args.get("period"))
         sales_period = build_sales_period(
             period,
@@ -372,30 +570,51 @@ def create_app():
         page = clamp_int(request.args.get("page"), 1, 1, 100000)
         page_size = clamp_int(request.args.get("page_size"), 30, 10, 100)
         meta = SOURCES[source]
-        where, params = build_filters(meta, request.args)
-        use_sales_aggregate = True
-        order_sql = build_order(meta, request.args.get("sort_by"), request.args.get("sort_order"), sales_period, use_sales_aggregate, request.args)
+        date_start_arg = request.args.get("date_start")
+        date_end_arg = request.args.get("date_end")
+        where, params = build_filters(meta, request.args, latest_by_default=True)
+        has_date_filter = bool(date_start_arg or date_end_arg)
+        is_single_day_filter = bool(date_start_arg and date_end_arg and date_end_arg == date_start_arg)
+        use_latest_join = has_date_filter and not is_single_day_filter
+        sort_by = request.args.get("sort_by")
+        include_sales_growth_join = sort_by == "sales_growth"
+        use_sales_aggregate = (not is_single_day_filter) or include_sales_growth_join
+        order_sql = build_order(meta, sort_by, request.args.get("sort_order"), sales_period, use_sales_aggregate, request.args)
         offset = (page - 1) * page_size
 
         select_sql = build_product_select(source, meta)
-        latest_join = build_latest_product_join(meta, where)
+        latest_join = build_latest_product_join(meta, where) if use_latest_join else ""
         sales_aggregate_join = build_sales_aggregate_join(meta, where) if use_sales_aggregate else ""
+        main_where_sql = "" if latest_join else f"WHERE {' AND '.join(where)}"
         previous_sales_aggregate_join = build_previous_sales_aggregate_join(
             meta,
-            request.args.get("date_start"),
-            request.args.get("date_end"),
-        ) if use_sales_aggregate else ""
+            date_start_arg,
+            date_end_arg,
+        ) if use_sales_aggregate and include_sales_growth_join else ""
         sales_delta_join = build_sales_delta_join(
             meta,
-            request.args.get("date_start"),
-            request.args.get("date_end"),
-        ) if use_sales_aggregate else ""
-        runtime_sold_select = (
-            "sales_aggregate.aggregate_sold_count AS runtime_sold_count, previous_sales_aggregate.previous_sold_count AS previous_runtime_sold_count, "
-            f"{sales_delta_current_expr(meta)} AS current_period_sold_count, {sales_delta_previous_expr()} AS previous_period_sold_count"
-            if use_sales_aggregate
-            else "NULL AS runtime_sold_count, NULL AS previous_runtime_sold_count, NULL AS current_period_sold_count, NULL AS previous_period_sold_count"
-        )
+            date_start_arg,
+            date_end_arg,
+        ) if use_sales_aggregate and include_sales_growth_join else ""
+        if use_sales_aggregate and include_sales_growth_join:
+            runtime_sold_select = (
+                "sales_aggregate.aggregate_sold_count AS runtime_sold_count, "
+                "previous_sales_aggregate.previous_sold_count AS previous_runtime_sold_count, "
+                f"{sales_delta_current_expr(meta)} AS current_period_sold_count, "
+                f"{sales_delta_previous_expr()} AS previous_period_sold_count"
+            )
+        elif use_sales_aggregate:
+            runtime_sold_select = (
+                "sales_aggregate.aggregate_sold_count AS runtime_sold_count, "
+                "NULL AS previous_runtime_sold_count, "
+                "NULL AS current_period_sold_count, "
+                "NULL AS previous_period_sold_count"
+            )
+        else:
+            runtime_sold_select = (
+                "NULL AS runtime_sold_count, NULL AS previous_runtime_sold_count, "
+                "NULL AS current_period_sold_count, NULL AS previous_period_sold_count"
+            )
         sql = f"""
             SELECT {select_sql}, {runtime_sold_select}
             FROM `{meta["table"]}`
@@ -403,6 +622,7 @@ def create_app():
             {sales_aggregate_join}
             {previous_sales_aggregate_join}
             {sales_delta_join}
+            {main_where_sql}
             {order_sql}
             LIMIT %s OFFSET %s
         """
@@ -418,8 +638,12 @@ def create_app():
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(count_sql, params)
             total = int(cursor.fetchone()["total"])
-            query_params = [*params]
-            if use_sales_aggregate:
+            query_params = []
+            if latest_join:
+                query_params.extend(params)
+            if sales_aggregate_join:
+                query_params.extend(params)
+            if main_where_sql:
                 query_params.extend(params)
             cursor.execute(sql, [*query_params, page_size, offset])
             raw_rows = cursor.fetchall()
@@ -447,11 +671,32 @@ def create_app():
     def stats():
         require_current_user()
         source = normalize_source(request.args.get("source"))
+        if source == "pod_cross_category":
+            reset_stale_pod_illustration_tasks()
         meta = SOURCES[source]
         where, params = build_filters(meta, request.args)
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*) AS total FROM `{meta['table']}` WHERE {' AND '.join(where)}", params)
             total = int(cursor.fetchone()["total"])
+            if source == "pod_cross_category":
+                cursor.execute(
+                    f"""
+                    SELECT illustration_status AS status, COUNT(*) AS count
+                    FROM `{meta['table']}`
+                    WHERE {" AND ".join(where)}
+                    GROUP BY illustration_status
+                    """,
+                    params,
+                )
+                pod_statuses = {str(row["status"] if row["status"] is not None else 0): int(row["count"]) for row in cursor.fetchall()}
+                return api_ok({
+                    "source": source,
+                    "total": total,
+                    "pod_statuses": pod_statuses,
+                    "statuses": {},
+                    "ip_grades": {},
+                    "materials": {},
+                })
             cursor.execute(
                 f"""
                 SELECT audit_status, COUNT(*) AS count
@@ -472,7 +717,11 @@ def create_app():
                 params,
             )
             grades = {row["ip_grade"]: int(row["count"]) for row in cursor.fetchall()}
-            material_counts = count_material_types(cursor, meta["table"], where, params)
+            try:
+                material_counts = count_material_types(cursor, meta["table"], where, params)
+            except pymysql.err.OperationalError as exc:
+                material_counts = {}
+                print(f"[STATS] skip material count table={meta['table']} error={exc}", flush=True)
         return api_ok({
             "source": source,
             "total": total,
@@ -492,6 +741,233 @@ def create_app():
         return api_ok({
             "source": source,
             "latest_date": stringify(row.get("latest_date") if row else None),
+        })
+
+    @app.post("/api/products/recalculate-scores")
+    def recalculate_scores_api():
+        user = require_current_user()
+        if stringify(user.get("role")).strip().lower() not in {"admin", "manager"}:
+            return api_error("没有评分回算权限", 403)
+        payload = request.get_json(silent=True) or {}
+        source = normalize_source(payload.get("source") or request.args.get("source")) if (payload.get("source") or request.args.get("source")) else None
+        date_record = stringify(payload.get("date_record") or request.args.get("date_record")).strip() or None
+        limit = parse_int(payload.get("limit") or request.args.get("limit"), None)
+        force = str(payload.get("force") or request.args.get("force") or "").strip().lower() in {"1", "true", "yes"}
+        latest_only_arg = payload.get("latest_only", request.args.get("latest_only"))
+        latest_only = None if latest_only_arg in {None, ""} else str(latest_only_arg).strip().lower() in {"1", "true", "yes"}
+        summary = recalculate_selection_scores(source=source, date_record=date_record, limit=limit, force=force, latest_only=latest_only)
+        return api_ok({"summary": summary})
+
+    @app.post("/api/products/pod_cross_category/<product_id>/extract")
+    def create_pod_illustration_task(product_id):
+        user = require_current_user()
+        payload = request.get_json(silent=True) or {}
+        style_prompt = stringify(payload.get("style_prompt")).strip()[:255]
+        force_regenerate = str(payload.get("force") or request.args.get("force") or "").strip().lower() in {"1", "true", "yes"}
+        date_record = stringify(payload.get("date_record") or request.args.get("date_record")).strip()
+        print(
+            f"[POD_EXTRACT] request product_id={product_id} date_record={date_record or '-'} "
+            f"user={user.get('username') or user.get('id')}",
+            flush=True,
+        )
+        meta = SOURCES["pod_cross_category"]
+        where = [f"`{meta['id']}` = %s"]
+        params = [product_id]
+        if date_record:
+            where.append(f"`{meta['date']}` = %s")
+            params.append(date_record)
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT id, `{meta['id']}` AS product_id, `{meta['date']}` AS date_record,
+                       {sql_alias(meta.get("title"), "title")},
+                       {sql_alias(meta.get("image"), "image_value")},
+                       illustration_extractable,
+                       illustration_result_url
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)}
+                ORDER BY `{meta['date']}` DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            product = cursor.fetchone()
+            if not product:
+                print(f"[POD_EXTRACT] product not found product_id={product_id}", flush=True)
+                return api_error("POD商品不存在", 404)
+            if product.get("illustration_extractable") not in {1, "1", True}:
+                print(
+                    f"[POD_EXTRACT] rejected not_extractable product_id={product_id} "
+                    f"extractable={product.get('illustration_extractable')}",
+                    flush=True,
+                )
+                return api_error("该商品未通过插画可提取性判断，不能生成插画", 400)
+            if product.get("illustration_result_url") and not force_regenerate:
+                print(
+                    f"[POD_EXTRACT] already generated product_id={product_id} "
+                    f"url={product.get('illustration_result_url')}",
+                    flush=True,
+                )
+                return api_ok({
+                    "task_id": None,
+                    "status": 2,
+                    "result_image_url": stringify(product.get("illustration_result_url")),
+                    "message": "该商品已有插画结果",
+                })
+            task_id = f"pod_{product_id}_{int(datetime.now().timestamp() * 1000)}"
+            task_date = stringify(product.get("date_record"))
+            image_url = f"/api/products/pod_cross_category/{product_id}/image?date_record={task_date}"
+            print(f"[POD_EXTRACT] create task task_id={task_id} product_id={product_id} date_record={task_date}", flush=True)
+            cursor.execute(
+                """
+                INSERT INTO pod_illustration_task
+                  (task_id, product_id, date_record, user_id, username, style_prompt, original_image_url, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                """,
+                (task_id, product_id, task_date, user.get("id"), user.get("username"), style_prompt, image_url),
+            )
+            cursor.execute(
+                f"""
+                UPDATE `{meta['table']}`
+                SET illustration_status = 1
+                WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                """,
+                (product_id, task_date),
+            )
+            conn.commit()
+        try:
+            print(f"[POD_EXTRACT] calling minimax task_id={task_id}", flush=True)
+            result_url = call_minimax_illustration_generation(
+                product.get("image_value"),
+                product.get("title") or "",
+                style_prompt,
+                task_id,
+            )
+            print('result_',result_url)
+            with db() as conn, conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE pod_illustration_task
+                    SET result_image_url = %s, status = 2, error_msg = NULL
+                    WHERE task_id = %s
+                    """,
+                    (result_url, task_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE pod_cross_category_product
+                    SET illustration_status = 2,
+                        illustration_result_url = %s
+                    WHERE product_id = %s AND date_record = %s
+                    """,
+                    (result_url, product_id, task_date),
+                )
+                conn.commit()
+            print(f"[POD_EXTRACT] success task_id={task_id} result_url={result_url}", flush=True)
+            return api_ok({
+                "task_id": task_id,
+                "status": 2,
+                "result_image_url": result_url,
+                "message": "插画已生成",
+            })
+        except Exception as exc:
+            error_msg = stringify(exc)[:1000]
+            print(f"[POD_EXTRACT] failed task_id={task_id} error={error_msg}", flush=True)
+            with db() as conn, conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE pod_illustration_task
+                    SET status = 3, error_msg = %s
+                    WHERE task_id = %s
+                    """,
+                    (error_msg, task_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE pod_cross_category_product
+                    SET illustration_status = 3
+                    WHERE product_id = %s AND date_record = %s
+                    """,
+                    (product_id, task_date),
+                )
+                conn.commit()
+            return api_error(f"插画生成失败：{error_msg}", 502)
+
+    @app.get("/api/products/pod_cross_category/extract-tasks/<task_id>")
+    def get_pod_illustration_task(task_id):
+        require_current_user()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT task_id, product_id, date_record, style_prompt, original_image_url, result_image_url, status, error_msg, created_at, updated_at
+                FROM pod_illustration_task
+                WHERE task_id = %s
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            task = cursor.fetchone()
+        if not task:
+            return api_error("任务不存在", 404)
+        return api_ok({key: serialize_value(value) for key, value in task.items()})
+
+    @app.post("/api/products/<source>/<product_id>/illustration-check")
+    def check_product_illustration_extractable(source, product_id):
+        require_current_user()
+        source = normalize_source(source)
+        if source != "pod_cross_category":
+            return api_error("插画可提取性判断仅用于 POD 跨品类商品", 400)
+        payload = request.get_json(silent=True) or {}
+        date_record = stringify(payload.get("date_record") or request.args.get("date_record")).strip()
+        meta = SOURCES[source]
+        where = [f"`{meta['id']}` = %s"]
+        params = [product_id]
+        if date_record:
+            where.append(f"`{meta['date']}` = %s")
+            params.append(date_record)
+
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT `{meta['id']}` AS product_id, `{meta['date']}` AS date_record,
+                       {sql_alias(meta.get("title"), "title")},
+                       {sql_alias(meta.get("image"), "image_value")}
+                FROM `{meta['table']}`
+                WHERE {" AND ".join(where)}
+                ORDER BY `{meta['date']}` DESC
+                LIMIT 1
+                """,
+                params,
+            )
+            product = cursor.fetchone()
+            if not product:
+                return api_error("商品不存在", 404)
+            if not product.get("image_value"):
+                return api_error("商品主图为空，无法判断插画可提取性", 422)
+
+            try:
+                result = analyze_illustration_extractability(product.get("image_value"), product.get("title") or "")
+            except Exception as exc:
+                print(f"[MINIMAX_V2] manual check failed product_id={product_id}: {exc}", flush=True)
+                return api_error(f"插画判断服务失败，未写入判断结果：{exc}", 502)
+            extractable = 1 if result.get("can_extract_illustration") else 0
+            reason = stringify(result.get("reason")).strip()[:500]
+            cursor.execute(
+                f"""
+                UPDATE `{meta['table']}`
+                SET illustration_extractable = %s,
+                    illustration_extract_reason = %s
+                WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                """,
+                (extractable, reason, product_id, product.get("date_record")),
+            )
+            conn.commit()
+
+        return api_ok({
+            "product_id": product_id,
+            "date_record": product.get("date_record"),
+            "illustration_extractable": extractable,
+            "illustration_extract_reason": reason,
         })
 
     @app.post("/api/translate-title")
@@ -803,34 +1279,39 @@ def create_app():
             )
             history = list(reversed(cursor.fetchall()))
 
-        context_query = build_expert_context_query(message, history)
-        base_files = merge_expert_base_files(base_files, extract_expert_file_paths(context_query))
-        readonly_context = collect_expert_readonly_context(context_query, base_files)
-        ceo_decision = build_expert_ceo_decision(context_query, readonly_context, image_count)
-        expert_execution = dispatch_expert_handlers(ceo_decision, context_query, readonly_context, base_files, session_id, user["id"])
-        learning_result = build_expert_post_learning(session_id, context_query, ceo_decision, expert_execution)
-        if image_count:
-            readonly_context = (readonly_context + "\n\n" if readonly_context else "") + (
-                f"用户本轮随消息发送了{image_count}张图片。当前后端已接收图片上下文，"
-                "但专家团队视觉识别能力需要接入视觉模型后才能直接读取图片内容。"
-            )
-
-        if "【权限缺口】" in readonly_context:
-            answer = build_permission_required_answer(context_query, readonly_context)
-            validation_result = {"passed": True, "permission_required": True, "retry_count": 0}
-            status = "SUCCESS"
-        else:
-            try:
-                answer = sanitize_expert_team_answer(call_expert_team_ai(user, message, history, project_code, project_context, readonly_context, ceo_decision, expert_execution, learning_result))
-                if readonly_context and is_expert_fake_wait_answer(answer):
-                    answer = build_expert_read_context_answer(message, readonly_context, ceo_decision, expert_execution)
-                answer = ensure_expert_execution_status(answer, ceo_decision, expert_execution)
-                answer, validation_result = validate_and_refine_expert_answer(context_query, answer, ceo_decision, expert_execution)
+        import requests
+        try:
+            java_payload = {
+                "sessionId": str(session_id),
+                "userId": user["id"],
+                "message": message,
+                "context": {
+                    "project_code": project_code,
+                    "project_context": project_context,
+                    "base_files": base_files,
+                    "images": images
+                }
+            }
+            java_res = requests.post("http://localhost:5010/api/agent/chat", json=java_payload, timeout=120)
+            java_json = java_res.json()
+            if java_json.get("code") == 200 and java_json.get("data"):
+                answer = java_json["data"].get("reply") or java_json["data"].get("message") or "专家团队已处理，但未返回文本回复。"
                 status = "SUCCESS"
-            except Exception as exc:
-                answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
-                validation_result = {"passed": False, "fallback": True, "reason": str(exc), "retry_count": 0}
-                status = "FALLBACK"
+                readonly_context = ""
+                ceo_decision = {"note": "Handled by Java Agent (port 5010)"}
+                expert_execution = []
+                learning_result = {}
+                validation_result = {"passed": True}
+            else:
+                raise Exception(f"Java API error: {java_json.get('message', 'Unknown error')}")
+        except Exception as exc:
+            answer = sanitize_expert_team_answer(fallback_expert_team_answer(message, str(exc)))
+            validation_result = {"passed": False, "fallback": True, "reason": str(exc), "retry_count": 0}
+            status = "FALLBACK"
+            readonly_context = ""
+            ceo_decision = {}
+            expert_execution = []
+            learning_result = {}
 
         with db() as conn, conn.cursor() as cursor:
             cursor.execute(
@@ -950,36 +1431,43 @@ def db():
     return pymysql.connect(**DB_CONFIG)
 
 
+def safe_rollback(conn):
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def safe_close(conn):
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 def translate_text_to_chinese(text):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY，无法翻译商品名")
+    api_key = stringify(api_key).strip().removeprefix("Bearer ").strip()
     url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MINIMAX_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是电商商品标题翻译助手。只输出简体中文译文，不要解释。",
-                },
-                {
-                    "role": "user",
-                    "content": f"请把下面的英文商品名翻译成简体中文，保留品牌名、型号和关键规格：\n{text}",
-                },
-            ],
-            "temperature": 0,
-            "stream": False,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
+    payload = {
+        "model": MINIMAX_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是电商商品标题翻译助手。只输出简体中文译文，不要解释。",
+            },
+            {
+                "role": "user",
+                "content": f"请把下面的英文商品名翻译成简体中文，保留品牌名、型号和关键规格：\n{text}",
+            },
+        ],
+        "temperature": 0,
+        "stream": False,
+    }
+    
+    data = call_minimax_api_with_retry(url, api_key, payload, timeout=30)
     try:
         translation = strip_llm_think_blocks(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
@@ -993,32 +1481,25 @@ def translate_general_text_to_chinese(text):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY，无法翻译文本")
+    api_key = stringify(api_key).strip().removeprefix("Bearer ").strip()
     url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MINIMAX_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是电商商品信息翻译助手。只输出简体中文译文，不要解释。保留品牌名、型号、规格、数字和专有名词。",
-                },
-                {
-                    "role": "user",
-                    "content": f"请把下面的商品卖点或商品描述翻译成简体中文，保持分隔符和关键信息清晰：\n{text}",
-                },
-            ],
-            "temperature": 0,
-            "stream": False,
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    data = response.json()
+    payload = {
+        "model": MINIMAX_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是电商商品信息翻译助手。只输出简体中文译文，不要解释。保留品牌名、型号、规格、数字 and 专有名词。",
+            },
+            {
+                "role": "user",
+                "content": f"请把下面的商品卖点或商品描述翻译成简体中文，保持分隔符和关键信息清晰：\n{text}",
+            },
+        ],
+        "temperature": 0,
+        "stream": False,
+    }
+    
+    data = call_minimax_api_with_retry(url, api_key, payload, timeout=30)
     try:
         translation = strip_llm_think_blocks(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
@@ -1035,6 +1516,393 @@ def strip_llm_think_blocks(text):
     cleaned = re.sub(r"^\s*思考[:：][\s\S]*?(?=\n\s*(结论|翻译|译文)[:：]|\Z)", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^\s*(结论|翻译|译文)[:：]\s*", "", cleaned.strip(), flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def normalize_vision_image_url(image_value):
+    value = stringify(image_value).strip()
+    if not value:
+        return ""
+    if value.startswith("data:image/") or value.startswith("http://") or value.startswith("https://"):
+        return value
+    return "data:image/jpeg;base64," + value
+
+
+def decode_image_value(image_value):
+    value = stringify(image_value).strip()
+    if not value:
+        return None
+    if value.startswith("data:image/") and "," in value:
+        value = value.split(",", 1)[1]
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(value, validate=False))).convert("RGB")
+    except Exception:
+        return None
+
+
+def local_illustration_extractability_hint(image_value, title=""):
+    title_text = stringify(title).lower()
+    positive_terms = (
+        "tattoo", "sticker", "skull", "skeleton", "graphic", "print", "printed",
+        "pattern", "illustration", "embroidered", "embroidery", "boho",
+        "bohemian", "dog", "dogs", "animal", "floral", "flower", "halloween",
+        "cartoon", "tribal", "camo", "geometric", "all-over print",
+    )
+    negative_terms = (
+        "plain", "solid", "minimalist", "basic", "ribbed", "knit", "zip",
+        "zipper", "drawstring", "pocket", "pockets", "fleece", "pullover",
+        "oversized", "puffy", "quilted",
+    )
+    has_positive_title = any(term in title_text for term in positive_terms)
+    has_negative_title = any(term in title_text for term in negative_terms)
+    if has_negative_title and not has_positive_title:
+        return None
+    image = decode_image_value(image_value)
+    if image is None:
+        return None
+    gray = image.resize((240, 240)).convert("L")
+    pixels = list(gray.getdata())
+    dark_ratio = sum(1 for value in pixels if value < 85) / len(pixels)
+    edge = gray.filter(ImageFilter.FIND_EDGES)
+    edge_pixels = list(edge.getdata())
+    edge_ratio = sum(1 for value in edge_pixels if value > 45) / len(edge_pixels)
+    if has_positive_title and dark_ratio >= 0.012 and edge_ratio >= 0.025:
+        return {
+            "can_extract_illustration": True,
+            "reason": (
+                "本地兜底判断：标题和主图特征显示商品表面存在可迁移的印花/图案元素，"
+                f"深色图案占比 {dark_ratio:.1%}，边缘密度 {edge_ratio:.1%}。"
+            ),
+        }
+    return None
+
+
+def parse_llm_json_object(raw_text):
+    if not raw_text:
+        return {}
+    text = strip_llm_think_blocks(raw_text)
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end >= start:
+        text = text[start:end + 1]
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+def call_minimax_api_with_retry(url, api_key, payload, timeout=90, max_retries=3):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    last_exc = None
+    session = requests.Session()
+    session.trust_env = False
+    for attempt in range(max_retries):
+        try:
+            response = session.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    raise RuntimeError(f"MiniMax API {url} returned non-JSON response") from exc
+            
+            print(f"[MINIMAX_API] {url} attempt {attempt+1} error {response.status_code}: {response.text}", flush=True)
+            if response.status_code in [429, 500, 502, 503, 504]:
+                time.sleep(2 * (attempt + 1))
+                continue
+            response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"[MINIMAX_API] {url} attempt {attempt+1} network error: {e}", flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+    raise last_exc or RuntimeError(f"MiniMax API {url} failed after {max_retries} attempts")
+
+
+def extract_minimax_message_content(data, context="MiniMax"):
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{context} returned invalid response type: {type(data).__name__}")
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"{context} returned no choices: {stringify(data)[:300]}")
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        raise RuntimeError(f"{context} returned invalid choice: {stringify(first_choice)[:300]}")
+    message = first_choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError(f"{context} returned no message: {stringify(first_choice)[:300]}")
+    content = message.get("content")
+    if content is None:
+        raise RuntimeError(f"{context} returned empty content: {stringify(message)[:300]}")
+    content = stringify(content).strip()
+    if not content:
+        raise RuntimeError(f"{context} returned blank content")
+    return content
+
+
+def analyze_illustration_extractability(image_value, title=""):
+    api_key = resolve_minimax_api_key()
+    if not api_key: raise RuntimeError("缺少 MINIMAX_API_KEY")
+    prompt = {
+        "system": (
+            "你是商品视觉素材提取判断助手。必须结合商品主图和标题判断，"
+            "只输出 JSON，不要输出 Markdown。你只判断图案是否适合提取迁移，"
+            "不判断版权风险。必须按“能否从商品表面剥离出可复用装饰图案”判断，"
+            "不能把商品本体、服装版型、包型结构、拉链、帽绳、口袋、缝线、普通面料纹理当成可提取图案。"
+        ),
+        "user_text": json.dumps(
+            {
+                "task": "判断商品主图里是否存在适合迁移到手机壳设计的可提取图案。",
+                "product": {"title": title or ""},
+                "criteria": [
+                    "返回 true 的前提：商品表面必须有可从商品本体中剥离出来的清晰非品牌装饰图案，例如插画、重复印花、动物/花卉/几何图案、刺绣图案、骷髅/节日图案、明确的大面积装饰印花。",
+                    "即使图片里有人物、模特或真实商品，只要商品表面的装饰图案本身足够清楚，也可以返回 true。",
+                    "返回 false：纯色卫衣/纯色衣服/纯色包、普通商品结构、服装版型、包型结构、拉链、帽绳、口袋、缝线、褶皱、阴影、普通针织/罗纹/绗缝/磨毛/纯面料纹理都不算可提取图案。",
+                    "返回 false：只有品牌 Logo、商标文字、广告文字、商品标签，或图案太小/太糊/被严重遮挡。",
+                    "如果主图看起来只是一个空白或纯色商品，即使标题包含 hoodie、sweatshirt、shirt、bag 等品类词，也必须返回 false。",
+                ],
+                "required_json": {
+                    "can_extract_illustration": "true/false",
+                    "reason": "一句话说明判断依据；如果返回 true，必须点名主图里可剥离的具体图案元素；如果是纯色/结构/面料，返回 false 并说明没有可提取装饰图案",
+                },
+            },
+            ensure_ascii=False,
+        ),
+    }
+    try:
+        content = call_product_vision_minimax(prompt, image_value)
+    except Exception as exc:
+        local_hint = local_illustration_extractability_hint(image_value, title)
+        if local_hint:
+            return local_hint
+        raise RuntimeError(f"插画视觉判断接口调用失败: {exc}") from exc
+    parsed = parse_product_json_response(content)
+    if "can_extract_illustration" not in parsed:
+        raise RuntimeError(f"插画判断服务返回格式异常: {content[:300]}")
+    reason = stringify(parsed.get("reason"))
+    if not parsed.get("can_extract_illustration") and any(
+        marker in reason for marker in ("未提供商品主图", "无法看到图片", "无法查看图片", "未显示商品主图")
+    ):
+        local_hint = local_illustration_extractability_hint(image_value, title)
+        if local_hint:
+            return local_hint
+    
+    return {
+        "can_extract_illustration": bool(parsed.get("can_extract_illustration")),
+        "reason": reason,
+    }
+
+def generate_artwork_description(api_key, image_url):
+    system_prompt = '''角色设定 (Role):
+你现在是一位顶级的数字资产提取专家和高级纹理艺术家。你的任务是敏锐地观察用户上传的产品参考图，并为图像生成模型（如 Midjourney, DALL-E, 或 Stable Diffusion）撰写极其精确的英文提示词（Prompt），目的是将附着在 3D 物品上的平面图案完美剥离出来。
+
+工作流 (Workflow):
+视觉解构： 忽略所有 3D 结构（包的形状、衣服的褶皱、人物、背景、光影）。只盯住“印刷图案”本身。
+细节提取： 准确识别图案的风格、核心元素（如花朵、几何体、Logo）、排列方式（单图居中还是无缝平铺铺满）、精确的颜色组成以及底色。
+排除干扰： 敏锐识别出必须去除的元素（如水印、品牌 Logo、缝线、拉链、反光）。
+输出提示词： 根据以上分析，输出一段用于生成平面资产的英文提示词。
+
+提示词撰写规则 (Rules for Prompt Writing):
+首句定调： 必须以 "A detailed, high-resolution photo of a flat, seamless textile pattern swatch..." 开头。
+详尽描述图案： 用专业的视觉词汇描述提取出的图案细节。
+强化否定指令： 明确指出“不要什么”。
+格式要求： 只输出最终的英文提示词本身，不需要任何解释。'''.strip()
+
+    prompt = {
+        "system": system_prompt,
+        "user_text": "请观察这张图片并直接输出英文提示词（Prompt）。",
+    }
+
+    print(f"[MINIMAX_VISION] Requesting artwork description for image...", flush=True)
+    try:
+        raw_answer = call_product_vision_minimax(prompt, image_url)
+        return stringify(raw_answer).strip()
+    except Exception as exc:
+        print(f"[MINIMAX_VISION] Artwork description error: {exc}", flush=True)
+        raise RuntimeError("无法获取原图的插画描述") from exc
+
+def build_illustration_generation_prompt(artwork_description="", retry_feedback=""):
+    feedback_text = stringify(retry_feedback).strip()
+    feedback_part = f"\nPrevious failed because: {feedback_text[:260]}. Fix this exactly in this attempt." if feedback_text else ""
+    
+    if artwork_description:
+        prompt = artwork_description
+    else:
+        # 这是一个兜底的极简提示词，防止由于某种原因视觉模型没返回内容
+        prompt = "A detailed, high-resolution photo of a flat, seamless textile pattern swatch, precisely extracted from the printed design on the product in the reference image. The output must be a single, flat, repeating tile asset filling the entire square canvas. The texture is that of a scanned fabric sample, completely smooth and devoid of any three-dimensional product contours, creases, hardware, or the product shape itself. Do not generate a new product, model, or scene."
+    
+    # 强制加上基础铁律，防止视觉模型生成的提示词遗漏了“扁平化”和“去产品特征”的要求
+    base_rules = "\nCRITICAL INSTRUCTIONS: The output MUST be a flat 2D asset. It must be completely devoid of 3D contours, creases, hardware, handles, straps, models, shadows, and watermarks. Do NOT generate the product shape (e.g. do not generate a bag or a shirt)."
+    
+    if base_rules not in prompt:
+        prompt += base_rules
+        
+    prompt += feedback_part
+    return prompt[:1450]
+
+
+def image_bytes_to_data_url(image_bytes, mime_type="image/jpeg"):
+    return f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+
+def save_generated_illustration_bytes(image_bytes, task_id):
+    safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", stringify(task_id))[:80] or f"illustration_{int(time.time())}"
+    filename = f"{safe_task_id}.jpeg"
+    GENERATED_ILLUSTRATION_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = GENERATED_ILLUSTRATION_DIR / filename
+    with output_path.open("wb") as handle:
+        handle.write(image_bytes)
+    return f"{GENERATED_ILLUSTRATION_URL_PREFIX}/{filename}"
+
+
+def call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id="illustration", attempt=1):
+    image_file = normalize_vision_image_url(image_file)
+    if not image_file:
+        raise RuntimeError("商品主图为空，无法生成插画")
+    payload = {
+        "model": MINIMAX_IMAGE_MODEL,
+        "prompt": prompt,
+        "aspect_ratio": "1:1",
+        "subject_reference": [
+            {
+                "type": MINIMAX_IMAGE_SUBJECT_TYPE,
+                "image_file": image_file,
+            }
+        ],
+        "response_format": "base64",
+        "n": 1,
+    }
+    print(
+        f"[MINIMAX_IMAGE] request task_id={task_id} attempt={attempt} model={MINIMAX_IMAGE_MODEL} "
+        f"prompt_len={len(prompt)} reference={'url' if image_file.startswith(('http://', 'https://')) else 'base64'}",
+        flush=True,
+    )
+    
+    data = call_minimax_api_with_retry(MINIMAX_IMAGE_GENERATION_URL, api_key, payload, timeout=180)
+    response_data = data.get("data") or {}
+    print(
+        f"[MINIMAX_IMAGE] response task_id={task_id} attempt={attempt} "
+        f"data_keys={list(response_data.keys())}",
+        flush=True,
+    )
+    base64_images = response_data.get("image_base64") or response_data.get("image_base64s") or []
+    url_images = (
+        response_data.get("image_urls")
+        or response_data.get("image_url")
+        or response_data.get("images")
+        or response_data.get("urls")
+        or []
+    )
+    if isinstance(base64_images, str):
+        base64_images = [base64_images]
+    if isinstance(url_images, str):
+        url_images = [url_images]
+
+    image_bytes = b""
+    if base64_images:
+        image_bytes = base64.b64decode(base64_images[0], validate=False)
+    elif url_images:
+        first_url = url_images[0]
+        if isinstance(first_url, dict):
+            first_url = first_url.get("url") or first_url.get("image_url") or first_url.get("image")
+        first_url = stringify(first_url).strip()
+        if not first_url:
+            raise RuntimeError("MiniMax 图生图返回了空图片链接")
+        session = requests.Session()
+        session.trust_env = False
+        image_response = session.get(first_url, timeout=120)
+        image_response.raise_for_status()
+        image_bytes = image_response.content
+    else:
+        error_hint = stringify(data.get("base_resp") or response_data.get("base_resp") or data)[:500]
+        raise RuntimeError(f"MiniMax 图生图未返回图片数据：{error_hint}")
+    return image_bytes
+
+
+def evaluate_generated_illustration(api_key, source_image_file, generated_bytes, task_id="illustration"):
+    generated_image_url = image_bytes_to_data_url(generated_bytes)
+    user_text = "Compare the artwork in Image 2 with the original in Image 1. Return JSON with 'match_score' (0-100) and 'reason'."
+    
+    payload = {
+        "model": MINIMAX_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": source_image_file}},
+                    {"type": "image_url", "image_url": {"url": generated_image_url}}
+                ]
+            }
+        ]
+    }
+    
+    try:
+        data = call_minimax_api_with_retry("https://api.minimax.io/v1/text/chatcompletion_v2", api_key, payload)
+        content = data["choices"][0]["message"]["content"]
+        parsed = parse_llm_json_object(content)
+    except (KeyError, IndexError, TypeError, Exception) as e:
+        print(f"[MINIMAX_V2] Eval Error: {e}", flush=True)
+        # 质检失败时，默认给 0 分
+        parsed = {"match_score": 0, "reason": f"质检接口调用失败: {e}"}
+        
+    score = float(parsed.get("match_score", 0))
+    return {
+        "pass": score >= MINIMAX_ILLUSTRATION_PASS_SCORE,
+        "is_same": score >= 80,
+        "score": score,
+        "feedback": parsed.get("reason", ""),
+    }
+
+def call_minimax_illustration_generation(image_value, title="", style_prompt="", task_id="illustration"):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY，无法调用 MiniMax 图生图")
+    api_key = stringify(api_key).strip().removeprefix("Bearer ").strip()
+    image_file = normalize_vision_image_url(image_value)
+    if not image_file:
+        raise RuntimeError("商品主图为空，无法生成插画")
+
+    # 阶段一：用大模型查看原图，生成详细描述
+    print(f"[MINIMAX_IMAGE_QC] task_id={task_id} generating artwork description...", flush=True)
+    try:
+        artwork_description = generate_artwork_description(api_key, image_file)
+        print(f"image_description task_id={task_id}: {artwork_description}", flush=True)
+    except Exception as e:
+        print(f"[MINIMAX_IMAGE_QC] task_id={task_id} failed to get description: {e}", flush=True)
+        artwork_description = ""
+
+    best_bytes = b""
+    best_score = -1.0
+    best_feedback = ""
+    retry_feedback = ""
+    for attempt in range(1, MINIMAX_ILLUSTRATION_MAX_ATTEMPTS + 1):
+        prompt = build_illustration_generation_prompt(artwork_description, retry_feedback)
+        image_bytes = call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id, attempt)
+        evaluation = evaluate_generated_illustration(api_key, image_file, image_bytes, task_id)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} attempt={attempt} "
+            f"pass={evaluation['pass']} score={evaluation['score']} feedback={evaluation['feedback']}",
+            flush=True,
+        )
+        if evaluation["score"] > best_score:
+            best_score = evaluation["score"]
+            best_bytes = image_bytes
+            best_feedback = evaluation["feedback"]
+        if evaluation["pass"]:
+            return save_generated_illustration_bytes(image_bytes, task_id)
+        retry_feedback = evaluation["feedback"]
+    if best_bytes:
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} all attempts failed, best_score={best_score} "
+            f"feedback={best_feedback}",
+            flush=True,
+        )
+        raise RuntimeError(f"插画生成质检未通过，最佳得分 {best_score:.0f}：{best_feedback}")
+    raise RuntimeError("MiniMax 图生图未生成可保存的图片")
 
 
 TITLE_TRANSLATION_PHRASES = [
@@ -1155,6 +2023,165 @@ def parse_int(value, default=None):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def ensure_pod_cross_category_tables():
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pod_cross_category_product (
+              id BIGINT NOT NULL AUTO_INCREMENT,
+              product_id BIGINT NOT NULL,
+              date_record VARCHAR(10) NOT NULL DEFAULT '',
+              title VARCHAR(500) DEFAULT NULL,
+              rank_sold_count INT DEFAULT NULL,
+              rating DECIMAL(3,2) DEFAULT NULL,
+              region VARCHAR(10) DEFAULT NULL,
+              currency VARCHAR(10) DEFAULT NULL,
+              base_price DECIMAL(10,2) DEFAULT NULL,
+              real_price VARCHAR(50) DEFAULT NULL,
+              original_price VARCHAR(50) DEFAULT NULL,
+              launch_time DATETIME DEFAULT NULL,
+              author_count INT DEFAULT NULL,
+              aweme_count INT DEFAULT NULL,
+              live_count INT DEFAULT NULL,
+              sold_count BIGINT DEFAULT NULL,
+              sale_amount DECIMAL(15,2) DEFAULT NULL,
+              review_count INT DEFAULT NULL,
+              commission_rate VARCHAR(20) DEFAULT NULL,
+              category_l1 VARCHAR(100) DEFAULT NULL,
+              category_l2 VARCHAR(100) DEFAULT NULL,
+              category_l3 VARCHAR(100) DEFAULT NULL,
+              stock_count INT DEFAULT NULL,
+              viral_index INT DEFAULT NULL,
+              popularity_index INT DEFAULT NULL,
+              country_rank VARCHAR(50) DEFAULT NULL,
+              category_rank VARCHAR(50) DEFAULT NULL,
+              region_name VARCHAR(50) DEFAULT NULL,
+              transport_fee VARCHAR(50) DEFAULT NULL,
+              detail_url TEXT DEFAULT NULL,
+              cover_list LONGTEXT DEFAULT NULL,
+              channel_ratio TEXT DEFAULT NULL,
+              channel_gmv_ratio TEXT DEFAULT NULL,
+              content_ratio TEXT DEFAULT NULL,
+              `投放_ratio` TEXT DEFAULT NULL,
+              sales_overview LONGTEXT DEFAULT NULL,
+              fan_distribution LONGTEXT DEFAULT NULL,
+              author_type_distribution LONGTEXT DEFAULT NULL,
+              ad_analysis LONGTEXT DEFAULT NULL,
+              comments TEXT DEFAULT NULL,
+              image_base64 LONGTEXT DEFAULT NULL,
+              overview_7d LONGTEXT DEFAULT NULL,
+              distribution_7d LONGTEXT DEFAULT NULL,
+              overview_90d LONGTEXT DEFAULT NULL,
+              distribution_90d TEXT DEFAULT NULL,
+              overview_180d LONGTEXT DEFAULT NULL,
+              distribution_180d TEXT DEFAULT NULL,
+              ad_analysis_7d LONGTEXT DEFAULT NULL,
+              ad_analysis_90d LONGTEXT DEFAULT NULL,
+              ai_learned INT DEFAULT 0,
+              sku_analysis_7d LONGTEXT DEFAULT NULL,
+              sku_analysis_28d LONGTEXT DEFAULT NULL,
+              selection_score DECIMAL(6,2) DEFAULT NULL,
+              score_reason TEXT DEFAULT NULL,
+              sales_mom DECIMAL(8,2) DEFAULT NULL,
+              illustration_status TINYINT DEFAULT 0,
+              illustration_result_url VARCHAR(512) DEFAULT NULL,
+              score DECIMAL(8,2) DEFAULT NULL,
+              status TINYINT DEFAULT 0,
+              audit_status VARCHAR(20) DEFAULT 'PENDING',
+              ip_grade VARCHAR(10) DEFAULT NULL,
+              ip_reason TEXT DEFAULT NULL,
+              ip_tags LONGTEXT DEFAULT NULL,
+              material_analysis LONGTEXT DEFAULT NULL,
+              ai_analysis_error LONGTEXT DEFAULT NULL,
+              PRIMARY KEY (id),
+              UNIQUE KEY uk_pod_product_date (product_id, date_record),
+              KEY idx_pod_date_score (date_record, score),
+              KEY idx_pod_selection_score_date (date_record, selection_score),
+              KEY idx_pod_sales_mom_date (date_record, sales_mom),
+              KEY idx_pod_illustration_status (illustration_status),
+              KEY idx_pod_date_category_score (date_record, category_l1, category_l2, category_l3, score),
+              KEY idx_pod_status (status),
+              KEY idx_pod_audit_status (audit_status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='POD跨品类选品商品表'
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pod_illustration_task (
+              task_id VARCHAR(64) NOT NULL,
+              product_id BIGINT NOT NULL,
+              date_record VARCHAR(10) DEFAULT '',
+              user_id BIGINT DEFAULT NULL,
+              username VARCHAR(100) DEFAULT NULL,
+              style_prompt VARCHAR(255) DEFAULT NULL,
+              original_image_url VARCHAR(512) DEFAULT NULL,
+              result_image_url VARCHAR(512) DEFAULT NULL,
+              status TINYINT NOT NULL DEFAULT 0,
+              error_msg TEXT DEFAULT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (task_id),
+              KEY idx_pod_task_product (product_id, date_record),
+              KEY idx_pod_task_status (status, updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='POD插画提取任务表'
+            """
+        )
+        cursor.execute("SHOW INDEX FROM pod_cross_category_product")
+        existing_indexes = {row["Key_name"] for row in cursor.fetchall()}
+        if "idx_pod_illustration_queue" not in existing_indexes:
+            cursor.execute(
+                """
+                CREATE INDEX idx_pod_illustration_queue
+                ON pod_cross_category_product(date_record, illustration_extractable, id)
+                """
+            )
+        conn.commit()
+
+
+def ensure_selection_score_columns():
+    field_definitions = {
+        "selection_score": "DECIMAL(6,2) DEFAULT NULL COMMENT '选品综合分'",
+        "score_reason": "TEXT DEFAULT NULL COMMENT '选品打分原因'",
+        "sales_mom": "DECIMAL(8,2) DEFAULT NULL COMMENT '销售环比百分比'",
+        "score_attempts": "TINYINT NOT NULL DEFAULT 0 COMMENT '选品分回算次数'",
+        "score_updated_at": "DATETIME DEFAULT NULL COMMENT '选品分最后回算时间'",
+        "illustration_status": "TINYINT DEFAULT 0 COMMENT '插画提取状态：0待处理 1处理中 2成功 3失败 4废弃'",
+        "illustration_result_url": "VARCHAR(512) DEFAULT NULL COMMENT '插画提取结果图链接'",
+        "illustration_extractable": "TINYINT DEFAULT NULL COMMENT '是否适合提取为手机壳插画：1可提取 0不可提取 NULL未判断'",
+        "illustration_extract_reason": "VARCHAR(500) DEFAULT NULL COMMENT '插画可提取性判断原因'",
+    }
+    index_definitions = {
+        "idx_selection_score_date": "(date_record, selection_score)",
+        "idx_score_queue": "(selection_score, score_attempts, date_record)",
+        "idx_sales_mom_date": "(date_record, sales_mom)",
+        "idx_illustration_status": "(illustration_status)",
+    }
+    tables = sorted({meta["table"] for meta in SOURCES.values()})
+    with db() as conn, conn.cursor() as cursor:
+        for table in tables:
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+                """,
+                (table,),
+            )
+            existing_columns = {row["COLUMN_NAME"] for row in cursor.fetchall()}
+            for field, definition in field_definitions.items():
+                if field not in existing_columns:
+                    cursor.execute(f"ALTER TABLE `{table}` ADD COLUMN `{field}` {definition}")
+                    existing_columns.add(field)
+
+            if SCORE_AUTO_CREATE_INDEXES:
+                cursor.execute(f"SHOW INDEX FROM `{table}`")
+                existing_indexes = {row["Key_name"] for row in cursor.fetchall()}
+                for index_name, index_columns in index_definitions.items():
+                    if index_name not in existing_indexes:
+                        cursor.execute(f"CREATE INDEX `{index_name}` ON `{table}` {index_columns}")
+        conn.commit()
 
 
 def ensure_detail_analysis_table():
@@ -2290,23 +3317,18 @@ def generate_codepatch_plan(decision, message, readonly_context, base_files):
         return {"ok": False, "message": "缺少 MINIMAX_API_KEY，无法生成通用补丁计划。"}
 
     prompt = build_codepatch_planning_prompt(decision, message, readonly_context, base_files)
+    url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
+    payload = {
+        "model": MINIMAX_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是严格的代码补丁规划器，只能输出 JSON，不要输出 markdown、解释或 <think>。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.05,
+        "stream": False,
+    }
     try:
-        response = requests.post(
-            f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": MINIMAX_MODEL,
-                "messages": [
-                    {"role": "system", "content": "你是严格的代码补丁规划器，只能输出 JSON，不要输出 markdown、解释或 <think>。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.05,
-                "stream": False,
-            },
-            timeout=90,
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = call_minimax_api_with_retry(url, api_key, payload, timeout=90)
         raw = data["choices"][0]["message"]["content"]
         plan = parse_codepatch_json(raw)
     except Exception as exc:
@@ -3270,15 +4292,13 @@ def call_expert_team_ai(user, message, history, project_code, project_context, r
         role = "assistant" if item.get("role") == "assistant" else "user"
         messages.append({"role": role, "content": stringify(item.get("content"))})
     messages.append({"role": "user", "content": message})
-    response = requests.post(
-        f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"model": MINIMAX_MODEL, "messages": messages, "temperature": 0.2, "stream": False},
-        timeout=60,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
+    payload = {"model": MINIMAX_MODEL, "messages": messages, "temperature": 0.2, "stream": False}
+    try:
+        data = call_minimax_api_with_retry(url, api_key, payload, timeout=60)
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        return fallback_expert_team_answer(message, str(exc))
 
 
 def sanitize_expert_team_answer(text):
@@ -3524,22 +4544,17 @@ def correct_expert_answer_for_user_experience(original_input, raw_output, reason
     )
 
     try:
-        response = requests.post(
-            f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": MINIMAX_MODEL,
-                "messages": [
-                    {"role": "system", "content": "你是严格的用户体验回复改写器，只输出改写后的最终回复。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-                "stream": False,
-            },
-            timeout=45,
-        )
-        response.raise_for_status()
-        data = response.json()
+        url = f"{MINIMAX_BASE_URL.rstrip('/')}/chat/completions"
+        payload = {
+            "model": MINIMAX_MODEL,
+            "messages": [
+                {"role": "system", "content": "你是严格的用户体验回复改写器，只输出改写后的最终回复。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "stream": False,
+        }
+        data = call_minimax_api_with_retry(url, api_key, payload, timeout=45)
         return sanitize_expert_team_answer(data["choices"][0]["message"]["content"].strip())
     except Exception:
         return build_user_facing_execution_answer(ceo_decision, expert_execution, reasons)
@@ -4424,6 +5439,17 @@ def build_product_select(source, meta):
         "`material_analysis`",
         "`ai_analysis_error`",
         "`launch_time`" if has_launch_time(meta) else "NULL AS launch_time",
+        sql_alias(meta.get("score"), "pod_score"),
+        sql_alias(meta.get("score_reason"), "score_reason"),
+        sql_alias(meta.get("sales_mom"), "pod_sales_mom"),
+        sql_alias(meta.get("status"), "pod_status"),
+        sql_alias(meta.get("illustration_result_url"), "illustration_result_url"),
+        sql_alias(meta.get("illustration_extractable"), "illustration_extractable"),
+        sql_alias(meta.get("illustration_extract_reason"), "illustration_extract_reason"),
+        sql_alias(meta.get("category_l1"), "category_l1"),
+        sql_alias(meta.get("category_l2"), "category_l2"),
+        sql_alias(meta.get("category_l3"), "category_l3"),
+        sql_alias(meta.get("aweme_count"), "aweme_count_view"),
         platform_url_expr,
         image_url_expr,
     ])
@@ -4563,12 +5589,14 @@ def sales_delta_previous_expr():
 
 
 def has_launch_time(meta):
-    return meta["table"] in {"fastmoss_product_aggregate", "fastmoss_product_rank_aggregate"}
+    return meta["table"] in {"fastmoss_product_aggregate", "fastmoss_product_rank_aggregate", "pod_cross_category_product"}
 
 
 def build_filters(meta, args, latest_by_default=False):
     where = ["1=1"]
     params = []
+    if meta.get("table") == "pod_cross_category_product":
+        where.append("illustration_extractable = 1")
     date_start = args.get("date_start")
     date_end = args.get("date_end")
     if latest_by_default and not date_start and not date_end:
@@ -4586,6 +5614,14 @@ def build_filters(meta, args, latest_by_default=False):
     add_number_range_filter(where, params, meta.get("price"), args.get("price_min"), args.get("price_max"))
     add_number_range_filter(where, params, meta.get("base_price"), args.get("base_price_min"), args.get("base_price_max"))
     add_number_range_filter(where, params, meta.get("transport_fee"), args.get("transport_fee_min"), args.get("transport_fee_max"))
+    add_number_range_filter(where, params, meta.get("score"), args.get("score_min"), args.get("score_max"))
+    add_number_range_filter(where, params, meta.get("sales_mom"), args.get("sales_mom_min"), args.get("sales_mom_max"))
+    add_number_range_filter(where, params, meta.get("aweme_count"), args.get("aweme_min"), args.get("aweme_max"))
+    if meta.get("table") == "pod_cross_category_product":
+        add_eq_filter(where, params, meta.get("status"), args.get("pod_status"))
+    add_eq_filter(where, params, meta.get("category_l1"), args.get("category_l1"))
+    add_eq_filter(where, params, meta.get("category_l2"), args.get("category_l2"))
+    add_eq_filter(where, params, meta.get("category_l3"), args.get("category_l3"))
     add_ratio_range_filter(where, params, meta, args, "视频", args.get("video_ratio_min"), args.get("video_ratio_max"), direct_field=meta.get("video_ratio"))
     add_ratio_range_filter(where, params, meta, args, "商品卡", args.get("product_card_ratio_min"), args.get("product_card_ratio_max"), direct_field=meta.get("product_card_ratio"))
     add_range_filter(where, params, "launch_time", args.get("launch_start"), args.get("launch_end")) if has_launch_time(meta) else None
@@ -4665,7 +5701,7 @@ def distribution_index_number_expr(field, index, key):
 
 
 def add_eq_filter(where, params, field, value):
-    if value:
+    if field and value:
         where.append(f"`{field}` = %s")
         params.append(value)
 
@@ -4731,6 +5767,12 @@ def sort_field_expr(meta, sort_by):
         "commission": meta.get("commission"),
         "author_count": meta.get("author_count"),
         "launch_time": "launch_time" if has_launch_time(meta) else None,
+        "score": meta.get("score"),
+        "sales_mom": meta.get("sales_mom"),
+        "aweme_count": meta.get("aweme_count"),
+        "category_l1": meta.get("category_l1"),
+        "category_l2": meta.get("category_l2"),
+        "category_l3": meta.get("category_l3"),
     }
     return qualified_field(meta, fields.get(sort_by or "date_record") or meta["date"])
 
@@ -4762,6 +5804,7 @@ def build_order(meta, sort_by, sort_order, sales_period=None, use_sales_aggregat
         return f"ORDER BY COALESCE({numeric_sql_expr(overview_expr)}, {numeric_sql_expr(raw_field)}) {direction}"
 
     numeric_keys = {"sold", "total_sold", "sale_amount", "rating", "price", "commission", "author_count"}
+    numeric_keys |= {"score", "sales_mom", "aweme_count"}
     if sort_by in numeric_keys:
         # 移除常见非数字符号并转换为 DECIMAL 排序
         return f"ORDER BY {numeric_sql_expr(raw_field)} {direction}"
@@ -4856,6 +5899,20 @@ def normalize_product_row(source, row, sales_period):
         "video_ratio": stringify(video_ratio),
         "product_card_ratio": stringify(product_card_ratio),
         "product_card_ratio_28d": stringify(product_card_ratio_28d),
+        "selection_score": stringify(row.get("pod_score")),
+        "score_reason": row.get("score_reason"),
+        "sales_mom": stringify(row.get("pod_sales_mom")),
+        "illustration_status": row.get("pod_status"),
+        "illustration_result_url": stringify(row.get("illustration_result_url")),
+        "illustration_extractable": row.get("illustration_extractable"),
+        "illustration_extract_reason": stringify(row.get("illustration_extract_reason")),
+        "pod_score": stringify(row.get("pod_score")),
+        "pod_sales_mom": stringify(row.get("pod_sales_mom")),
+        "pod_status": row.get("pod_status"),
+        "category_l1": stringify(row.get("category_l1")),
+        "category_l2": stringify(row.get("category_l2")),
+        "category_l3": stringify(row.get("category_l3")),
+        "aweme_count": stringify(row.get("aweme_count_view")),
         "distribution_7d_chart": chart_7d,
         "distribution_28d_chart": chart_28d,
         "transport_fee": stringify(row.get("transport_fee_view")),
@@ -4871,6 +5928,336 @@ def normalize_product_row(source, row, sales_period):
         "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
         "platform_url": resolve_platform_url(source, row.get("product_id"), row.get("platform_url")),
     }
+
+
+def clean_number(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    text = stringify(value).strip()
+    if not text:
+        return 0.0
+    multiplier = 1.0
+    if "亿" in text:
+        multiplier = 100000000.0
+    elif "万" in text:
+        multiplier = 10000.0
+    text = re.sub(r"[^0-9.\-]", "", text)
+    if not text or text in {"-", ".", "-."}:
+        return 0.0
+    try:
+        return float(text) * multiplier
+    except ValueError:
+        return 0.0
+
+
+def overview_metric_value(row, field, keywords):
+    data = parse_json(row.get(field)) if field else None
+    if not isinstance(data, dict):
+        return 0.0
+    for key, value in data.items():
+        key_text = stringify(key)
+        if "日均" in key_text:
+            continue
+        if any(keyword in key_text for keyword in keywords):
+            return clean_number(value)
+    return 0.0
+
+
+def score_category_key(source, meta, row):
+    for field in (meta.get("category_l3"), meta.get("category_l2"), meta.get("category_l1")):
+        value = row.get(field) if field else None
+        if value:
+            return stringify(value)
+    return source
+
+
+def score_input_from_row(source, meta, row):
+    sales_7d = overview_metric_value(row, meta.get("overview_7d"), ["销量", "sale"])
+    sales_30d = overview_metric_value(row, meta.get("overview_30d"), ["销量", "sale"])
+    if sales_30d <= 0:
+        sales_30d = clean_number(row.get(meta.get("sold"))) or clean_number(row.get(meta.get("total_sold")))
+    if sales_7d <= 0:
+        sales_7d = clean_number(row.get(meta.get("sold"))) if sales_30d <= 0 else min(clean_number(row.get(meta.get("sold"))), sales_30d)
+    video_count = clean_number(row.get(meta.get("aweme_count"))) or clean_number(row.get("aweme_count"))
+    rating = clean_number(row.get(meta.get("rating"))) or 3.5
+    price = clean_number(row.get(meta.get("base_price"))) or clean_number(row.get(meta.get("price")))
+    total_sales = clean_number(row.get(meta.get("total_sold"))) or clean_number(row.get(meta.get("sold")))
+    return {
+        "category_key": score_category_key(source, meta, row),
+        "sales_7d": sales_7d,
+        "sales_30d": sales_30d,
+        "total_sales": total_sales,
+        "video_count": video_count,
+        "rating": rating,
+        "price": price,
+    }
+
+
+def penalty_norm_score(norm, max_points):
+    if norm <= 0:
+        return 0.0
+    norm = max(0.0, min(1.0, float(norm)))
+    # 用户规则的核心是“中段最优”，且各维度不得超过自身满分。
+    # 需求示例给出的惩罚表为：10%=14.6、30%=52、50%=100、70%=80.6、100%=66.8。
+    # 用分段插值严格贴合该表，再乘以维度满分，避免 35 分维度算出 46 分这类超分。
+    curve = [
+        (0.0, 0.0),
+        (0.1, 0.146),
+        (0.3, 0.52),
+        (0.5, 1.0),
+        (0.7, 0.806),
+        (1.0, 0.668),
+    ]
+    for (left_norm, left_score), (right_norm, right_score) in zip(curve, curve[1:]):
+        if norm <= right_norm:
+            span = right_norm - left_norm
+            ratio = 0 if span <= 0 else (norm - left_norm) / span
+            normalized_score = left_score + (right_score - left_score) * ratio
+            return round(max(0.0, min(1.0, normalized_score)) * max_points, 6)
+    return round(curve[-1][1] * max_points, 6)
+
+
+def calculate_selection_score(score_input, benchmark):
+    rating = score_input["rating"] or 3.5
+    price = score_input["price"]
+    sales_30d = score_input["sales_30d"]
+    total_sales = score_input["total_sales"]
+    detail = {
+        "version": "selection_score_v1",
+        "inputs": {
+            "sales_7d": round(score_input["sales_7d"], 2),
+            "sales_30d": round(sales_30d, 2),
+            "total_sales": round(total_sales, 2),
+            "video_count": round(score_input["video_count"], 2),
+            "rating": round(rating, 2),
+            "price": round(price, 2) if price else 0,
+        },
+        "benchmark": {
+            "category_key": score_input.get("category_key"),
+            "max_sales_7d": round(benchmark.get("max_sales_7d") or 0, 2),
+            "max_sales_30d": round(benchmark.get("max_sales_30d") or 0, 2),
+            "max_video_count": round(benchmark.get("max_video_count") or 0, 2),
+        },
+        "components": {},
+        "risk": None,
+        "conclusion": "",
+        "summary": "",
+    }
+
+    def finish_risk(message):
+        detail["risk"] = message
+        detail["conclusion"] = "暂不上架"
+        detail["summary"] = message
+        return 0.0, json.dumps(detail, ensure_ascii=False)
+
+    if rating < 3.0:
+        return finish_risk("评分低于 3.0，触发风控规则，选品分归零。")
+    if price and (price < 1 or price > 100):
+        return finish_risk("价格低于 $1 或高于 $100，触发风控规则，选品分归零。")
+    if sales_30d == 0 and total_sales > 0:
+        return finish_risk("30天销量为 0 但总销量大于 0，疑似数据异常，选品分归零。")
+
+    max_30d = max(benchmark.get("max_sales_30d") or 0, sales_30d)
+    max_7d = max(benchmark.get("max_sales_7d") or 0, score_input["sales_7d"])
+    max_video = max(benchmark.get("max_video_count") or 0, score_input["video_count"])
+    norm_30d = (math.log10(sales_30d + 1) / math.log10(max_30d + 1)) if max_30d > 0 else 0
+    norm_7d = (math.log10(score_input["sales_7d"] + 1) / math.log10(max_7d + 1)) if max_7d > 0 else 0
+    norm_video = (math.log10(score_input["video_count"] + 1) / math.log10(max_video + 1)) if max_video > 0 else 0
+    sales_score = penalty_norm_score(norm_30d, 35)
+    rating_score = (rating / 5) * 25
+    heat_score = penalty_norm_score(norm_video, 25)
+    trend_ratio = (norm_7d / norm_30d) if norm_30d > 0 else 0
+    trend_score = min(1, trend_ratio) * 15
+    total = round(min(100, max(0, sales_score + rating_score + heat_score + trend_score)), 2)
+    if total >= 75:
+        conclusion = "推荐上架"
+    elif total >= 50:
+        conclusion = "观察等待"
+    else:
+        conclusion = "暂不上架"
+    reason = (
+        f"{conclusion}：销量分 {sales_score:.1f}，评分分 {rating_score:.1f}，"
+        f"热度分 {heat_score:.1f}，趋势分 {trend_score:.1f}。"
+    )
+    detail["components"] = {
+        "sales_score": round(sales_score, 2),
+        "rating_score": round(rating_score, 2),
+        "heat_score": round(heat_score, 2),
+        "trend_score": round(trend_score, 2),
+        "norm_30d": round(norm_30d, 4),
+        "norm_7d": round(norm_7d, 4),
+        "norm_video": round(norm_video, 4),
+        "raw_sales_30d_ratio": round((sales_30d / max_30d) if max_30d > 0 else 0, 6),
+        "raw_sales_7d_ratio": round((score_input["sales_7d"] / max_7d) if max_7d > 0 else 0, 6),
+        "raw_video_ratio": round((score_input["video_count"] / max_video) if max_video > 0 else 0, 6),
+        "sales_curve_ratio": round((sales_score / 35) if 35 else 0, 4),
+        "heat_curve_ratio": round((heat_score / 25) if 25 else 0, 4),
+        "trend_curve_ratio": round(min(1, trend_ratio), 4),
+        "trend_ratio": round(trend_ratio, 4),
+    }
+    detail["benchmark"] = {
+        "category_key": score_input.get("category_key"),
+        "max_sales_7d": round(max_7d, 2),
+        "max_sales_30d": round(max_30d, 2),
+        "max_video_count": round(max_video, 2),
+    }
+    detail["conclusion"] = conclusion
+    detail["summary"] = reason
+    return total, json.dumps(detail, ensure_ascii=False)
+
+def score_sales_mom(current_sales, previous_sales):
+    current_sales = clean_number(current_sales)
+    previous_sales = clean_number(previous_sales)
+    if previous_sales <= 0:
+        return 100.0 if current_sales > 0 else 0.0
+    return round(((current_sales - previous_sales) / previous_sales) * 100, 2)
+
+
+def table_column_names(cursor, table):
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
+        """,
+        (table,),
+    )
+    return {row["COLUMN_NAME"] for row in cursor.fetchall()}
+
+
+def build_score_select_sql(meta, columns):
+    selected = ["`id`"]
+    for field in {
+        meta.get("id"),
+        meta.get("date"),
+        meta.get("title"),
+        meta.get("rating"),
+        meta.get("price"),
+        meta.get("base_price"),
+        meta.get("sold"),
+        meta.get("total_sold"),
+        meta.get("overview_7d"),
+        meta.get("overview_30d"),
+        meta.get("category_l1"),
+        meta.get("category_l2"),
+        meta.get("category_l3"),
+        meta.get("aweme_count"),
+        "aweme_count",
+    }:
+        if field and field in columns:
+            selected.append(f"`{field}`")
+    return ", ".join(dict.fromkeys(selected))
+
+
+def recalculate_selection_scores(source=None, date_record=None, limit=None, force=False, latest_only=None):
+    sources = [source] if source else ["unified", "fastmoss", "kalodata", "pod_cross_category"]
+    summary = {}
+    if latest_only is None:
+        latest_only = SCORE_RECALC_LATEST_ONLY
+    with db() as conn, conn.cursor() as cursor:
+        for item_source in sources:
+            try:
+                if item_source not in SOURCES:
+                    continue
+                meta = SOURCES[item_source]
+                columns = table_column_names(cursor, meta["table"])
+                if not {"selection_score", "score_reason", "sales_mom"}.issubset(columns):
+                    continue
+                select_sql = build_score_select_sql(meta, columns)
+                where = ["1=1"]
+                params = []
+                if date_record:
+                    where.append(f"`{meta['date']}` = %s")
+                    params.append(date_record)
+                elif latest_only:
+                    where.append(f"`{meta['date']}` = (SELECT MAX(latest_score_source.`{meta['date']}`) FROM `{meta['table']}` AS latest_score_source)")
+                target_limit = int(limit) if limit else SCORE_DAEMON_BATCH_SIZE
+                queue_order = "`id` ASC"
+                unscored_where = [*where, "(selection_score IS NULL OR selection_score = '')"]
+                safe_select_limit = min(target_limit, 200)
+                cursor.execute(
+                    f"""
+                    SELECT {select_sql}
+                    FROM `{meta['table']}`
+                    WHERE {' AND '.join(unscored_where)}
+                    ORDER BY {queue_order}
+                    LIMIT %s
+                    """,
+                    [*params, safe_select_limit],
+                )
+                rows = list(cursor.fetchall())
+                if len(rows) < target_limit and not force and "score_attempts" in columns:
+                    remaining_limit = min(target_limit - len(rows), 200)
+                    rescored_where = [
+                        *where,
+                        "selection_score IS NOT NULL",
+                        "selection_score <> ''",
+                        "score_attempts < %s",
+                    ]
+                    cursor.execute(
+                        f"""
+                        SELECT {select_sql}
+                        FROM `{meta['table']}`
+                        WHERE {' AND '.join(rescored_where)}
+                        ORDER BY score_attempts ASC, score_updated_at ASC, {queue_order}
+                        LIMIT %s
+                        """,
+                        [*params, SCORE_RECALC_MAX_ATTEMPTS, remaining_limit],
+                    )
+                    rows.extend(list(cursor.fetchall()))
+                elif force and len(rows) < target_limit:
+                    remaining_limit = min(target_limit - len(rows), 200)
+                    cursor.execute(
+                        f"""
+                        SELECT {select_sql}
+                        FROM `{meta['table']}`
+                        WHERE {' AND '.join(where)}
+                        ORDER BY {queue_order}
+                        LIMIT %s
+                        """,
+                        [*params, remaining_limit],
+                    )
+                    seen_ids = {row["id"] for row in rows}
+                    rows.extend([row for row in list(cursor.fetchall()) if row["id"] not in seen_ids])
+                inputs = [(row, score_input_from_row(item_source, meta, row)) for row in rows]
+                benchmarks = {}
+                for _row, score_input in inputs:
+                    bucket = benchmarks.setdefault(score_input["category_key"], {"max_sales_30d": 0, "max_sales_7d": 0, "max_video_count": 0})
+                    bucket["max_sales_30d"] = max(bucket["max_sales_30d"], score_input["sales_30d"])
+                    bucket["max_sales_7d"] = max(bucket["max_sales_7d"], score_input["sales_7d"])
+                    bucket["max_video_count"] = max(bucket["max_video_count"], score_input["video_count"])
+                updated = 0
+                for row, score_input in inputs:
+                    score, reason = calculate_selection_score(score_input, benchmarks.get(score_input["category_key"], {}))
+                    mom = score_sales_mom(score_input["sales_7d"], score_input["sales_30d"] - score_input["sales_7d"])
+                    set_parts = ["selection_score = %s", "score_reason = %s", "sales_mom = %s"]
+                    update_values = [score, reason, mom]
+                    if "score_attempts" in columns:
+                        set_parts.append("score_attempts = LEAST(score_attempts + 1, %s)")
+                        update_values.append(SCORE_RECALC_MAX_ATTEMPTS)
+                    if "score_updated_at" in columns:
+                        set_parts.append("score_updated_at = NOW()")
+                    update_values.append(row["id"])
+                    cursor.execute(
+                        f"""
+                        UPDATE `{meta['table']}`
+                        SET {", ".join(set_parts)}
+                        WHERE `id` = %s
+                        """,
+                        update_values,
+                    )
+                    updated += cursor.rowcount
+                    if updated and updated % 200 == 0:
+                        conn.commit()
+                summary[item_source] = {"scanned": len(rows), "updated": updated}
+                conn.commit()
+            except pymysql.err.OperationalError as exc:
+                safe_rollback(conn)
+                summary[item_source] = {"scanned": 0, "updated": 0, "error": str(exc)}
+                print(f"[SCORE_DAEMON] skip source={item_source} error={exc}", flush=True)
+    return summary
 
 
 def attach_runtime_metrics(cursor, meta, rows, sales_period, collection_start=None, collection_end=None):
@@ -5112,6 +6499,13 @@ def normalize_detail(source, row):
         "ai_analysis_error": parse_json(row.get("ai_analysis_error")),
         "period_fields": build_detail_period_fields(source, row, meta),
         "sku_analysis": build_detail_sku_analysis(row, meta),
+        "illustration_status": row.get("illustration_status"),
+        "illustration_result_url": stringify(row.get("illustration_result_url")),
+        "illustration_extractable": row.get("illustration_extractable"),
+        "illustration_extract_reason": stringify(row.get("illustration_extract_reason")),
+        "selection_score": stringify(row.get("selection_score")),
+        "score_reason": row.get("score_reason"),
+        "sales_mom": stringify(row.get("sales_mom")),
         "raw_fields": raw,
     }
 
@@ -5462,7 +6856,7 @@ def format_metric_number(value):
 
 
 def build_platform_url(source, product_id):
-    if source in {"unified", "fastmoss"}:
+    if source in {"unified", "fastmoss", "pod_cross_category"}:
         return f"https://www.fastmoss.com/zh/e-commerce/detail/{product_id}"
     return build_tiktok_shop_url(product_id)
 
@@ -5496,6 +6890,8 @@ def fetch_ready_links(source):
 def count_material_types(cursor, table, where=None, params=None):
     where = list(where or ["1=1"])
     params = list(params or [])
+    where.append("material_analysis IS NOT NULL")
+    where.append("material_analysis <> ''")
     where.append("JSON_VALID(material_analysis)")
     cursor.execute(
         f"""
@@ -5599,11 +6995,188 @@ def start_ai_daemon_if_enabled():
     )
 
 
+def start_score_daemon_if_enabled():
+    global _score_daemon_started
+    if _score_daemon_started or not SCORE_DAEMON_ENABLED:
+        return
+    if os.getenv("WERKZEUG_RUN_MAIN") == "false":
+        return
+    thread = threading.Thread(target=score_daemon_loop, name="cp-selection-score-daemon", daemon=True)
+    thread.start()
+    _score_daemon_started = True
+    print(
+        f"[SCORE_DAEMON] started batch_size={SCORE_DAEMON_BATCH_SIZE} "
+        f"interval={SCORE_DAEMON_INTERVAL_SECONDS}s "
+        f"latest_only={SCORE_RECALC_LATEST_ONLY} max_attempts={SCORE_RECALC_MAX_ATTEMPTS}",
+        flush=True,
+    )
+
+
+def start_illustration_daemon_if_enabled():
+    global _illustration_daemon_started
+    if _illustration_daemon_started or not ILLUSTRATION_DAEMON_ENABLED:
+        return
+    if os.getenv("WERKZEUG_RUN_MAIN") == "false":
+        return
+    valid_sources = [source for source in ILLUSTRATION_DAEMON_SOURCES if source == "pod_cross_category"]
+    if not valid_sources:
+        print(f"[ILLUSTRATION_DAEMON] no valid sources: {ILLUSTRATION_DAEMON_SOURCES}", flush=True)
+        return
+    thread = threading.Thread(target=illustration_daemon_loop, name="cp-illustration-check-daemon", daemon=True)
+    thread.start()
+    _illustration_daemon_started = True
+    print(
+        f"[ILLUSTRATION_DAEMON] started sources={','.join(valid_sources)} "
+        f"batch_size={ILLUSTRATION_DAEMON_BATCH_SIZE} interval={ILLUSTRATION_DAEMON_INTERVAL_SECONDS}s "
+        f"concurrency={ILLUSTRATION_DAEMON_CONCURRENCY} latest_only={ILLUSTRATION_DAEMON_LATEST_ONLY}",
+        flush=True,
+    )
+
+
+def score_daemon_loop():
+    while True:
+        try:
+            summary = recalculate_selection_scores(limit=SCORE_DAEMON_BATCH_SIZE)
+            print(f"[SCORE_DAEMON] cycle finished summary={summary}", flush=True)
+            record_daily_system_stats(
+                "score_daemon_cycle",
+                {"selection_scored": sum(int(item.get("updated") or 0) for item in summary.values())},
+                summary,
+            )
+        except Exception:
+            print("[SCORE_DAEMON] cycle failed", flush=True)
+            traceback.print_exc()
+        time.sleep(max(30, SCORE_DAEMON_INTERVAL_SECONDS))
+
+
+def illustration_daemon_loop():
+    while True:
+        try:
+            summary = run_illustration_daemon_once()
+            print(f"[ILLUSTRATION_DAEMON] cycle finished summary={summary}", flush=True)
+            record_daily_system_stats(
+                "illustration_daemon_cycle",
+                {"illustration_checked": sum(int(item.get("processed") or 0) for item in summary.values())},
+                summary,
+            )
+        except Exception:
+            print("[ILLUSTRATION_DAEMON] cycle failed", flush=True)
+            traceback.print_exc()
+        time.sleep(max(30, ILLUSTRATION_DAEMON_INTERVAL_SECONDS))
+
+
+def run_illustration_daemon_once():
+    summary = {}
+    for source in ILLUSTRATION_DAEMON_SOURCES:
+        if source != "pod_cross_category":
+            continue
+        keys = fetch_illustration_daemon_product_keys(source, ILLUSTRATION_DAEMON_BATCH_SIZE)
+        processed = 0
+        failed = 0
+        if keys:
+            max_workers = min(ILLUSTRATION_DAEMON_CONCURRENCY, len(keys))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(process_single_illustration_check, source, key) for key in keys]
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            processed += 1
+                        else:
+                            failed += 1
+                    except Exception:
+                        failed += 1
+                        traceback.print_exc()
+        summary[source] = {"queued": len(keys), "processed": processed, "failed": failed}
+    return summary
+
+
+def fetch_illustration_daemon_product_keys(source, limit):
+    meta = SOURCES[source]
+    image_field = meta.get("image")
+    where = [
+        "illustration_extractable IS NULL",
+        f"`{image_field}` IS NOT NULL",
+        f"`{image_field}` <> ''",
+    ]
+    params = []
+    if ILLUSTRATION_DAEMON_LATEST_ONLY:
+        where.append(f"`{meta['date']}` = (SELECT MAX(t2.`{meta['date']}`) FROM `{meta['table']}` t2)")
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT `{meta['id']}` AS product_id, `{meta['date']}` AS date_record
+            FROM `{meta['table']}`
+            WHERE {" AND ".join(where)}
+            ORDER BY `{meta['date']}` DESC, id ASC
+            LIMIT %s
+            """,
+            [*params, limit],
+        )
+        return list(cursor.fetchall())
+
+
+def process_single_illustration_check(source, key):
+    meta = SOURCES[source]
+    product_id = key.get("product_id")
+    date_record = key.get("date_record")
+    try:
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT `{meta['id']}` AS product_id, `{meta['date']}` AS date_record,
+                       {sql_alias(meta.get("title"), "title")},
+                       {sql_alias(meta.get("image"), "image_value")}
+                FROM `{meta['table']}`
+                WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                LIMIT 1
+                """,
+                (product_id, date_record),
+            )
+            product = cursor.fetchone()
+            if not product or not product.get("image_value"):
+                return False
+            result = analyze_illustration_extractability(product.get("image_value"), product.get("title") or "")
+            extractable = 1 if result.get("can_extract_illustration") else 0
+            reason = stringify(result.get("reason")).strip()[:500]
+            cursor.execute(
+                f"""
+                UPDATE `{meta['table']}`
+                SET illustration_extractable = %s,
+                    illustration_extract_reason = %s
+                WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                  AND illustration_extractable IS NULL
+                """,
+                (extractable, reason, product_id, date_record),
+            )
+            conn.commit()
+            print(
+                f"[ILLUSTRATION_DAEMON] checked source={source} product_id={product_id} "
+                f"date_record={date_record} extractable={extractable}",
+                flush=True,
+            )
+            return True
+    except Exception as exc:
+        print(
+            f"[ILLUSTRATION_DAEMON] item failed source={source} product_id={product_id} "
+            f"date_record={date_record} error={exc}",
+            flush=True,
+        )
+        return False
+
+
 def ai_daemon_loop():
     while True:
         try:
-            processed = run_ai_daemon_once()
-            print(f"[AI_DAEMON] cycle finished, processed={processed}", flush=True)
+            summary = run_ai_daemon_once()
+            print(f"[AI_DAEMON] cycle finished summary={summary}", flush=True)
+            record_daily_system_stats(
+                "ai_daemon_cycle",
+                {
+                    "ip_analyzed": sum(int(item.get("ip_analyzed") or 0) for item in summary.values()),
+                    "material_analyzed": sum(int(item.get("material_analyzed") or 0) for item in summary.values()),
+                },
+                summary,
+            )
         except Exception:
             print("[AI_DAEMON] cycle failed", flush=True)
             traceback.print_exc()
@@ -5611,11 +7184,18 @@ def ai_daemon_loop():
 
 
 def run_ai_daemon_once():
-    processed = 0
+    summary = {}
     for source in AI_DAEMON_SOURCES:
         print(f"[AI_DAEMON] fetching source={source}", flush=True)
         keys = fetch_ai_daemon_product_keys(source, AI_DAEMON_ANALYSIS, AI_DAEMON_BATCH_SIZE)
         print(f"[AI_DAEMON] source={source} queued={len(keys)}", flush=True)
+        source_summary = {
+            "queued": len(keys),
+            "processed": 0,
+            "ip_analyzed": 0,
+            "material_analyzed": 0,
+        }
+        summary[source] = source_summary
         if not keys:
             continue
 
@@ -5626,11 +7206,14 @@ def run_ai_daemon_once():
             }
             for future in as_completed(futures):
                 try:
-                    if future.result():
-                        processed += 1
+                    result = future.result()
+                    if result:
+                        source_summary["processed"] += 1
+                        source_summary["ip_analyzed"] += int(result.get("ip_analyzed") or 0)
+                        source_summary["material_analyzed"] += int(result.get("material_analyzed") or 0)
                 except Exception:
                     traceback.print_exc()
-    return processed
+    return summary
 
 
 def process_single_ai_task(source, key):
@@ -5642,23 +7225,33 @@ def process_single_ai_task(source, key):
     return False
 
 
+def ai_analysis_delta(before_state, after_state):
+    return {
+        "ip_analyzed": 1 if is_blank(before_state.get("ip_grade")) and not is_blank(after_state.get("ip_grade")) else 0,
+        "material_analyzed": 1 if is_blank(before_state.get("material_analysis")) and not is_blank(after_state.get("material_analysis")) else 0,
+    }
+
+
 def process_single_ai_task_once(source, key, attempt=1):
     conn = db()
     try:
         with conn.cursor() as cursor:
             cursor.execute(f"SET SESSION innodb_lock_wait_timeout = {AI_DAEMON_LOCK_WAIT_SECONDS}")
             product = load_ai_product(cursor, source, key["product_id"], key["date_record"])
+            before_state = fetch_current_analysis_state(cursor, source, product)
             reused_fields = reuse_existing_product_analysis(cursor, source, product, AI_DAEMON_ANALYSIS)
             if reused_fields:
                 conn.commit()
             if reused_fields and not needs_ai_analysis(cursor, source, product, AI_DAEMON_ANALYSIS):
+                after_state = fetch_current_analysis_state(cursor, source, product)
+                delta = ai_analysis_delta(before_state, after_state)
                 print(
                     f"[AI_DAEMON][{threading.current_thread().name}] reused "
                     f"{','.join(reused_fields)} source={source} "
                     f"product_id={product['product_id']} date_record={product.get('date_record')}",
                     flush=True,
                 )
-                return True
+                return {"processed": True, **delta}
             if not needs_ai_analysis(cursor, source, product, AI_DAEMON_ANALYSIS):
                 print(
                     f"[AI_DAEMON][{threading.current_thread().name}] skip already analyzed "
@@ -5675,10 +7268,12 @@ def process_single_ai_task_once(source, key, attempt=1):
                 flush=True,
             )
             run_ai_product_flow(cursor, source, product, AI_DAEMON_ANALYSIS, AI_DAEMON_WRITE)
+            after_state = fetch_current_analysis_state(cursor, source, product)
+            delta = ai_analysis_delta(before_state, after_state)
             conn.commit()
-            return True
+            return {"processed": True, **delta}
     except pymysql.err.OperationalError as exc:
-        conn.rollback()
+        safe_rollback(conn)
         if exc.args and exc.args[0] == 1205:
             if attempt < AI_DAEMON_LOCK_RETRIES:
                 print(
@@ -5704,7 +7299,7 @@ def process_single_ai_task_once(source, key, attempt=1):
         traceback.print_exc()
         return False
     except Exception:
-        conn.rollback()
+        safe_rollback(conn)
         print(
             f"[AI_DAEMON][{threading.current_thread().name}] item failed "
             f"source={source} product_id={key.get('product_id')} "
@@ -5714,7 +7309,7 @@ def process_single_ai_task_once(source, key, attempt=1):
         traceback.print_exc()
         return False
     finally:
-        conn.close()
+        safe_close(conn)
 
 
 def reuse_existing_product_analysis(cursor, source, product, analysis):
@@ -5876,17 +7471,33 @@ def fetch_ai_daemon_product_keys(source, analysis, limit):
         params.append(latest_date)
 
     if analysis == "both":
-        where.append(
-            "("
-            "material_analysis IS NULL OR material_analysis = '' "
-            "OR ip_grade IS NULL OR ip_grade = ''"
-            ")"
-        )
-    elif analysis == "material":
-        where.append("(material_analysis IS NULL OR material_analysis = '')")
-    else:
-        where.append("(ip_grade IS NULL OR ip_grade = '')")
+        keys = []
+        seen = set()
+        with db() as conn, conn.cursor() as cursor:
+            for condition in [
+                "(ip_grade IS NULL OR ip_grade = '')",
+                "(material_analysis IS NULL OR material_analysis = '')",
+            ]:
+                remaining = limit - len(keys)
+                if remaining <= 0:
+                    break
+                for row in query_ai_daemon_product_keys(cursor, table, id_field, date_field, where, params, condition, remaining):
+                    key = (str(row.get("product_id")), str(row.get("date_record")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    keys.append(row)
+                    if len(keys) >= limit:
+                        break
+        return keys
 
+    condition = "(material_analysis IS NULL OR material_analysis = '')" if analysis == "material" else "(ip_grade IS NULL OR ip_grade = '')"
+    with db() as conn, conn.cursor() as cursor:
+        return query_ai_daemon_product_keys(cursor, table, id_field, date_field, where, params, condition, limit)
+
+
+def query_ai_daemon_product_keys(cursor, table, id_field, date_field, base_where, base_params, condition, limit):
+    where = [*base_where, condition]
     sql = f"""
         SELECT `{id_field}` AS product_id, `{date_field}` AS date_record
         FROM `{table}`
@@ -5894,9 +7505,8 @@ def fetch_ai_daemon_product_keys(source, analysis, limit):
         ORDER BY `id` DESC
         LIMIT %s
     """
-    with db() as conn, conn.cursor() as cursor:
-        cursor.execute(sql, [*params, limit])
-        return cursor.fetchall()
+    cursor.execute(sql, [*base_params, limit])
+    return list(cursor.fetchall())
 
 
 def fetch_ai_daemon_latest_date(meta):
@@ -5911,6 +7521,8 @@ app = create_app()
 
 if __name__ == "__main__":
     start_ai_daemon_if_enabled()
+    start_score_daemon_if_enabled()
+    start_illustration_daemon_if_enabled()
     debug_enabled = os.getenv("FLASK_DEBUG", "true").strip().lower() == "true"
     app.run(
         host="0.0.0.0",

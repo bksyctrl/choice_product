@@ -1,0 +1,9 @@
+package com.ecommerce.workflow.delegate.mapper;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.ecommerce.workflow.delegate.entity.SubAgentTask;
+import org.apache.ibatis.annotations.Mapper;
+
+// @Mapper // Temporarily disabled due to MyBatis-Plus compatibility issue with Spring Boot 3.x
+public interface SubAgentTaskMapper extends BaseMapper<SubAgentTask> {
+}

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>选品审核平台</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.1.9">
+  <link rel="stylesheet" href="/static/styles.css?v=1.2.0">
 </head>
 <body>
   <div class="app hidden" id="appShell">
@@ -21,6 +21,7 @@
         <button class="active" data-source="unified">统一表</button>
         <button data-source="fastmoss">fastmoss</button>
         <button data-source="kalodata">kalodata</button>
+        <button data-source="pod_cross_category">跨品类数据</button>
       </nav>
       <nav class="source-nav utility-nav">
         <button id="detailAnalysisNav" type="button">深度分析</button>
@@ -76,7 +77,18 @@
         </label>
         <label>材质细分<input id="materialCategories" placeholder="TPU,硅胶"></label>
         <label>排除材质<input id="excludeMaterialCategories" placeholder="钢化膜,贴纸"></label>
-        <label>排序<select id="sortBy"><option value="product_card_sales">商品卡销量</option><option value="total_sold">总销量</option><option value="sales_growth">销售环比</option><option value="product_card_ratio">商品卡占比</option><option value="launch_time">上架时间</option><option value="rating">评分</option><option value="ip_grade">IP等级</option></select></label>
+        <label id="topPodStatusFilter" class="pod-only-filter hidden">
+          POD状态
+          <select id="topPodStatus">
+            <option value="">全部</option>
+            <option value="0">待处理</option>
+            <option value="1">提取中</option>
+            <option value="2">已提取</option>
+            <option value="3">提取失败</option>
+            <option value="4">已废弃</option>
+          </select>
+        </label>
+        <label>排序<select id="sortBy"><option value="product_card_sales">商品卡销量</option><option value="score">选品分</option><option value="total_sold">总销量</option><option value="sales_mom">POD销售环比</option><option value="sales_growth">销售环比</option><option value="product_card_ratio">商品卡占比</option><option value="launch_time">上架时间</option><option value="rating">评分</option><option value="ip_grade">IP等级</option></select></label>
         <button id="topSearchBtn" class="primary">查询</button>
       </section>
 
@@ -110,6 +122,10 @@
     <div class="dialog-head"><h3>商品图片</h3><button id="closeImage">关闭</button></div>
     <img id="largeImage" class="large-image" src="" alt="">
   </dialog>
+  <dialog id="scoreDialog">
+    <div class="dialog-head"><h3>选品分明细</h3><button id="closeScoreDialog" type="button">关闭</button></div>
+    <div id="scoreDialogBody" class="score-dialog-body"></div>
+  </dialog>
   <dialog id="filterDialog" class="filter-dialog">
     <div class="dialog-head"><h3>添加筛选条件</h3><button id="closeFilterDialog" type="button">关闭</button></div>
     <div id="filterOptions" class="filter-options"></div>
@@ -119,7 +135,7 @@
   <script>
     const state = { source: 'unified', mode: 'products', currentUser: null, detailAnalysisType: 'ip', expertSessionId: null, expertSessions: [], expertMessages: [], expertImages: [], expertBaseFiles: defaultExpertBaseFiles().join('\n'), view: 'table', page: 1, pageSize: 30, total: 0, items: [], periodLabel: '近7天', sortBy: 'product_card_sales', sortOrder: 'desc' };
     const statusText = { PENDING: '待选中', REVIEWING: '待复核', READY: '待上架', PUBLISHED: '已上架', OTHER: '其他' };
-    const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata' };
+    const sourceText = { unified: '统一表', fastmoss: 'fastmoss', kalodata: 'kalodata', pod_cross_category: '跨品类数据' };
     const $ = (id) => document.getElementById(id);
     const filterDefinitions = [
       { key: 'dateRecord', label: '采集日期', type: 'dateRange', startId: 'dateStart', endId: 'dateEnd', startLabel: '采集开始', endLabel: '采集结束' },
@@ -133,6 +149,8 @@
       { key: 'rating', label: '评分', type: 'range', minId: 'ratingMin', maxId: 'ratingMax', placeholderMin: '最低评分', placeholderMax: '最高评分' },
       { key: 'price', label: '售价范围', type: 'range', minId: 'priceMin', maxId: 'priceMax', placeholderMin: '最低售价', placeholderMax: '最高售价' },
       { key: 'basePrice', label: '定价范围', type: 'range', minId: 'basePriceMin', maxId: 'basePriceMax', placeholderMin: '最低定价', placeholderMax: '最高定价' },
+      { key: 'podScore', label: 'POD综合分', type: 'range', minId: 'scoreMin', maxId: 'scoreMax', placeholderMin: '最低分', placeholderMax: '最高分' },
+      { key: 'podSalesMom', label: '销售环比', type: 'range', minId: 'salesMomMin', maxId: 'salesMomMax', suffix: '%', placeholderMin: '最低环比', placeholderMax: '最高环比' },
       {
         key: 'auditStatus',
         label: '商品状态',
@@ -145,6 +163,20 @@
           ['READY', '待上架'],
           ['PUBLISHED', '已上架'],
           ['OTHER', '其他'],
+        ],
+      },
+      {
+        key: 'podStatus',
+        label: 'POD状态',
+        type: 'select',
+        id: 'podStatus',
+        options: [
+          ['', '全部'],
+          ['0', '待处理'],
+          ['1', '提取中'],
+          ['2', '已提取'],
+          ['3', '提取失败'],
+          ['4', '已废弃'],
         ],
       },
     ];
@@ -160,6 +192,9 @@
       priceMin: 'price_min', priceMax: 'price_max', commissionMin: 'commission_min', commissionMax: 'commission_max',
       authorMin: 'author_min', authorMax: 'author_max', ratingMin: 'rating_min', ratingMax: 'rating_max',
       basePriceMin: 'base_price_min', basePriceMax: 'base_price_max',
+      scoreMin: 'score_min', scoreMax: 'score_max', salesMomMin: 'sales_mom_min', salesMomMax: 'sales_mom_max',
+      podStatus: 'pod_status',
+      topPodStatus: 'pod_status',
       transportFeeMin: 'transport_fee_min', transportFeeMax: 'transport_fee_max',
       productCardRatioMin: 'product_card_ratio_min', productCardRatioMax: 'product_card_ratio_max',
       videoRatioMin: 'video_ratio_min', videoRatioMax: 'video_ratio_max',
@@ -176,6 +211,7 @@
         const canUseExpertTeam = ['admin', 'manager'].includes(String(user.role || '').toLowerCase());
         $('expertTeamNav').classList.toggle('hidden', !canUseExpertTeam);
         $('appShell').classList.remove('hidden');
+        syncPodTopFilters();
         await loadDefaultDateAndData();
       } catch (error) {
         const next = encodeURIComponent(`${location.pathname}${location.search}`);
@@ -187,6 +223,10 @@
       state.mode = 'products';
       state.source = btn.dataset.source;
       state.page = 1;
+      state.sortBy = state.source === 'pod_cross_category' ? 'score' : 'product_card_sales';
+      state.sortOrder = 'desc';
+      $('sortBy').value = state.sortBy;
+      syncPodTopFilters();
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       btn.classList.add('active');
       $('detailAnalysisNav').classList.remove('active');
@@ -208,6 +248,15 @@
 
     function canUseExpertTeam() {
       return ['admin', 'manager'].includes(String(state.currentUser?.role || '').toLowerCase());
+    }
+
+    function syncPodTopFilters() {
+      const isPod = state.source === 'pod_cross_category';
+      $('topPodStatusFilter').classList.toggle('hidden', !isPod);
+      if (!isPod) {
+        $('topPodStatus').value = '';
+        delete filterValues.topPodStatus;
+      }
     }
 
     function openDetailAnalysisWorkspace(type = state.detailAnalysisType || 'ip') {
@@ -577,6 +626,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
     $('topSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
     $('sortBy').addEventListener('change', () => { state.sortBy = $('sortBy').value; state.page = 1; loadProducts(); });
+    $('topPodStatus').addEventListener('change', () => { state.page = 1; loadAll(); });
     $('resetFiltersBtn').addEventListener('click', resetFilters);
     $('logoutBtn').addEventListener('click', logout);
     $('pageSize').addEventListener('change', () => { state.pageSize = Number($('pageSize').value); state.page = 1; loadProducts(); });
@@ -585,6 +635,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     $('copyReadyBtn').addEventListener('click', copyReadyLinks);
     $('closeDetail').addEventListener('click', () => $('detailDialog').close());
     $('closeImage').addEventListener('click', () => $('imageDialog').close());
+    $('closeScoreDialog').addEventListener('click', () => $('scoreDialog').close());
     initCustomFilters();
 
     function renderDetailAnalysisPage(items = [], loading = true) {
@@ -897,16 +948,25 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadProducts() {
-      const res = await fetch(`/api/products?${buildParams()}`);
-      const json = await res.json();
-      if (!json.ok) return showToast(json.error || '加载失败');
-      state.items = json.data.items || [];
-      state.total = json.data.total;
-      state.period = json.data.period;
-      state.periodLabel = json.data.period_label || '近7天';
-      $('periodHint').textContent = `${collectionDateHint()}，周期指标按${state.periodLabel}展示`;
-      renderItems();
-      renderPager();
+      $('content').innerHTML = '<div style="text-align: center; padding: 100px;"><div style="border: 4px solid #f3f3f3; border-top: 4px solid #007bff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto;"></div><p style="margin-top:15px; color: #666; font-size: 14px;">数据加载中，请稍候...</p></div><style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>';
+      try {
+        const res = await fetch(`/api/products?${buildParams()}`);
+        const json = await res.json();
+        if (!json.ok) {
+          $('content').innerHTML = '<div class="empty">加载失败</div>';
+          return showToast(json.error || '加载失败');
+        }
+        state.items = json.data.items || [];
+        state.total = json.data.total;
+        state.period = json.data.period;
+        state.periodLabel = json.data.period_label || '近7天';
+        $('periodHint').textContent = `${collectionDateHint()}，周期指标按${state.periodLabel}展示`;
+        renderItems();
+        renderPager();
+      } catch (error) {
+        $('content').innerHTML = '<div class="empty">网络请求失败，请稍后重试</div>';
+        showToast('网络请求失败');
+      }
     }
 
     function dedupeLatestItems(items) {
@@ -939,6 +999,19 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       const json = await res.json();
       if (!json.ok) return;
       const data = json.data;
+      if (state.source === 'pod_cross_category') {
+        const pod = data.pod_statuses || {};
+        const cards = [
+          ['全部商品', data.total || 0],
+          ['待处理', pod['0'] || 0],
+          ['提取中', pod['1'] || 0],
+          ['已提取', pod['2'] || 0],
+          ['提取失败', pod['3'] || 0],
+          ['已废弃', pod['4'] || 0],
+        ];
+        $('stats').innerHTML = cards.map(([label, value]) => `<div class="stat"><span>${label}</span><strong>${value}</strong></div>`).join('');
+        return;
+      }
       const cards = [
         ['待选中', data.statuses.PENDING || 0], ['待复核', data.statuses.REVIEWING || 0],
         ['待上架', data.statuses.READY || 0], ['已上架', data.statuses.PUBLISHED || 0],
@@ -955,8 +1028,12 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     function renderTable() {
+      if (state.source === 'pod_cross_category') {
+        renderPodTable();
+        return;
+      }
       $('content').innerHTML = `<div class="table-wrap"><table><thead><tr>
-        <th>商品图</th><th>商品标题</th><th>${sortHeader('product_card_sales', '商品卡销量')}</th><th>近7天销量占比</th><th>近28天销量占比</th>
+        <th>商品图</th><th>商品标题</th><th>${sortHeader('score', '选品分')}</th><th>${sortHeader('product_card_sales', '商品卡销量')}</th><th>近7天销量占比</th><th>近28天销量占比</th>
         <th>${sortHeader('total_sold', '总销量')}</th><th class="metric-header">${sortHeader('sales_growth', '销售环比')}<span class="metric-hint" title="销售环比 = ((当前销量 / 上期销量) - 1) * 100%。当前销量按所选采集日期范围求和，上期销量取前一段同等数量的采集日期；上期销量为0时展示N/A。">?</span></th>
         <th>${sortHeader('product_card_ratio', '商品卡占比')}</th><th>${sortHeader('launch_time', '上架时间')}</th><th>${sortHeader('rating', '评分')}</th><th>${sortHeader('ip_grade', 'IP等级')}</th>
         <th>材质标签</th><th>当前状态</th><th>链接</th><th>详情</th>
@@ -965,15 +1042,145 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       bindSortHeaders();
     }
 
+    function renderPodTable() {
+      $('content').innerHTML = `<div class="table-wrap"><table><thead><tr>
+        <th>商品图</th><th>商品标题</th><th>类目</th><th>${sortHeader('score', 'POD综合分')}</th>
+        <th>${sortHeader('sold', '当前销量')}</th><th>${sortHeader('total_sold', '累计销量')}</th><th>${sortHeader('sales_mom', '销售环比')}</th>
+        <th>${sortHeader('rating', '评分')}</th><th>${sortHeader('aweme_count', '视频数')}</th><th>${sortHeader('launch_time', '上架时间')}</th>
+        <th>POD状态</th><th>链接</th><th>操作</th>
+      </tr></thead><tbody>${state.items.map(podRowTemplate).join('')}</tbody></table></div>`;
+      bindRowActions();
+      bindSortHeaders();
+      bindPodActions();
+    }
+
+    function podRowTemplate(item) {
+      return `<tr>
+        <td><button class="image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img class="thumb" src="${item.image_url}" alt=""></button></td>
+        <td class="title-cell">${productTitleCell(item)}</td>
+        <td>${escapeHtml([item.category_l1, item.category_l2, item.category_l3].filter(Boolean).join(' / ') || 'N/A')}</td>
+        <td>${selectionScoreBadge(item.selection_score || item.pod_score, item)}</td>
+        <td>${escapeHtml(item.sold_count)}</td>
+        <td>${escapeHtml(item.total_sold_count)}</td>
+        <td>${escapeHtml(item.pod_sales_mom || 'N/A')}${item.pod_sales_mom ? '%' : ''}</td>
+        <td>${escapeHtml(item.rating)}</td>
+        <td>${escapeHtml(item.aweme_count || '0')}</td>
+        <td>${escapeHtml(item.launch_time)}</td>
+        <td>${illustrationStatusBadge(item.illustration_status ?? item.pod_status, item.illustration_result_url, item.illustration_extractable)}${illustrationExtractabilityBadge(item)}${illustrationCheckButton(item)}</td>
+        <td>${platformLinks(item)}</td>
+        <td class="pod-actions"><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button>${podExtractButton(item)}</td>
+      </tr>`;
+    }
+
+    function selectionScoreBadge(value, item = null) {
+      if (value === null || value === undefined || String(value).trim() === '') {
+        return '<span class="pod-score muted">未评分</span>';
+      }
+      const score = Number(value);
+      if (!Number.isFinite(score)) return '<span class="pod-score muted">未评分</span>';
+      const cls = score >= 75 ? 'high' : (score >= 50 ? 'mid' : 'low');
+      const detailButton = item
+        ? `<button type="button" class="score-detail-link" data-score-detail="${escapeHtml(item.product_id)}" data-date="${escapeHtml(item.date_record || '')}">明细</button>`
+        : '';
+      return `<span class="score-cell"><span class="pod-score ${cls}">${score.toFixed(2)}</span>${detailButton}</span>`;
+    }
+
+    function podScoreBadge(value) {
+      if (value === null || value === undefined || String(value).trim() === '') {
+        return '<span class="pod-score muted">未评分</span>';
+      }
+      const score = Number(value);
+      if (!Number.isFinite(score)) return '<span class="pod-score muted">未评分</span>';
+      const cls = score >= 75 ? 'high' : (score >= 50 ? 'mid' : 'low');
+      return `<span class="pod-score ${cls}">${score.toFixed(2)}</span>`;
+    }
+
+    function illustrationStatusBadge(value, resultUrl, extractable = null) {
+      const hasExtractableArg = arguments.length >= 3;
+      const extractableText = extractable === null || extractable === undefined ? '' : String(extractable).trim();
+      const isUnjudged = hasExtractableArg && extractableText === '';
+      const status = isUnjudged ? 0 : Number(value ?? 0);
+      const html = podStatusBadge(status);
+      if (status === 2 && resultUrl) {
+        return `${html}<a class="illustration-result-link" href="${escapeHtml(resultUrl)}" target="_blank" rel="noreferrer">结果图</a>`;
+      }
+      return html;
+    }
+
+    function illustrationExtractabilityBadge(item) {
+      const value = item?.illustration_extractable;
+      const reason = item?.illustration_extract_reason || '';
+      if (value === null || value === undefined || String(value).trim() === '') {
+        return '<span class="illustration-extract-badge pending">未判断</span>';
+      }
+      const canExtract = Number(value) === 1;
+      const label = canExtract ? '可提取' : '不可提取';
+      const cls = canExtract ? 'yes' : 'no';
+      const title = reason ? ` title="${escapeHtml(reason)}"` : '';
+      return `<span class="illustration-extract-badge ${cls}"${title}>${label}</span>`;
+    }
+
+    function illustrationCheckButton(item) {
+      return '';
+    }
+
+    function podStatusBadge(value) {
+      const map = {
+        0: ['待处理', 'pending'],
+        1: ['提取中', 'processing'],
+        2: ['已提取', 'done'],
+        3: ['提取失败', 'failed'],
+        4: ['已废弃', 'discarded'],
+      };
+      const [label, cls] = map[Number(value ?? 0)] || map[0];
+      return `<span class="pod-status ${cls}">${label}</span>`;
+    }
+
+    function podExtractButton(item) {
+      if (Number(item.illustration_extractable) !== 1) return '';
+      const status = Number(item.illustration_status ?? item.pod_status ?? 0);
+      if (status === 1) return '<button type="button" disabled>提取中...</button>';
+      if (status === 2) return `<button type="button" data-pod-extract="${escapeHtml(item.product_id)}" data-date="${escapeHtml(item.date_record || '')}">重新提取</button>`;
+      if (status === 4) return '';
+      const label = status === 3 ? '重试提取' : '提取插画';
+      return `<button type="button" data-pod-extract="${escapeHtml(item.product_id)}" data-date="${escapeHtml(item.date_record || '')}">${label}</button>`;
+    }
+
+    function bindPodActions() {
+      document.querySelectorAll('[data-pod-extract]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const productId = btn.dataset.podExtract;
+          const dateRecord = btn.dataset.date || '';
+          btn.disabled = true;
+          btn.textContent = '提交中...';
+          try {
+            const res = await fetch(`/api/products/pod_cross_category/${encodeURIComponent(productId)}/extract`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ date_record: dateRecord, style_prompt: 'POD视觉素材提取', force: true }),
+            });
+            const json = await res.json();
+            if (!json.ok) throw new Error(json.error || '任务提交失败');
+            showToast(json.data?.message || '插画提取任务已创建');
+            loadAll();
+          } catch (error) {
+            btn.disabled = false;
+            btn.textContent = '提取插画';
+            showToast(error.message || '任务提交失败');
+          }
+        });
+      });
+    }
+
     function rowTemplate(item) {
       return `<tr>
         <td><button class="image-button" data-image="${item.image_url}" data-title="${escapeHtml(item.title)}"><img class="thumb" src="${item.image_url}" alt=""></button></td>
         <td class="title-cell">${productTitleCell(item)}</td>
-        <td>${escapeHtml(item.product_card_sales)}</td><td>${salesSharePie(item.distribution_7d_chart)}</td><td>${salesSharePie(item.distribution_28d_chart)}</td>
+        <td>${selectionScoreBadge(item.selection_score || item.pod_score, item)}</td><td>${escapeHtml(item.product_card_sales)}</td><td>${salesSharePie(item.distribution_7d_chart)}</td><td>${salesSharePie(item.distribution_28d_chart)}</td>
         <td>${escapeHtml(item.total_sold_count)}</td><td>${escapeHtml(item.sales_growth)}</td><td>${escapeHtml(item.product_card_ratio_28d || item.product_card_ratio)}</td>
         <td>${escapeHtml(item.launch_time)}</td><td>${escapeHtml(item.rating)}</td><td>${gradeBadge(item.ip_grade, item)}</td>
         <td>${materialBadge(item)}${reasonPreview('材质判断原因', item.material_reason)}</td>
-        <td>${statusSelect(item)}</td><td>${platformLinks(item)}</td>
+        <td>${illustrationStatusBadge(item.illustration_status, item.illustration_result_url)}${statusSelect(item)}</td><td>${platformLinks(item)}</td>
         <td><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button></td>
       </tr>`;
     }
@@ -1045,6 +1252,8 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       document.querySelectorAll('[data-detail]').forEach(btn => btn.addEventListener('click', () => openDetail(btn.dataset.detail, btn.dataset.date)));
       document.querySelectorAll('[data-image]').forEach(btn => btn.addEventListener('click', () => openImage(btn.dataset.image, btn.dataset.title)));
       document.querySelectorAll('[data-reason-title]').forEach(btn => btn.addEventListener('click', () => openReason(btn.dataset.reasonTitle, btn.dataset.reasonText, btn.dataset.productTitle, btn.dataset.ipGrade, btn.dataset.productId, btn.dataset.dateRecord, btn.dataset.source)));
+      document.querySelectorAll('[data-score-detail]').forEach(btn => btn.addEventListener('click', () => openScoreDetail(btn.dataset.scoreDetail, btn.dataset.date)));
+      document.querySelectorAll('[data-illustration-check]').forEach(btn => btn.addEventListener('click', () => checkIllustrationExtractability(btn)));
       document.querySelectorAll('[data-status-product]').forEach(select => select.addEventListener('change', () => updateStatus(select)));
       document.querySelectorAll('[data-product-title]').forEach(el => {
         el.addEventListener('mouseenter', () => showProductTitleTooltip(el));
@@ -1063,10 +1272,199 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       }));
     }
 
+    async function checkIllustrationExtractability(btn) {
+      const productId = btn.dataset.illustrationCheck;
+      const dateRecord = btn.dataset.date || '';
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = '判断中...';
+      try {
+        const res = await fetch(`/api/products/${state.source}/${encodeURIComponent(productId)}/illustration-check`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ date_record: dateRecord }),
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || '插画判断失败');
+        const data = json.data || {};
+        const applyResult = item => {
+          if (!item) return;
+          item.illustration_extractable = data.illustration_extractable;
+          item.illustration_extract_reason = data.illustration_extract_reason;
+        };
+        state.items
+          .filter(item => String(item.product_id) === String(productId) && String(item.date_record || '') === String(dateRecord || ''))
+          .forEach(applyResult);
+        if (currentDetailItem && String(currentDetailItem.product_id) === String(productId)) {
+          applyResult(currentDetailItem);
+          renderDetailDialog();
+        }
+        showToast(json.data?.illustration_extract_reason || '插画判断已完成');
+        loadProducts();
+      } catch (error) {
+        btn.disabled = false;
+        btn.textContent = oldText;
+        showToast(error.message || '插画判断失败');
+      }
+    }
+
     function openImage(src, title) {
       $('largeImage').src = src;
       $('largeImage').alt = title || '商品图片';
       $('imageDialog').showModal();
+    }
+
+    function openScoreDetail(productId, dateRecord) {
+      const item = state.items.find(row => String(row.product_id) === String(productId) && String(row.date_record || '') === String(dateRecord || ''))
+        || state.items.find(row => String(row.product_id) === String(productId))
+        || currentDetailItem;
+      if (!item) return showToast('未找到该商品的评分数据');
+      $('scoreDialogBody').innerHTML = scoreDetailHtml(item);
+      bindScoreFormulaHelp($('scoreDialogBody'));
+      $('scoreDialog').showModal();
+    }
+
+    function parseScoreDetail(item) {
+      const rawReason = item?.score_reason || item?.pod_score_reason || '';
+      const score = Number(item?.selection_score ?? item?.pod_score);
+      let detail = {};
+      if (rawReason && String(rawReason).trim().startsWith('{')) {
+        detail = parseMaybeJson(rawReason) || {};
+      }
+      const components = detail.components || {};
+      const inputs = detail.inputs || {};
+      const benchmark = detail.benchmark || {};
+      return {
+        score: Number.isFinite(score) ? score : 0,
+        summary: detail.summary || (rawReason && !String(rawReason).trim().startsWith('{') ? rawReason : ''),
+        conclusion: detail.conclusion || scoreConclusion(score),
+        risk: detail.risk || '',
+        components,
+        inputs,
+        benchmark,
+      };
+    }
+
+    function scoreSummaryText(item) {
+      const detail = parseScoreDetail(item);
+      return detail.summary || detail.conclusion || '';
+    }
+
+    function scoreConclusion(score) {
+      const value = Number(score);
+      if (!Number.isFinite(value)) return '未评分';
+      if (value >= 75) return '推荐上架';
+      if (value >= 50) return '观察等待';
+      return '暂不上架';
+    }
+
+    function scoreDetailHtml(item) {
+      const detail = parseScoreDetail(item);
+      const c = detail.components || {};
+      const inputs = detail.inputs || {};
+      const benchmark = detail.benchmark || {};
+      const summary = detail.summary || '暂无评分原因明细，建议重新执行选品分回算后查看完整拆解。';
+      const rawSales30Ratio = finiteOr(c.raw_sales_30d_ratio, safeRatio(inputs.sales_30d, benchmark.max_sales_30d));
+      const rawVideoRatio = finiteOr(c.raw_video_ratio, safeRatio(inputs.video_count, benchmark.max_video_count));
+      const salesCurveRatio = finiteOr(c.sales_curve_ratio, safeRatio(c.sales_score, 35));
+      const heatCurveRatio = finiteOr(c.heat_curve_ratio, safeRatio(c.heat_score, 25));
+      const trendCurveRatio = finiteOr(c.trend_curve_ratio, Math.min(1, Number(c.trend_ratio) || 0));
+      return `<section class="score-detail-panel">
+        <div class="score-detail-summary">
+          <div>
+            <span>综合得分</span>
+            <strong>${formatScoreNumber(detail.score)}</strong>
+          </div>
+          <div>
+            <span>推荐结论</span>
+            <strong>${escapeHtml(detail.conclusion || scoreConclusion(detail.score))}</strong>
+          </div>
+        </div>
+        <p>${escapeHtml(summary)}</p>
+        ${detail.risk ? `<div class="score-risk">风控命中：${escapeHtml(detail.risk)}</div>` : ''}
+        <div class="score-breakdown-grid">
+          ${scorePartCard('销量分', c.sales_score, 35, [
+            ['30天销量', formatScoreNumber(inputs.sales_30d)],
+            ['类目最大30天销量', formatScoreNumber(benchmark.max_sales_30d)],
+            ['原始销量占比', formatPercentNumber(rawSales30Ratio)],
+            ['log归一化结果', formatScoreNumber(c.norm_30d)],
+            ['曲线得分比例', formatPercentNumber(salesCurveRatio)]
+          ], scoreFormulaText('sales'))}
+          ${scorePartCard('评分分', c.rating_score, 25, [
+            ['商品评分', `${formatScoreNumber(inputs.rating)} / 5`],
+            ['评分得分比例', formatPercentNumber(safeRatio(c.rating_score, 25))]
+          ], scoreFormulaText('rating'))}
+          ${scorePartCard('热度分', c.heat_score, 25, [
+            ['视频数', formatScoreNumber(inputs.video_count)],
+            ['类目最大视频数', formatScoreNumber(benchmark.max_video_count)],
+            ['原始视频占比', formatPercentNumber(rawVideoRatio)],
+            ['log归一化结果', formatScoreNumber(c.norm_video)],
+            ['曲线得分比例', formatPercentNumber(heatCurveRatio)]
+          ], scoreFormulaText('heat'))}
+          ${scorePartCard('趋势分', c.trend_score, 15, [
+            ['7天销量', formatScoreNumber(inputs.sales_7d)],
+            ['7天log归一化', formatScoreNumber(c.norm_7d)],
+            ['30天log归一化', formatScoreNumber(c.norm_30d)],
+            ['趋势比', formatScoreNumber(c.trend_ratio)],
+            ['封顶后比例', formatPercentNumber(trendCurveRatio)]
+          ], scoreFormulaText('trend'))}
+        </div>
+        <div class="score-detail-kv">
+          <div><span>价格</span><strong>${formatScoreNumber(inputs.price)}</strong></div>
+          <div><span>总销量</span><strong>${formatScoreNumber(inputs.total_sales)}</strong></div>
+          <div><span>类目基准</span><strong>${escapeHtml(benchmark.category_key || '未分组')}</strong></div>
+          <div><span>归一化说明</span><strong>分数使用 log 归一化，不是直接用原始销量占比。</strong></div>
+        </div>
+      </section>`;
+    }
+
+    function scorePartCard(label, value, max, rows, formula) {
+      const numeric = Number(value);
+      const safeValue = Number.isFinite(numeric) ? numeric : 0;
+      const percent = max > 0 ? Math.max(0, Math.min(100, (safeValue / max) * 100)) : 0;
+      return `<div class="score-part-card">
+        <div class="score-part-head">
+          <span>${escapeHtml(label)}${formula ? `<button type="button" class="score-formula-help" data-score-formula="${escapeHtml(formula)}" aria-label="查看评分公式">?</button>` : ''}</span>
+          <strong>${formatScoreNumber(safeValue)} / ${max}</strong>
+        </div>
+        <div class="score-part-track"><i style="width:${percent.toFixed(2)}%"></i></div>
+        <div class="score-param-list">${(Array.isArray(rows) ? rows : []).map(([name, rowValue]) => `<div><span>${escapeHtml(name)}</span><strong>${escapeHtml(rowValue)}</strong></div>`).join('')}</div>
+        <div class="score-formula-popover" hidden></div>
+      </div>`;
+    }
+
+    function scoreFormulaText(type) {
+      const formulas = {
+        sales: '销量分：norm30d = log10(30天销量+1) / log10(类目最大30天销量+1)；penalty = |norm30d - 0.5| × 0.67；销量分 = norm30d × (1 - penalty) × 2 × 35。当前系统会按维度满分封顶，避免超过35分。',
+        rating: '评分分：评分分 = (评分 / 5) × 25；无评分时按3.5计算。',
+        heat: '热度分：normVideo = log10(视频数+1) / log10(类目最大视频数+1)；penalty = |normVideo - 0.5| × 0.67；热度分 = normVideo × (1 - penalty) × 2 × 25。当前系统会按维度满分封顶，避免超过25分。',
+        trend: '趋势分：norm7d = log10(7天销量+1) / log10(类目最大7天销量+1)；ratio = norm7d / norm30d；趋势分 = min(1, ratio) × 15。',
+      };
+      return formulas[type] || '';
+    }
+
+    function formatScoreNumber(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return '--';
+      return Number.isInteger(number) ? String(number) : number.toFixed(2);
+    }
+
+    function formatPercentNumber(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return '--';
+      return `${(number * 100).toFixed(2)}%`;
+    }
+
+    function safeRatio(value, base) {
+      const left = Number(value);
+      const right = Number(base);
+      if (!Number.isFinite(left) || !Number.isFinite(right) || right <= 0) return NaN;
+      return left / right;
+    }
+
+    function finiteOr(value, fallback) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
     }
 
     let currentDetailItem = null;
@@ -1117,7 +1515,29 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
         $('detailDialog').close();
         openDetailAnalysisWorkspace(btn.dataset.openDetailAnalysis || state.detailAnalysisType);
       }));
+      document.querySelectorAll('[data-illustration-check]').forEach(btn => btn.addEventListener('click', () => checkIllustrationExtractability(btn)));
       document.querySelectorAll('[data-translate-selling-points]').forEach(btn => btn.addEventListener('click', () => translateSellingPoints(btn)));
+      bindScoreFormulaHelp($('detailBody'));
+    }
+
+    function bindScoreFormulaHelp(root = document) {
+      root.querySelectorAll('[data-score-formula]').forEach(btn => {
+        if (btn.dataset.boundFormula === '1') return;
+        btn.dataset.boundFormula = '1';
+        btn.addEventListener('click', event => {
+          event.preventDefault();
+          event.stopPropagation();
+          const card = btn.closest('.score-part-card');
+          const box = card?.querySelector('.score-formula-popover');
+          if (!box) return;
+          const shouldShow = box.hidden;
+          root.querySelectorAll('.score-formula-popover').forEach(item => { item.hidden = true; });
+          if (shouldShow) {
+            box.textContent = btn.dataset.scoreFormula || '';
+            box.hidden = false;
+          }
+        });
+      });
     }
 
     function openReason(title, text, productTitle = '', grade = '', productId = '', dateRecord = '', source = '') {
@@ -1185,6 +1605,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
               ${materialSummaryBadge(item.material_analysis)}
             </div>
             <div class="detail-metric-grid">${metricItems.map(([label, value]) => detailMetricCard(label, value)).join('')}</div>
+            ${scoreDecisionSection(item)}
           </section>
         </div>
         ${(attributesText || sellingPointsText) ? `<section class="detail-section detail-extra-info">
@@ -1227,6 +1648,29 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
           <pre>${escapeHtml(JSON.stringify(raw, null, 2))}</pre>
         </details>
       </section>`;
+    }
+
+    function scoreDecisionSection(item) {
+      const score = Number(item.selection_score ?? item.pod_score);
+      const scoreHtml = Number.isFinite(score) ? selectionScoreBadge(score) : '<span class="pod-score muted">未评分</span>';
+      const mom = detailValue(item.sales_mom, item.pod_sales_mom);
+      const reason = scoreSummaryText(item);
+      const illustration = illustrationStatusBadge(item.illustration_status ?? item.pod_status, item.illustration_result_url, item.illustration_extractable);
+      const isPodSource = item.source === 'pod_cross_category';
+      const extractable = isPodSource ? illustrationExtractabilityBadge(item) : '';
+      const checkButton = isPodSource ? illustrationCheckButton(item) : '';
+      const result = item.illustration_result_url ? `<a href="${escapeHtml(item.illustration_result_url)}" target="_blank" rel="noreferrer">查看插画结果</a>` : '';
+      return `<div class="score-decision-panel">
+        <div><span>选品分</span>${scoreHtml}</div>
+        <div><span>销售环比</span><strong>${escapeHtml(mom ? `${mom}%` : 'N/A')}</strong></div>
+        <div><span>插画状态</span>${illustration}${result}</div>
+        ${isPodSource ? `<div><span>插画判断</span>${extractable}${checkButton}</div>` : ''}
+        ${reason ? `<p>${escapeHtml(reason)}</p>` : ''}
+        <details class="score-detail-toggle">
+          <summary>查看评分明细</summary>
+          ${scoreDetailHtml(item)}
+        </details>
+      </div>`;
     }
 
     function detailMetricCard(label, value) {

@@ -413,10 +413,15 @@
           })
         });
         const json = await res.json();
+        const payload = json.data || {};
+        const returnedSessionId = payload.data?.sessionId || payload.sessionId;
+        if (returnedSessionId) {
+          $('sessionId').value = returnedSessionId;
+        }
         messages.pop();
         messages.push({
           role: 'assistant',
-          content: json.message || json.error || '专家团队没有返回内容'
+          content: payload.message || payload.reply || json.message || json.error || payload.error || '专家团队没有返回内容'
         });
       } catch (error) {
         messages.pop();

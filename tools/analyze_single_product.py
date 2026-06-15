@@ -4,10 +4,13 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 from decimal import Decimal
 from datetime import datetime
 
 import pymysql
+import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -23,6 +26,9 @@ DB_CONFIG = {
     "database": "ecommerce_workflow",
     "charset": "utf8mb4",
     "cursorclass": pymysql.cursors.DictCursor,
+    "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
+    "read_timeout": int(os.getenv("DB_READ_TIMEOUT", "20")),
+    "write_timeout": int(os.getenv("DB_WRITE_TIMEOUT", "20")),
 }
 
 MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
@@ -32,6 +38,7 @@ PROMPT_VERSION = "single_product_v1"
 MAX_LOG_TEXT_LENGTH = 120000
 IP_RULE_KEYWORD_HIT_THRESHOLD = float(os.getenv("IP_RULE_KEYWORD_HIT_THRESHOLD", "0.3"))
 IP_RULE_RECALL_MAX_RULES = max(1, int(os.getenv("IP_RULE_RECALL_MAX_RULES", "80")))
+REFERENCE_CACHE_TTL_SECONDS = max(30, int(os.getenv("AI_REFERENCE_CACHE_TTL_SECONDS", "300")))
 UNKNOWN_IP_SOURCE_MARKERS = (
     "unknown",
     "not identified",
@@ -109,6 +116,45 @@ def connect_db():
     return pymysql.connect(**DB_CONFIG)
 
 
+_REFERENCE_CACHE = {}
+_REFERENCE_CACHE_LOCK = threading.Lock()
+
+
+def _cache_key(name, analysis_type, limit=None):
+    return (name, analysis_type, limit)
+
+
+def _get_cached_reference(name, analysis_type, limit=None):
+    key = _cache_key(name, analysis_type, limit)
+    with _REFERENCE_CACHE_LOCK:
+        cached = _REFERENCE_CACHE.get(key)
+        if not cached:
+            return None
+        if time.time() - cached["loaded_at"] > REFERENCE_CACHE_TTL_SECONDS:
+            return None
+        return [dict(row) for row in cached["rows"]]
+
+
+def _set_cached_reference(name, analysis_type, rows, limit=None):
+    key = _cache_key(name, analysis_type, limit)
+    safe_rows = [dict(row) for row in rows]
+    with _REFERENCE_CACHE_LOCK:
+        _REFERENCE_CACHE[key] = {
+            "loaded_at": time.time(),
+            "rows": safe_rows,
+        }
+    return [dict(row) for row in safe_rows]
+
+
+def _get_stale_reference(name, analysis_type, limit=None):
+    key = _cache_key(name, analysis_type, limit)
+    with _REFERENCE_CACHE_LOCK:
+        cached = _REFERENCE_CACHE.get(key)
+        if not cached:
+            return []
+        return [dict(row) for row in cached["rows"]]
+
+
 def json_dumps(data):
     def default(obj):
         if isinstance(obj, Decimal):
@@ -162,7 +208,10 @@ def compact_request_for_log(request_payload):
 
 def resolve_minimax_api_key():
     if MINIMAX_API_KEY:
-        return MINIMAX_API_KEY
+        return str(MINIMAX_API_KEY).strip().removeprefix("Bearer ").strip()
+    env_key = os.getenv("MINIMAX_API_KEY") or os.getenv("minimax_api_key") or ""
+    if env_key:
+        return str(env_key).strip().removeprefix("Bearer ").strip()
     test_file = os.path.join(os.getcwd(), "test.py")
     if not os.path.exists(test_file):
         return ""
@@ -172,7 +221,7 @@ def resolve_minimax_api_key():
         with open(test_file, "r", encoding="utf-8") as file:
             text = file.read()
         match = re.search(r"api_key\s*=\s*['\"]([^'\"]+)['\"]", text)
-        return match.group(1).strip() if match else ""
+        return match.group(1).strip().removeprefix("Bearer ").strip() if match else ""
     except Exception:
         return ""
 
@@ -252,39 +301,67 @@ def load_product(cursor, source, product_id=None, date_record=None):
 
 
 def load_rules(cursor, analysis_type):
-    if analysis_type == "IP":
-        cursor.execute(
-            """
-            SELECT rule_code, rule_name, ip_grade, ip_type, keywords, image_description, rule_reason
-            FROM cp_ai_ip_rule
-            WHERE enabled = 1
-            ORDER BY id
-            """
+    cached = _get_cached_reference("rules", analysis_type)
+    if cached is not None:
+        return cached
+
+    try:
+        with connect_db() as conn, conn.cursor() as readonly_cursor:
+            if analysis_type == "IP":
+                readonly_cursor.execute(
+                    """
+                    SELECT rule_code, rule_name, ip_grade, ip_type, keywords, image_description, rule_reason
+                    FROM cp_ai_ip_rule
+                    WHERE enabled = 1
+                    ORDER BY id
+                    """
+                )
+            else:
+                readonly_cursor.execute(
+                    """
+                    SELECT rule_code, rule_name, material_type, material_category, keywords, image_description, rule_reason
+                    FROM cp_ai_material_rule
+                    WHERE enabled = 1
+                    ORDER BY id
+                    """
+                )
+            return _set_cached_reference("rules", analysis_type, readonly_cursor.fetchall())
+    except pymysql.err.MySQLError as exc:
+        stale = _get_stale_reference("rules", analysis_type)
+        print(
+            f"[AI_REFERENCE] load_rules failed analysis_type={analysis_type}, "
+            f"fallback_rows={len(stale)} error={exc}",
+            flush=True,
         )
-    else:
-        cursor.execute(
-            """
-            SELECT rule_code, rule_name, material_type, material_category, keywords, image_description, rule_reason
-            FROM cp_ai_material_rule
-            WHERE enabled = 1
-            ORDER BY id
-            """
-        )
-    return cursor.fetchall()
+        return stale
 
 
 def load_experiences(cursor, analysis_type, limit=20):
-    cursor.execute(
-        """
-        SELECT experience_type, result_summary, matched_rules, reason, match_score
-        FROM cp_ai_analysis_experience
-        WHERE enabled = 1 AND analysis_type = %s
-        ORDER BY updated_at DESC, id DESC
-        LIMIT %s
-        """,
-        (analysis_type, limit),
-    )
-    return cursor.fetchall()
+    cached = _get_cached_reference("experiences", analysis_type, limit)
+    if cached is not None:
+        return cached
+
+    try:
+        with connect_db() as conn, conn.cursor() as readonly_cursor:
+            readonly_cursor.execute(
+                """
+                SELECT experience_type, result_summary, matched_rules, reason, match_score
+                FROM cp_ai_analysis_experience
+                WHERE enabled = 1 AND analysis_type = %s
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %s
+                """,
+                (analysis_type, limit),
+            )
+            return _set_cached_reference("experiences", analysis_type, readonly_cursor.fetchall(), limit)
+    except pymysql.err.MySQLError as exc:
+        stale = _get_stale_reference("experiences", analysis_type, limit)
+        print(
+            f"[AI_REFERENCE] load_experiences failed analysis_type={analysis_type}, "
+            f"fallback_rows={len(stale)} error={exc}",
+            flush=True,
+        )
+        return stale
 
 
 def recall_ip_rules_by_keyword_hit(product, rules, threshold=IP_RULE_KEYWORD_HIT_THRESHOLD, max_rules=IP_RULE_RECALL_MAX_RULES):
@@ -643,7 +720,11 @@ def call_minimax(prompt, image_value):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY 环境变量，无法调用 MiniMax。")
-    client = OpenAI(base_url=MINIMAX_BASE_URL, api_key=api_key)
+    client = OpenAI(
+        base_url=MINIMAX_BASE_URL,
+        api_key=api_key,
+        http_client=httpx.Client(trust_env=False),
+    )
     image_url = normalize_image_data(image_value)
     response = client.chat.completions.create(
         model=MINIMAX_MODEL,

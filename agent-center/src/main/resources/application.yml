@@ -4,18 +4,74 @@ server:
 spring:
   application:
     name: choice-product-agent-center
+  
   datasource:
     url: jdbc:mysql://${DB_HOST:192.168.0.168}:${DB_PORT:3306}/${DB_NAME:ecommerce_workflow}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: ${DB_USER:ITaimysql}
     password: ${DB_PASSWORD:Ai12345678@}
     driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      minimum-idle: 5
+      maximum-pool-size: 20
 
-agent:
-  llm:
-    base-url: ${MINIMAX_BASE_URL:https://api.minimax.io/v1}
-    api-key: ${MINIMAX_API_KEY:${minimax_api_key:}}
-    model: ${MINIMAX_MODEL:MiniMax-M2.7}
-  decision:
-    confidence-threshold: ${AGENT_CONFIDENCE_THRESHOLD:0.6}
-  rag:
-    top-k: ${AGENT_RAG_TOP_K:5}
+  data:
+    redis:
+      host: ${REDIS_HOST:192.168.0.168}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:Ai123456789@}
+      database: 0
+
+  rabbitmq:
+    host: ${MQ_HOST:192.168.0.168}
+    port: ${MQ_PORT:5672}
+    username: ${MQ_USERNAME:ITaimysql}
+    password: ${MQ_PASSWORD:Ai12345678@}
+    virtual-host: /
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.ecommerce.workflow.entity
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# AI API Configuration
+ai:
+  providers:
+    - name: MiniMax AI
+      type: LLM
+      base-url: ${MINIMAX_BASE_URL:https://api.minimax.chat}
+      api-key: ${MINIMAX_API_KEY:sk-cp-9hCfHirB-HE_Fhe2sk7OVc97UKoQXwrREGlPoRGarWJm2f8_SSf-KBelZlsNbSkqkxT2YNT0y3KtVWDaa7nQnkhgE01gq_4o1SZ-GvH8Revt-O-8OkYHcdg}
+      default-model: ${MINIMAX_MODEL:abab6.5g-chat}
+      models: abab6.5s-chat,abab6.5g-chat,abab6.5t-chat
+      priority: 10
+      enabled: true
+      timeout-ms: 120000
+      capabilities: chat,code,creative,translation,math,analysis
+      extra-params: '{"chatEndpoint":"/v1/chat/completions","authHeaderFormat":"bearer"}'
+
+# MinIO Configuration
+minio:
+  endpoint: ${MINIO_ENDPOINT:http://192.168.0.168:9000}
+  access-key: ${MINIO_ACCESS_KEY:minioadmin}
+  secret-key: ${MINIO_SECRET_KEY:minioadmin}
+  bucket-name: ecommerce-media
+
+# Milvus Configuration
+milvus:
+  host: 192.168.0.168
+  port: 19530
+  database: ecommerce_workflow
+
+rag:
+  top-k: 5
+
+logging:
+  level:
+    root: INFO
+    com.ecommerce.workflow: DEBUG
