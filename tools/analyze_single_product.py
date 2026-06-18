@@ -1,6 +1,7 @@
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import pymysql
 import httpx
 from openai import OpenAI
 from dotenv import load_dotenv
+from PIL import Image
 
 
 load_dotenv()
@@ -33,7 +35,9 @@ DB_CONFIG = {
 
 MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY") or os.getenv("minimax_api_key") or ""
-MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-Text-01")
+MINIMAX_VISION_MAX_RETRIES = max(1, int(os.getenv("MINIMAX_VISION_MAX_RETRIES", "5")))
+MINIMAX_VISION_RATE_LIMIT_SLEEP_SECONDS = max(1, int(os.getenv("MINIMAX_VISION_RATE_LIMIT_SLEEP_SECONDS", "10")))
 PROMPT_VERSION = "single_product_v1"
 MAX_LOG_TEXT_LENGTH = 120000
 IP_RULE_KEYWORD_HIT_THRESHOLD = float(os.getenv("IP_RULE_KEYWORD_HIT_THRESHOLD", "0.3"))
@@ -230,11 +234,20 @@ def normalize_image_data(image_value):
     if not image_value:
         return ""
     image_value = str(image_value).strip()
-    if image_value.startswith("data:image/"):
-        return image_value
     if image_value.startswith("http://") or image_value.startswith("https://"):
         return image_value
-    return "data:image/jpeg;base64," + image_value
+    raw_value = image_value
+    if image_value.startswith("data:image/") and "," in image_value:
+        raw_value = image_value.split(",", 1)[1]
+    try:
+        image = Image.open(io.BytesIO(base64.b64decode(raw_value, validate=False))).convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=92)
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except Exception:
+        if image_value.startswith("data:image/"):
+            return image_value
+        return "data:image/jpeg;base64," + image_value
 
 
 def image_digest(image_value):
@@ -720,28 +733,45 @@ def call_minimax(prompt, image_value):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY 环境变量，无法调用 MiniMax。")
-    client = OpenAI(
-        base_url=MINIMAX_BASE_URL,
-        api_key=api_key,
-        http_client=httpx.Client(trust_env=False),
-    )
     image_url = normalize_image_data(image_value)
-    response = client.chat.completions.create(
-        model=MINIMAX_MODEL,
-        messages=[
-            {"role": "system", "content": prompt["system"]},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt["user_text"]},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+    last_error = None
+    for attempt in range(1, MINIMAX_VISION_MAX_RETRIES + 1):
+        try:
+            client = OpenAI(
+                base_url=MINIMAX_BASE_URL,
+                api_key=api_key,
+                http_client=httpx.Client(trust_env=False),
+            )
+            response = client.chat.completions.create(
+                model=MINIMAX_MODEL,
+                messages=[
+                    {"role": "system", "content": prompt["system"]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt["user_text"]},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    },
                 ],
-            },
-        ],
-        temperature=0,
-        stream=False,
-    )
-    return response.choices[0].message.content
+                temperature=0,
+                stream=False,
+            )
+            return response.choices[0].message.content
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            is_rate_limited = "429" in error_text or "rate_limit" in error_text or "rate limit" in error_text.lower()
+            if not is_rate_limited or attempt >= MINIMAX_VISION_MAX_RETRIES:
+                raise
+            sleep_seconds = min(60, MINIMAX_VISION_RATE_LIMIT_SLEEP_SECONDS * (2 ** (attempt - 1)))
+            print(
+                f"[MINIMAX_VISION] rate limited attempt={attempt}/{MINIMAX_VISION_MAX_RETRIES} "
+                f"sleep={sleep_seconds}s error={error_text[:180]}",
+                flush=True,
+            )
+            time.sleep(sleep_seconds)
+    raise RuntimeError(f"MiniMax 视觉接口重试失败: {last_error}")
 
 
 def parse_json_response(raw):

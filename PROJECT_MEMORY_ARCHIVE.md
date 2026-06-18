@@ -1370,6 +1370,162 @@ AI_DAEMON 超时结论：
 - 验证方式：
   - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
   - 结果：通过。
+
+补充修正（2026-06-15，MiniMax 视觉模型默认值修正并端到端自测）：
+- 问题表现：
+  - `image_description` 多次返回“没有看到图片”。
+  - 质检多次返回“未检测到图像数据”。
+  - 图生图接口本身可以返回 `image_base64`，但第一阶段描述和第三阶段质检无法稳定看图。
+- 根因：
+  - 项目默认 `MINIMAX_MODEL` 为 `MiniMax-M2.7`。
+  - 对同一张 base64 商品图直接测试 `/chat/completions` 后确认：`MiniMax-M2.7`、`image_url` object、`image_url` string、`image_base64` 三种入参都回复“没有看到图片”。
+  - 同样图片切换到 `MiniMax-Text-01` 后可以识别图像，例如识别出灰色卫衣、黑猫、女巫帽和南瓜。
+  - 因此问题不是数据库没图，也不是 base64 格式错误，而是视觉描述/质检用错了不看图的模型。
+- 代码修复：
+  - `tools/analyze_single_product.py` 中 `MINIMAX_MODEL` 默认值从 `MiniMax-M2.7` 改为 `MiniMax-Text-01`。
+  - 该改动影响复用 `call_product_vision_minimax()` 的 IP/材质分析、POD 可提取判断、`image_description` 和质检视觉判断。
+- 端到端自测：
+  - 商品 `1729398920156844544`：第一阶段成功生成 `image_description`，识别黑猫、南瓜、星星；图生图第一次返回 1033 后自动重试，第二次返回 `image_base64`；质检返回 `match_score=95`；保存结果 `/static/generated/illustrations/manualtest3_1729398920156844544_1781520520673.jpeg`。
+  - 商品 `1729432197146579968`：第一阶段识别 tactical webbing；图生图一次返回 `image_base64`；质检返回 `match_score=95`；保存结果 `/static/generated/illustrations/manualtest3_1729432197146579968_1781520586772.jpeg`。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py tools\analyze_single_product.py`
+  - 已直接调用 `call_product_vision_minimax()` 验证 `MiniMax-Text-01` 能看见商品图。
+  - 已直接调用 `call_minimax_illustration_generation()` 完成两张商品图端到端生成和质检。
+
+补充修正（2026-06-15，生成图含三维商品结构时强制低分）：
+- 问题表现：
+  - 用户反馈生成结果仍出现背包商品图，包含书包带子、包体、拉链、透视和阴影。
+  - 该类结果不是用户需要的纯二维平面素材。
+- 代码修复：
+  - 新增 `detect_generated_3d_artifacts()`，在左右对比质检前，先单独审查生成图本身是否含有任何三维商品形态。
+  - 禁止元素包括：背包、书包、手提包、包体轮廓、衣服、手机壳样机、手柄、书包带子、肩带、背带、拉链、拉链头、口袋、缝线、五金、扣具、厚度、折痕、褶皱、透视、阴影、摄影棚光影、桌面、背景场景。
+  - 如果生成图出现上述任何元素，`evaluate_generated_illustration()` 直接返回 `score=20`、`pass=false`，不会进入 85 分通过逻辑。
+  - 规则含义：任何跟三维商品结构有关的内容都必须低于 80 分。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 已用用户提供的背包生成图 `C:\Users\admin\AppData\Local\Temp\codex-clipboard-ce98cbe5-085b-45cd-98b9-d29019244486.png` 调用 `detect_generated_3d_artifacts()`。
+  - 返回：`forbidden_3d=true`，原因：图片中出现背包、包体轮廓、肩带、拉链等三维结构元素。
+
+### 2026-06-16：修复 WEBP 商品图被伪装成 JPEG 导致 MiniMax 图生图 1033
+
+问题表现：
+- 商品 `1729450215760696320` 的提取日志中，`image_description` 可以生成花卉描述，但 MiniMax 图生图连续 3 次返回空 `data_keys=[]`，`base_resp.status_code=1033 system error`。
+- 商品 `1732011246795854592` 的第一阶段视觉描述偶发 `NEED_RETRY_IMAGE_NOT_VISIBLE`，但最终任务可成功生成。
+- 日志中两个任务并发执行，`173201...` 与 `172945...` 的日志交织，容易误以为同一个任务串线；实际是两个不同 task_id 同时运行。
+
+根因：
+- 数据库中这两张商品图实际是 `WEBP`：
+  - `1729450215760696320`：PIL 识别为 `WEBP (1350, 1800)`，base64 前缀 `UklG...`。
+  - `1732011246795854592`：PIL 识别为 `WEBP (1600, 1600)`，base64 前缀 `UklG...`。
+- 旧代码对所有裸 base64 都直接拼成 `data:image/jpeg;base64,...`。
+- 也就是说实际传给 MiniMax 的是“WEBP 数据 + JPEG MIME”，视觉接口有时容忍，图生图接口容易返回 `1033 system error`。
+
+代码修复：
+- `app.py`
+  - `normalize_vision_image_url()` 不再直接给裸 base64 加 JPEG 前缀。
+  - 会先用 PIL 解码图片，再统一转成真实 JPEG bytes，最后输出 `data:image/jpeg;base64,...`。
+  - 该修复覆盖 POD 图生图、image_description、质检、三维结构审查等 app 内视觉链路。
+- `tools/analyze_single_product.py`
+  - `normalize_image_data()` 同步改为 PIL 解码后转真实 JPEG data URL。
+  - 该修复覆盖 IP 分析、材质分析、POD 可提取判断等共享视觉入口。
+
+验证方式：
+- 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py tools\analyze_single_product.py`
+- 已验证两个 WEBP 商品图经 `normalize_vision_image_url()` 后输出真实 JPEG：
+  - `1729450215760696320` -> `data:image/jpeg;base64,...`，PIL 识别 `JPEG (1350, 1800)`。
+  - `1732011246795854592` -> `data:image/jpeg;base64,...`，PIL 识别 `JPEG (1600, 1600)`。
+- 已端到端复测 `1729450215760696320`：
+  - 第一阶段生成 floral pattern 的 `image_description`。
+  - MiniMax 图生图 attempt=1 返回 `data_keys=['image_base64']`，不再出现 1033。
+  - 三维审查返回 `forbidden_3d=false`。
+  - 质检返回 `match_score=90`。
+  - 保存结果 `/static/generated/illustrations/manualjpeg_1729450215760696320_1781572772624.jpeg`。
+
+风险边界：
+- 转 JPEG 会让传给 MiniMax 的图片体积变大，但格式更稳定。
+- 如果后续遇到透明 PNG，当前会转成 RGB JPEG，透明区域会被合成到默认背景；如需要保留透明，需要单独处理。
+
+### 2026-06-16：POD 提取语义调整为“抠图/图案提取”并增加高置信本地抠图
+
+修改目标：
+- 用户明确该能力更准确的叫法是“抠图/图案提取”，不是“AI 生图”。
+- 目标是从商品图中提取已有插画/印花/图案，而不是让 AI 重新创作一个相似图片。
+
+代码策略：
+- `call_minimax_illustration_generation()` 现在先尝试 `local_cutout_print_artwork()` 做本地代码抠图。
+- 本地抠图只作为高置信路径：检测深色/高饱和“墨色”区域，输出透明 PNG。
+- 如果本地抠图疑似选中了大块商品本体或整件衣服/包，会放弃本地结果，降级到 MiniMax 严格 prompt 路径。
+- 新增 `save_extracted_artwork_png_bytes()`，本地抠图结果保存为 PNG，避免透明背景丢失。
+
+防误扣规则：
+- 如果本地抠图 bbox 接近整张图，拒绝。
+- 如果 bbox 超过图片宽/高 48% 且覆盖率超过 2%，认为可能选中商品本体，拒绝。
+- 用户提供的衣服示例图只是需求示例，不用于过拟合调参；经验证该图会被本地抠图拒绝：`本地抠图疑似选中大块商品区域`。
+
+风险边界：
+- 纯代码抠图适合边界清晰、墨色/高饱和印花明显的图案。
+- 对复杂衣服褶皱、浅色印花、同色系布料，本地抠图容易误扣或漏扣，因此只做高置信路径。
+- 低置信时仍走 MiniMax，但 prompt 语义应持续按“提取/抠取原图案”而不是“重新生成图案”维护。
+
+验证方式：
+- 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+- 已用用户提供的示例衣服图测试，本地抠图拒绝整件衣服区域。
+
+补充修正（2026-06-16，大面积胸前图案本地抠图改为保守兜底）：
+- 问题表现：
+  - 商品 `1731041924962947584` 是白色上衣上的大面积胸前印花。
+  - 本地抠图能检测到大 bbox，但调试图仍可能混入衣服/人物照片区域，不能直接保存为合格抠图。
+  - 同时该商品已有旧成功结果，后续重新提取失败不应把商品状态打成失败。
+- 代码修复：
+  - `local_cutout_print_artwork()` 对 bbox 超过图片宽/高 48% 的大面积结果改为拒绝：`本地抠图大面积图案置信不足，交给AI/已有结果兜底`。
+  - 提取接口异常处理增加已有结果保护：如果重新提取失败但商品已有 `illustration_result_url`，新任务写为 status=2 并返回已有结果，不再返回 502，也不把商品状态改成失败。
+  - 本地抠图结果即使产出，也会先经过 `detect_generated_3d_artifacts()`；三维/商品照片审查失败则降级，不保存。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 已验证 `1731041924962947584` 本地抠图会被拒绝并进入 AI/已有结果兜底。
+
+补充修正（2026-06-15，质检接口未检测到图像数据时重试）：
+- 问题表现：
+  - 质检返回 `{"match_score": 0, "reason": "未检测到图像数据，无法进行图案匹配评估"}`。
+  - 这表示质检视觉接口没有识别到 QC 对比图，不代表生成图真实匹配度为 0。
+- 代码修复：
+  - `is_missing_image_response()` 新增中文缺图标记：`未检测到图像数据`。
+  - `evaluate_generated_illustration()` 增加 `comparison_image_len` 日志，用于确认拼接后的质检对比图不是空数据。
+  - `evaluate_generated_illustration()` 增加最多 3 次质检重试，日志格式为 `qc_attempt=1/2/3 qc_raw=...`。
+  - 如果三次后仍没有 `match_score` 或仍未识别到图片，feedback 会写入 `质检返回未包含match_score或未识别到图片: ...`。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
+
+补充修正（2026-06-15，image_description 缺图重试与防幻觉）：
+- 问题表现：
+  - `image_description` 偶发返回 `I don't see an image attached... Please try uploading...`，说明第一阶段视觉描述接口没有识别到图片。
+  - 随机抽查多张图时，描述结果集中出现“花、玫瑰、植物”等元素，但原图未必有花，说明 prompt 示例词和模型补全导致了幻觉。
+- 代码修复：
+  - 新增 `is_missing_image_response()`，识别英文/中文的缺图提示，例如 `don't see an image`、`no image attached`、`please upload`、`无法看到图片`、`请提供图片`。
+  - `generate_artwork_description()` 增加最多 3 次重试：如果模型返回缺图提示或 `NEED_RETRY_IMAGE_NOT_VISIBLE`，不会进入图生图，而是重新请求视觉描述。
+  - 第一阶段描述 prompt 移除“花朵、动物、几何、抽象纹样等”这种示例诱导，改为“只能描述图片中真实可见的元素，不能根据品类或示例自行补花朵、动物、植物、几何等不存在的内容”。
+  - 第一阶段 user_text 增加：不要发散、不要补花朵或其他未出现的元素；如果没有收到图片或看不清图案，只输出 `NEED_RETRY_IMAGE_NOT_VISIBLE`。
+  - `sanitize_artwork_description()` 兼容新的 `A perfectly flat 2D seamless print pattern asset...` 开头，避免清洗时截断失败。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
+
+补充修正（2026-06-15，强制插画提取结果为纯二维平面素材）：
+- 问题表现：
+  - 用户反馈生成结果仍可能出现包、背包、手柄、肩带、透视、阴影等三维商品图，而用户需要的是可用于手机壳印刷的纯平面图案素材。
+- 提示词放置策略：
+  - 第一阶段 `generate_artwork_description()`：要求视觉模型只描述“可印刷二维图案”，不要把包型、衣服版型、手柄、拉链、五金、阴影、透视等商品本体写进图片描述 prompt。
+  - 第二阶段 `build_illustration_generation_prompt()`：这是最关键位置，直接控制 MiniMax image-to-image 输出；因此把 `ABSOLUTE OUTPUT REQUIREMENT` 放在最终 prompt 最前面，强制只生成 flat 2D print pattern asset。
+  - 第三阶段 `evaluate_generated_illustration()`：质检时如果右侧生成图仍有包、背包、手提包、衣服、手机壳样机、手柄、肩带、拉链、口袋、五金、商品轮廓、透视、阴影或任何 3D 体积，直接判为不合格，`match_score` 最高不超过 20。
+- 代码修复：
+  - 第一阶段描述 prompt 首句要求以 `A perfectly flat 2D seamless print pattern asset...` 开头。
+  - 第二阶段最终图生图 prompt 开头新增 `ABSOLUTE OUTPUT REQUIREMENT: Generate ONLY a perfectly flat 2D print pattern asset...`。
+  - 第二阶段明确禁止：bag、backpack、tote、purse、shirt、hoodie、model、mannequin、phone case mockup、product silhouette、handles、straps、zipper、pockets、seams、hardware、folds、wrinkles、leather shine、fabric depth、perspective、shadows、studio lighting、table、room、3D volume。
+  - 第三阶段质检只有在右侧是纯二维平面图案且图案相似时，才允许给 85 分以上。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
 - 风险边界：
   - 本次没有改变 MiniMax image-to-image 的官方请求字段。
   - 本次主要解决“生成成功但质检链路看不到图”导致的误报失败。
@@ -1390,3 +1546,201 @@ AI_DAEMON 超时结论：
 - 风险边界：
   - 如果质检接口本身仍无法识别图片，接口仍可能返回质检失败；但不会把未达标图片误写为成功结果。
   - 后续若要区分“质检接口异常”和“真实匹配度不足”，需要把质检失败类型单独入库或返回给前端。
+
+补充修正（2026-06-15，解释质检最佳评分为 0 并优化质检链路）：
+- 问题表现：
+  - 日志显示 MiniMax 图生图每轮都返回 `data_keys=['image_base64']`，说明生成接口有返回图片。
+  - 但每轮 `[MINIMAX_IMAGE_QC] attempt=... score=0.0 feedback=`，最佳评分为 0 且原因为空。
+- 原因：
+  - 评分为 0 不是因为没有继续生图；三轮生图已经执行。
+  - 评分为 0 的直接原因是质检接口返回内容没有被解析出 `match_score`，代码按默认值落到 0。
+  - 旧质检仍使用 `chatcompletion_v2` 手写双图 payload，同时传原图和生成图两个 `data:image/...;base64`，该路径对多图/base64 识别不稳定。
+  - 第一阶段 `image_description` 还暴露出另一个问题：视觉模型返回内容带 `<think>...</think>` 和 `--v 6 --ar 1:1` 等 Midjourney 参数，直接传给 MiniMax 图生图会污染 prompt。
+- 代码修复：
+  - 新增 `sanitize_artwork_description()`，清理 `<think>`、Markdown 代码块和 `--v/--ar/--style/--s/--q` 等参数，只保留真正的英文图片描述 prompt。
+  - 新增 `build_qc_comparison_image()`：把原商品图和生成图拼成一张左右对比图，再交给视觉模型评估。
+  - `evaluate_generated_illustration()` 不再走旧的 `chatcompletion_v2` 双图 payload，改为复用 `call_product_vision_minimax()` 对单张对比图打分。
+  - 质检日志新增 `qc_raw`，打印模型原始质检返回，便于后续判断是解析失败、模型没看懂图，还是生成图真实不达标。
+  - 如果质检返回不包含 `match_score`，feedback 会写入 `质检返回未包含match_score: ...`，不再出现空 feedback。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
+
+补充修正（2026-06-16，碎片残渣/无有效主体的提取结果强制低分）：
+- 问题表现：
+  - 用户反馈部分提取结果是大面积空白灰底，只在边角残留极少线条碎片。
+  - 另一些结果只剩 logo、铆钉、五金点、包边线等零散残留，没有形成可用于印刷的完整平面图案主体。
+  - 这类结果既不是合格抠图，也不是可用二维印花素材，必须低于 80 分。
+- 代码修复：
+  - 新增 `detect_low_value_flat_artifact()`，在视觉质检前先用图像算法检查生成图/抠图结果是否缺少有效图案主体。
+  - 检测维度包括：有效图案覆盖率、主体 bbox 占比、主体是否偏在角落、连通组件数量、最大组件占比。
+  - 对截图黑边、白/灰背景做背景差异过滤，避免把画布背景误认为有效图案。
+  - 如果结果是“有效图案面积过小”“主体占画布太小”“主体偏角且面积不足”“过于碎片化”“碎片残渣而非完整图案”，直接返回 `score=20`、`pass=false`。
+  - 本地抠图保存前也会先经过该低价值检查；如果只抠到文字、五金点、边缘残渣，则拒绝保存并降级到 MiniMax/已有结果兜底。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 用户提供的空白灰底碎片图返回：`生成图有效图案面积过小 coverage=0.0083`。
+  - 用户提供的 logo/铆钉/五金点残留图返回：`生成图过于碎片化 components=95 largest_ratio=0.178`。
+  - 用户提供的黑色卫衣文字图本地抠图被拒绝：`本地抠图图案像素过少 coverage=0.0009`。
+  - 用户提供的棕色包源图本地抠图被拒绝：`本地抠图大面积图案置信不足，交给AI/已有结果兜底`。
+
+补充修正（2026-06-16，高置信大面积文字/印花允许本地抠图，避免 MiniMax 1033 阻断）：
+- 问题表现：
+  - 商品 `1729491397801252352` 的第一阶段视觉描述正常，识别出 `jesus is for everybody` 文字和小十字图案。
+  - 本地抠图已检测到较完整图案区域：`bbox=679x566 coverage=0.0784`。
+  - 旧规则因为 bbox 超过图片宽/高 48%，直接判定“大面积图案置信不足”，强制降级到 MiniMax。
+  - MiniMax `image-01` 连续 3 次返回 `status_code=1033 system error` 且无图片数据，最终接口 502。
+- 根因：
+  - “大 bbox 一律拒绝”的规则过于保守。
+  - 对胸前大字、大面积图案、居中印花来说，bbox 大是正常现象，不等于抠到了整件衣服。
+  - 应该结合覆盖率、组件数量、最大主体占比判断是否为高置信图案主体。
+- 代码修复：
+  - `local_cutout_print_artwork()` 对大 bbox 增加 `large_print_confident` 例外。
+  - 大 bbox 只有同时满足以下条件才允许本地抠图保存：
+    - `0.045 <= coverage <= 0.14`
+    - `meaningful_components <= 30`
+    - `largest_component_ratio >= 0.35`
+  - 不满足时仍拒绝，并在日志中打印 `components` 与 `largest_ratio`。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 商品 `1729491397801252352` 本地抠图成功：`coverage=0.0784 bbox=679x566`。
+  - 该抠图通过低价值检测：`平面图案有效 coverage=0.0895 bbox_ratio=0.6245`。
+  - 用户提供的棕色包源图仍被拒绝：`coverage=0.0275 components=43 largest_ratio=0.407`。
+
+补充修正（2026-06-16，POD 提取失败后重跑完整流程 2 次）：
+- 问题表现：
+  - 单轮流程内虽然已有 MiniMax 图生图 attempt 重试，但如果整轮流程因为 `1033 system error`、质检失败、视觉接口异常等原因失败，会直接进入接口异常处理。
+  - 用户要求：这种失败不要马上报错，而是重新走完整流程 2 次；两次重跑后仍失败再报错。
+- 代码修复：
+  - 新增 `POD_EXTRACT_FLOW_MAX_ATTEMPTS`，默认值为 `3`，表示首次执行 + 失败后额外 2 次完整流程重跑。
+  - 将原 `call_minimax_illustration_generation()` 的主体拆为 `call_minimax_illustration_generation_once_flow()`。
+  - 新的 `call_minimax_illustration_generation()` 作为外层包装器，捕获单轮流程异常并重新执行完整流程。
+  - 每轮都会重新执行：本地抠图、低价值检测、三维结构审查、`image_description`、MiniMax 图生图多次 attempt、质检。
+  - 日志新增 `[POD_EXTRACT_FLOW] task_id=... flow_attempt=1/3 start/failed`，便于判断当前是第几轮完整流程。
+  - 如果 3 轮都失败，最终错误写为：`POD提取完整流程失败；已重跑 3 轮；flow 1: ... | flow 2: ... | flow 3: ...`。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
+
+补充修正（2026-06-16，POD 提取不再默认强制循环平铺）：
+- 问题表现：
+  - 用户指出并非所有商品都是循环纹样，很多 POD 商品只有单个胸前图案、背后大图、徽章、小图标或一句文字。
+  - 旧提示词第一阶段硬要求 `A perfectly flat 2D seamless print pattern asset...`，第二阶段兜底 prompt 写了 `repeating tile`，容易把单个图案误生成循环排布。
+- 代码修复：
+  - 第一阶段 `generate_artwork_description()` 首句要求改为 `A perfectly flat 2D printable artwork asset...`。
+  - 明确提示：不要默认写 `seamless/repeating`；只有原图本身是满版循环纹样时才描述为 seamless/repeating。
+  - 增加排布规则：必须保留原图的图案排布类型；单个胸前图案、背后大图、徽章、单句文字、局部小图标应描述为 `single centered/front/back graphic` 或 `isolated motif`。
+  - 第二阶段 `build_illustration_generation_prompt()` 改为 `printable artwork asset`，并要求保留 reference 的 layout type。
+  - 兜底 prompt 从 `Fill the square canvas with a clean 2D motif or repeating tile` 改为：单个图案/短语就输出单个干净孤立图案，只有原图已经是重复印花时才用 repeating tile。
+  - 第二阶段允许 `text graphic`，用于类似 “Jesus is for everybody” 这类非品牌文字印花。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 已确认 `app.py` 中不再把所有 POD 提取结果默认定调为 seamless/repeating。
+
+补充修正（2026-06-16，压缩第二阶段提示词并避免像素级抠残片）：
+- 问题表现：
+  - 用户将第二阶段提示词改为 `SYSTEM DIRECTIVE: 2D ASSET EXTRACTION & RECONSTRUCTION` 后，日志显示前两轮生成图被低价值规则打 20 分：
+    - `生成图有效图案面积过小 coverage=0.0092`
+    - `生成图过于碎片化 components=333 largest_ratio=0.081`
+  - 第三轮 MiniMax 图生图返回 `1033 system error`。
+- 根因：
+  - 提示词中的 `PRECISION MASKING`、`trace ONLY the artwork's pixels` 容易诱导图生图模型做字面像素抠图，输出细碎残片，而不是完整可用的二维印花重建。
+  - 该提示词本身过长，而代码最终会 `prompt[:1450]`；实际测试发现最终 prompt 被截断在规则中间，`PATTERN/ARTWORK TO RECREATE` 和具体图案描述没有传给 MiniMax。
+- 代码修复：
+  - 第二阶段 prompt 从“像素级 masking/cutout”改为“完整 2D printable digital design reconstruction”。
+  - 明确写入：`Do NOT do literal pixel masking; do not output tiny fragments, scattered residue, edge scraps`。
+  - 增加画布占比规则：单个图案/短语应居中并占画面约 55-85%，防止输出角落小残片。
+  - 压缩 `flat_rules` 长度，并在 `build_illustration_generation_prompt()` 中按预算截断 `artwork_description`，确保 `ARTWORK TO RECREATE` 总能保留在最终 1450 字符内。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 已测试 `build_illustration_generation_prompt()`：最终 prompt 长度 1253，包含 `ARTWORK TO RECREATE`，且具体描述 `Statue of Liberty` 未被截断。
+
+补充修正（2026-06-16，MiniMax 视觉接口 429 限流退避与插画判断后台降速）：
+- 问题表现：
+  - 日志出现：`插画视觉判断接口调用失败: Error code: 429 ... rate limit exceeded(RPM) (1002)`。
+  - 该错误表示 MiniMax 视觉接口一分钟请求数超限，不是单个商品判断逻辑错误。
+- 根因：
+  - 插画判断后台默认 `batch_size=120`、`concurrency=4`，同时手动 POD 提取、IP/材质分析也会复用同一个 MiniMax 视觉接口，容易打满 RPM。
+- 代码修复：
+  - `tools/analyze_single_product.py` 的 `call_minimax()` 增加 429/rate_limit 专用退避重试。
+  - 默认最多重试 `MINIMAX_VISION_MAX_RETRIES=5` 次。
+  - 默认退避基准 `MINIMAX_VISION_RATE_LIMIT_SLEEP_SECONDS=10` 秒，按 10/20/40/60/60 秒等待。
+  - `app.py` 插画判断后台默认降速：
+    - `ILLUSTRATION_DAEMON_INTERVAL_SECONDS`：120 -> 180
+    - `ILLUSTRATION_DAEMON_BATCH_SIZE`：120 -> 40
+    - `ILLUSTRATION_DAEMON_CONCURRENCY`：4 -> 2
+- 操作建议：
+  - 遇到 429 后先等 1-2 分钟再手动提取。
+  - 如果仍频繁 429，可临时设置 `ILLUSTRATION_DAEMON_ENABLED=false`，先让手动提取独占视觉额度。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py tools\analyze_single_product.py`
+  - 结果：通过。
+
+补充修正（2026-06-16，取消 POD 提取前置本地抠图，只保留 AI 识别/生成链路）：
+- 问题背景：
+  - 用户要求取消提取插画前的程序识别/本地抠图步骤，只使用 AI 识别。
+  - 当前代码中没有实际使用 `rembg`；前置步骤是 `local_cutout_print_artwork()` 的 OpenCV 本地抠图逻辑。
+- 代码修复：
+  - 从 `call_minimax_illustration_generation_once_flow()` 中移除本地抠图调用。
+  - POD 提取流程现在直接进入：
+    1. `generate_artwork_description()` 让 AI 识别原图图案并生成描述；
+    2. `call_minimax_illustration_generation_once()` 调用 MiniMax 图生图；
+    3. `evaluate_generated_illustration()` 质检。
+  - 日志新增：`[POD_EXTRACT_FLOW] task_id=... local_cutout_disabled use_ai_only=true`，用于确认当前已跳过本地抠图。
+- 保留项：
+  - `local_cutout_print_artwork()` 和 `save_extracted_artwork_png_bytes()` 函数暂时保留在文件中，但当前主流程不再调用。
+- 验证方式：
+  - 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+  - 结果：通过。
+### 2026-06-18：修复 POD 插画判断队列有索引仍超时
+修改目标：
+- 解决 `[ILLUSTRATION_DAEMON] cycle failed` 中 `fetch_illustration_daemon_product_keys()` 取待判断队列超时的问题。
+- 用户已经建立联合索引，但 MySQL 实际没有使用该索引，需要让队列 SQL 真正走索引。
+
+涉及文件：
+- `app.py`
+- `PROJECT_MEMORY_ARCHIVE.md`
+
+问题原因：
+- 数据库中确实存在 `idx_pod_illustration_queue(date_record, illustration_extractable, id)`。
+- 但原 SQL 同时包含：
+  - `date_record = (SELECT MAX(...))`
+  - `image_base64 IS NOT NULL`
+  - `image_base64 <> ''`
+  - `ORDER BY date_record DESC, id ASC`
+- `image_base64` 是 LONGTEXT 大字段，无法作为普通联合索引字段使用。
+- `EXPLAIN` 显示 MySQL 实际选择了 `PRIMARY`，不是 `idx_pod_illustration_queue`；它为了满足排序按主键扫，再逐行检查 date/status/image 条件，数据一多就会触发 PyMySQL read timeout。
+
+具体改动：
+- `fetch_illustration_daemon_product_keys()`：
+  - 先单独查询最新 `date_record`，不再在主队列 SQL 中使用 `SELECT MAX(...)` 子查询。
+  - 主队列 SQL 改为 `FORCE INDEX (idx_pod_illustration_queue)`。
+  - 主队列 SQL 移除 `image_base64 IS NOT NULL AND image_base64 <> ''`，避免取队列阶段扫描 LONGTEXT。
+  - 排序改为 `ORDER BY id ASC`，配合 `(date_record, illustration_extractable, id)` 使用。
+- 新增 `fetch_source_latest_date(meta)`，用于通用获取 source 最新采集日期。
+- `process_single_illustration_check()`：
+  - 如果商品不存在或主图为空，将该商品标记为 `illustration_extractable = 0`，并写入原因“商品主图为空，无法判断插画可提取性”。
+  - 这样无图商品不会反复进入“未判断”队列。
+
+验证结果：
+- 已执行：`D:\choice_product\.venv\Scripts\python.exe -m py_compile app.py`
+- 结果：通过。
+- 已执行新 SQL 的 `EXPLAIN`：
+  - `key = idx_pod_illustration_queue`
+  - `type = ref`
+  - `Extra = Using index condition; Using where`
+- 实测调用：
+  - `fetch_illustration_daemon_product_keys('pod_cross_category', 40)`
+  - 返回 40 条，耗时约 `0.762s`。
+
+用户如何看到：
+- 重启 Flask 后端。
+- `[ILLUSTRATION_DAEMON] cycle failed` 中取队列阶段的 MySQL timeout 应显著减少。
+- 控制台应继续看到：
+  `[ILLUSTRATION_DAEMON] checked source=pod_cross_category ... extractable=...`
+
+风险边界：
+- 本次不修改视觉判断 prompt。
+- 本次不修改图生图提取接口。
+- 本次不修改前端展示。
+- 如果后续仍超时，下一步应检查视觉模型请求本身是否卡住，而不是数据库取队列。

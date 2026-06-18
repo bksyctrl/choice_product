@@ -142,4 +142,322 @@ HTTP 200 OK
     }
   ]
 }
-*(备注：match_score=95 >= 85，通过打分。系统保存图片，结束循环并返回 url。)*
+*(备注：match_score=95 >= 85，通过打分。系统保存图片，结束循环并返回 url。)*========================================================================
+[2026-06-17 10:21:32] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731342892069983232_1781662882537
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a dark gray t-shirt with a centered design. The design includes an American flag positioned above the text. The text reads: "I DIDN'T GROW UP SAYING 'with Liberty & Justice for all' EVERY DAY TO SETTLE FOR ANYTHING LESS." The text is in white, with "with Liberty & Justice for all" italicized. The overall layout is simple and centered, with the flag and text aligned vertically. The key visual elements are the American fl
+DO
+
+========================================================================
+[2026-06-17 10:21:33] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731266629651567360_1781662885089
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a bold and colorful design centered on a white background. The main text "Juneteenth" is prominently displayed at the top in a cursive font, with each letter in a different color: red, green, and yellow. Below this, the phrase "I'M BLACK EVERY DAY. BUT TODAY I'M" is written in a smaller, uppercase sans-serif font. The word "BLACKITY" is the focal point, written in large, bold, black uppercase letters within a rectangula
+DO
+
+========================================================================
+[2026-06-17 10:22:02] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731266629651567360_1781662885089
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background with no forbidden content."}
+
+========================================================================
+[2026-06-17 10:22:06] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731342892069983232_1781662882537
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background."}
+
+========================================================================
+[2026-06-17 10:22:10] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731266629651567360_1781662885089
+attempt: 1
+qc_raw: {"match_score": 95, "reason": "The generated flat artwork accurately captures the text, colors, and layout of the original design. There are no forbidden 3D or person/product elements, and the relative scale and placement are correct."}
+
+========================================================================
+[2026-06-17 10:22:10] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731266629651567360_1781662885089
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and layout of the original design. There are no forbidden 3D or person/product elements, and the relative scale and placement are correct.
+
+========================================================================
+[2026-06-17 10:22:24] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731342892069983232_1781662882537
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the text, colors, and layout of the original image. The American flag and the text are correctly positioned and scaled."
+}
+
+========================================================================
+[2026-06-17 10:22:24] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731342892069983232_1781662882537
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and layout of the original image. The American flag and the text are correctly positioned and scaled.
+
+========================================================================
+[2026-06-17 10:25:09] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731342892069983232_1781663100703
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a dark gray t-shirt with a centered design. The design includes an American flag positioned above the text. The text reads: "I DIDN'T GROW UP SAYING 'with Liberty & Justice for all' EVERY DAY TO SETTLE FOR ANYTHING LESS." The text is in white, with "with Liberty & Justice for all" italicized. The overall layout is simple and centered, with the flag and text aligned vertically. The key visual elements are the American fl
+DO
+
+========================================================================
+[2026-06-17 10:25:37] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731342892069983232_1781663100703
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background."}
+
+========================================================================
+[2026-06-17 10:25:42] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731342892069983232_1781663100703
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the text, colors, and relative placement of the elements on the t-shirt."
+}
+
+========================================================================
+[2026-06-17 10:25:42] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731342892069983232_1781663100703
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and relative placement of the elements on the t-shirt.
+
+========================================================================
+[2026-06-17 10:34:08] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731342892069983232_1781663627951
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a dark gray t-shirt with a centered graphic and text design. The design includes a small American flag positioned above the text. The text reads: "I DIDN'T GROW UP SAYING 'with Liberty & Justice for all' EVERY DAY TO SETTLE FOR ANYTHING LESS." The text is in white, with "with Liberty & Justice for all" italicized. The overall layout is simple and centered, with the flag and text aligned vertically. The key visual elemen
+DO
+
+========================================================================
+[2026-06-17 10:34:09] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1732087386665030400_1781663630392
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a humorous text design on a dark background. The main text reads "RE-TIRED" in large, distressed white font with a red underline. Below this, in smaller white font, the text continues with "I WAS TIRED YESTERDAY AND I'M TIRED AGAIN TODAY." The text is centrally aligned and occupies the majority of the visible area. The overall layout is simple and straightforward, with the text being the primary focus. The colors used a
+DO
+
+========================================================================
+[2026-06-17 10:34:12] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731266629651567360_1781663628404
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring the text "Juneteenth" in a cursive font with the letters colored in red, green, and yellow. Below this, the phrase "I'M BLACK EVERY DAY. BUT TODAY I'M" is printed in a smaller, uppercase sans-serif font. The word "BLACKITY" is prominently displayed in large, bold, black uppercase letters within a rectangular border. Underneath "BLACKITY," the word "BLACK" is repeated three times in bold uppercase letters, each instance 
+DO
+
+========================================================================
+[2026-06-17 10:34:12] MINIMAX_IMAGE_REQUEST
+========================================================================
+task_id: pod_1731964100972155904_1781663629471
+attempt: 1
+model: image-01
+reference_type: base64
+prompt: [SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+
+ You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+
+ARTWORK TO RECREATE: A perfectly flat 2D printable artwork asset featuring a glossy, maroon tote bag with the text "TOTE BAG" printed in white, centered on the front. The bag has two handles and a slightly crinkled texture, giving it a reflective, almost marbled appearance. The background includes a framed picture of a gallery scene with two figures standing in front of artworks, and a cup and saucer with a spoon. The overall composition is minimalist and clean, with the tote bag as the primar
+DO
+
+========================================================================
+[2026-06-17 10:34:49] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731342892069983232_1781663627951
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background."}
+
+========================================================================
+[2026-06-17 10:34:49] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1732087386665030400_1781663630392
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background with no forbidden content."}
+
+========================================================================
+[2026-06-17 10:34:49] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731964100972155904_1781663629471
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image contains a flat 2D artwork asset on a plain clean background without any forbidden content."}
+
+========================================================================
+[2026-06-17 10:34:50] MINIMAX_ARTIFACT_QC
+========================================================================
+task_id: pod_1731266629651567360_1781663628404
+attempt: 1
+artifact_raw: {"forbidden_3d": "false", "reason": "The image is a pure flat 2D artwork asset on a plain clean background."}
+
+========================================================================
+[2026-06-17 10:34:55] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1732087386665030400_1781663630392
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the text, colors, and layout of the original design on the t-shirt."
+}
+
+========================================================================
+[2026-06-17 10:34:55] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1732087386665030400_1781663630392
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and layout of the original design on the t-shirt.
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731964100972155904_1781663629471
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the tote bag's design, including the text, color, and relative placement. There are no forbidden elements present."
+}
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731964100972155904_1781663629471
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the tote bag's design, including the text, color, and relative placement. There are no forbidden elements present.
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731266629651567360_1781663628404
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the text, colors, and layout of the original image."
+}
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731266629651567360_1781663628404
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and layout of the original image.
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_FINAL_QC
+========================================================================
+task_id: pod_1731342892069983232_1781663627951
+attempt: 1
+qc_raw: {
+  "match_score": 95,
+  "reason": "The generated flat artwork accurately captures the text, colors, and layout of the original image. The American flag and the text are correctly placed and sized, and there are no forbidden 3D or person-related elements."
+}
+
+========================================================================
+[2026-06-17 10:34:56] MINIMAX_QC_RESULT
+========================================================================
+task_id: pod_1731342892069983232_1781663627951
+match_score: 95.0
+pass_result: True
+feedback: The generated flat artwork accurately captures the text, colors, and layout of the original image. The American flag and the text are correctly placed and sized, and there are no forbidden 3D or person-related elements.
+

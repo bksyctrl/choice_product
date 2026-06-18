@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>选品审核平台</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.2.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.2.1">
 </head>
 <body>
   <div class="app hidden" id="appShell">
@@ -25,6 +25,7 @@
       </nav>
       <nav class="source-nav utility-nav">
         <button id="detailAnalysisNav" type="button">深度分析</button>
+        <button id="podIllustrationAssetsNav" type="button">POD插画库</button>
         <button id="expertTeamNav" type="button">专家团队</button>
       </nav>
 
@@ -183,6 +184,7 @@
     const filterByKey = Object.fromEntries(filterDefinitions.map(item => [item.key, item]));
     const activeFilterKeys = new Set();
     const filterValues = {};
+    const requestTokens = { products: 0, stats: 0, podAssets: 0, detailAnalyses: 0 };
     const paramMap = {
       keyword: 'keyword', dateStart: 'date_start', dateEnd: 'date_end',
       launchStart: 'launch_start', launchEnd: 'launch_end', auditStatus: 'audit_status',
@@ -199,6 +201,34 @@
       productCardRatioMin: 'product_card_ratio_min', productCardRatioMax: 'product_card_ratio_max',
       videoRatioMin: 'video_ratio_min', videoRatioMax: 'video_ratio_max',
     };
+
+    function nextRequestToken(key) {
+      requestTokens[key] = (requestTokens[key] || 0) + 1;
+      return requestTokens[key];
+    }
+
+    function isCurrentRequest(key, token) {
+      return requestTokens[key] === token;
+    }
+
+    function isCurrentProductView(token, source) {
+      return isCurrentRequest('products', token) && state.mode === 'products' && state.source === source;
+    }
+
+    function isCurrentStatsView(token, source) {
+      return isCurrentRequest('stats', token) && state.mode === 'products' && state.source === source;
+    }
+
+    function isCurrentPodAssetsView(token) {
+      return isCurrentRequest('podAssets', token) && state.mode === 'podIllustrationAssets';
+    }
+
+    function reloadCurrentData() {
+      if (state.mode === 'podIllustrationAssets') return loadPodIllustrationAssets();
+      if (state.mode === 'detailAnalysis') return loadDetailAnalyses();
+      if (state.mode === 'expertTeam') return loadExpertSessions();
+      return loadAll();
+    }
 
     async function initAuth() {
       try {
@@ -230,6 +260,7 @@
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       btn.classList.add('active');
       $('detailAnalysisNav').classList.remove('active');
+      $('podIllustrationAssetsNav').classList.remove('active');
       $('expertTeamNav').classList.remove('active');
       $('pageTitle').textContent = sourceText[state.source];
       $('exportReadyLink').href = `/api/products/${state.source}/export-ready-links`;
@@ -237,6 +268,9 @@
     }));
     $('detailAnalysisNav').addEventListener('click', () => {
       openDetailAnalysisWorkspace();
+    });
+    $('podIllustrationAssetsNav').addEventListener('click', () => {
+      openPodIllustrationAssetsWorkspace();
     });
     $('expertTeamNav').addEventListener('click', () => {
       if (!canUseExpertTeam()) {
@@ -264,9 +298,22 @@
       state.detailAnalysisType = type;
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       $('detailAnalysisNav').classList.add('active');
+      $('podIllustrationAssetsNav').classList.remove('active');
       $('expertTeamNav').classList.remove('active');
       renderDetailAnalysisPage();
       loadDetailAnalyses();
+    }
+
+    function openPodIllustrationAssetsWorkspace() {
+      state.mode = 'podIllustrationAssets';
+      state.source = 'pod_cross_category';
+      state.page = 1;
+      document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
+      $('detailAnalysisNav').classList.remove('active');
+      $('podIllustrationAssetsNav').classList.add('active');
+      $('expertTeamNav').classList.remove('active');
+      renderPodIllustrationAssetsPage([], true);
+      loadPodIllustrationAssets();
     }
 
     function openExpertTeamWorkspace() {
@@ -277,6 +324,7 @@
       state.mode = 'expertTeam';
       document.querySelectorAll('#sourceNav button').forEach(item => item.classList.remove('active'));
       $('detailAnalysisNav').classList.remove('active');
+      $('podIllustrationAssetsNav').classList.remove('active');
       $('expertTeamNav').classList.add('active');
       renderExpertTeamPage();
       loadExpertSessions();
@@ -623,15 +671,15 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       btn.classList.add('active');
       renderItems();
     }));
-    $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
-    $('topSearchBtn').addEventListener('click', () => { state.page = 1; loadAll(); });
-    $('sortBy').addEventListener('change', () => { state.sortBy = $('sortBy').value; state.page = 1; loadProducts(); });
-    $('topPodStatus').addEventListener('change', () => { state.page = 1; loadAll(); });
+    $('sidebarSearchBtn').addEventListener('click', () => { state.page = 1; reloadCurrentData(); });
+    $('topSearchBtn').addEventListener('click', () => { state.page = 1; reloadCurrentData(); });
+    $('sortBy').addEventListener('change', () => { state.sortBy = $('sortBy').value; state.page = 1; reloadCurrentData(); });
+    $('topPodStatus').addEventListener('change', () => { state.page = 1; reloadCurrentData(); });
     $('resetFiltersBtn').addEventListener('click', resetFilters);
     $('logoutBtn').addEventListener('click', logout);
-    $('pageSize').addEventListener('change', () => { state.pageSize = Number($('pageSize').value); state.page = 1; loadProducts(); });
-    $('prevPage').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; loadProducts(); } });
-    $('nextPage').addEventListener('click', () => { if (state.page * state.pageSize < state.total) { state.page += 1; loadProducts(); } });
+    $('pageSize').addEventListener('change', () => { state.pageSize = Number($('pageSize').value); state.page = 1; reloadCurrentData(); });
+    $('prevPage').addEventListener('click', () => { if (state.page > 1) { state.page -= 1; reloadCurrentData(); } });
+    $('nextPage').addEventListener('click', () => { if (state.page * state.pageSize < state.total) { state.page += 1; reloadCurrentData(); } });
     $('copyReadyBtn').addEventListener('click', copyReadyLinks);
     $('closeDetail').addEventListener('click', () => $('detailDialog').close());
     $('closeImage').addEventListener('click', () => $('imageDialog').close());
@@ -667,10 +715,125 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadDetailAnalyses() {
+      const token = nextRequestToken('detailAnalyses');
+      const analysisType = state.detailAnalysisType;
       const res = await fetch(`/api/detail-analyses?analysis_type=${encodeURIComponent(state.detailAnalysisType)}`);
       const json = await res.json();
+      if (!isCurrentRequest('detailAnalyses', token) || state.mode !== 'detailAnalysis' || state.detailAnalysisType !== analysisType) return;
       if (!json.ok) return showToast(json.error || '深度分析记录加载失败');
       renderDetailAnalysisPage(json.data.items || [], false);
+    }
+
+    function renderPodIllustrationAssetsPage(items = [], loading = true) {
+      $('pageTitle').textContent = 'POD插画库';
+      $('stats').innerHTML = '';
+      $('periodHint').textContent = '提取插画与手机壳效果图成果库';
+      $('content').innerHTML = `
+        <section class="pod-asset-page">
+          <div class="pod-asset-toolbar">
+            <strong>插画成果</strong>
+            <button type="button" data-refresh-pod-assets>刷新</button>
+          </div>
+          ${loading ? '<div class="detail-empty">正在加载POD插画库...</div>' : podIllustrationAssetsHtml(items)}
+        </section>`;
+      if (loading) {
+        $('pageInfo').textContent = 'POD插画库';
+        $('prevPage').disabled = true;
+        $('nextPage').disabled = true;
+      }
+      document.querySelector('[data-refresh-pod-assets]')?.addEventListener('click', loadPodIllustrationAssets);
+      bindPodAssetActions();
+    }
+
+    async function loadPodIllustrationAssets() {
+      const token = nextRequestToken('podAssets');
+      renderPodIllustrationAssetsPage([], true);
+      try {
+        const params = new URLSearchParams({ page: state.page, page_size: state.pageSize });
+        const keyword = $('keyword')?.value || '';
+        if (keyword) params.set('keyword', keyword);
+        const res = await fetch(`/api/pod-illustration-assets?${params}`);
+        const json = await res.json();
+        if (!isCurrentPodAssetsView(token)) return;
+        if (!json.ok) {
+          renderPodIllustrationAssetsPage([], false);
+          return showToast(json.error || 'POD插画库加载失败');
+        }
+        state.items = json.data.items || [];
+        state.total = json.data.total || 0;
+        renderPodIllustrationAssetsPage(state.items, false);
+        renderPager();
+      } catch (error) {
+        if (!isCurrentPodAssetsView(token)) return;
+        renderPodIllustrationAssetsPage([], false);
+        showToast('POD插画库加载失败');
+      }
+    }
+
+    function podAssetStatusText(status) {
+      const map = { 0: '待处理', 1: '生成中', 2: '成功', 3: '失败' };
+      return map[Number(status)] || '未知';
+    }
+
+    function podAssetImageButton(url, title, label) {
+      if (!url) return `<div class="pod-asset-thumb-placeholder">${label || '暂无图片'}</div>`;
+      return `<button class="pod-asset-thumb-button" type="button" data-image="${escapeHtml(url)}" data-title="${escapeHtml(title || '')}"><img src="${escapeHtml(url)}" alt=""></button>`;
+    }
+
+    function podAssetStatusBadge(status, type = 'asset') {
+      const value = Number(status ?? 0);
+      const map = {
+        0: ['待处理', 'pending'],
+        1: [type === 'phone' ? '生成中' : '提取中', 'processing'],
+        2: ['成功', 'done'],
+        3: ['失败', 'failed'],
+      };
+      const [label, cls] = map[value] || ['未知', 'pending'];
+      return `<span class="pod-status ${cls}">${label}</span>`;
+    }
+
+    function podIllustrationAssetsHtml(items) {
+      if (!items.length) return '<div class="detail-empty">暂无POD插画成果。跨品类商品提取成功后会自动写入这里。</div>';
+      return `<div class="table-wrap pod-asset-table-wrap"><table class="pod-asset-table"><thead><tr>
+        <th>商品图</th><th>商品标题</th><th>提取插画</th><th>手机壳图</th>
+        <th>插画状态</th><th>手机壳状态</th><th>采集日期</th><th>更新时间</th><th>操作</th>
+      </tr></thead><tbody>${items.map(item => `
+        <tr>
+          <td>${podAssetImageButton(item.product_image_url, item.product_title, '暂无原图')}</td>
+          <td class="title-cell">
+            <button class="pod-asset-title-button" type="button" data-detail="${escapeHtml(item.product_id)}" data-date="${escapeHtml(item.date_record || '')}">${escapeHtml(shortText(item.product_title || item.product_id, 96))}</button>
+            <div class="muted-line">${escapeHtml(item.product_id)} · ${escapeHtml(item.date_record || '')}</div>
+            ${item.error_msg ? `<div class="pod-asset-error">${escapeHtml(shortText(item.error_msg, 120))}</div>` : ''}
+          </td>
+          <td>${podAssetImageButton(item.illustration_image_url, item.product_title, '暂无插画')}</td>
+          <td>${podAssetImageButton(item.phone_case_image_url, item.product_title, '暂无手机壳')}</td>
+          <td>${podAssetStatusBadge(item.extract_status, 'extract')}</td>
+          <td>${podAssetStatusBadge(item.phone_case_status, 'phone')}</td>
+          <td>${escapeHtml(item.date_record || '-')}</td>
+          <td>${escapeHtml(item.updated_at || '-')}</td>
+          <td class="pod-actions"><button type="button" data-phone-case-asset="${escapeHtml(item.id)}">重新生成手机壳</button></td>
+        </tr>
+      `).join('')}</tbody></table></div>`;
+    }
+
+    function bindPodAssetActions() {
+      bindRowActions();
+      document.querySelectorAll('[data-phone-case-asset]').forEach(btn => btn.addEventListener('click', async () => {
+        const assetId = btn.dataset.phoneCaseAsset;
+        btn.disabled = true;
+        btn.textContent = '生成中...';
+        try {
+          const res = await fetch(`/api/pod-illustration-assets/${encodeURIComponent(assetId)}/phone-case`, { method: 'POST' });
+          const json = await res.json();
+          if (!json.ok) throw new Error(json.error || '手机壳生成失败');
+          showToast('手机壳图已生成');
+          loadPodIllustrationAssets();
+        } catch (error) {
+          showToast(error.message || '手机壳生成失败');
+          btn.disabled = false;
+          btn.textContent = '重新生成手机壳';
+        }
+      }));
     }
 
     function detailAnalysisRecordsHtml(items) {
@@ -694,14 +857,18 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadDetailAnalyses() {
+      const token = nextRequestToken('detailAnalyses');
+      const analysisType = state.detailAnalysisType;
       try {
         const res = await fetch(`/api/detail-analyses?analysis_type=${encodeURIComponent(state.detailAnalysisType)}`);
+        if (!isCurrentRequest('detailAnalyses', token) || state.mode !== 'detailAnalysis' || state.detailAnalysisType !== analysisType) return;
         if (!res.ok) {
           renderDetailAnalysisPage([], false);
           document.querySelector('.detail-analysis-records').innerHTML = `<div class="detail-empty">深度分析接口暂不可用，请确认后端已重启并加载最新代码。HTTP ${res.status}</div>`;
           return;
         }
         const json = await res.json();
+        if (!isCurrentRequest('detailAnalyses', token) || state.mode !== 'detailAnalysis' || state.detailAnalysisType !== analysisType) return;
         if (!json.ok) {
           renderDetailAnalysisPage([], false);
           document.querySelector('.detail-analysis-records').innerHTML = `<div class="detail-empty">${escapeHtml(json.error || '深度分析记录加载失败')}</div>`;
@@ -709,6 +876,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
         }
         renderDetailAnalysisPage(json.data.items || [], false);
       } catch (error) {
+        if (!isCurrentRequest('detailAnalyses', token) || state.mode !== 'detailAnalysis' || state.detailAnalysisType !== analysisType) return;
         renderDetailAnalysisPage([], false);
         document.querySelector('.detail-analysis-records').innerHTML = '<div class="detail-empty">深度分析记录加载失败，请确认后端服务已重启。</div>';
       }
@@ -870,15 +1038,18 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
 
     async function applyDatePreset(preset) {
       if (preset === 'custom') return;
-      const latest = await getLatestCollectionDate();
+      const source = state.source;
+      const mode = state.mode;
+      const latest = await getLatestCollectionDate(source);
+      if (state.mode !== mode || state.source !== source) return;
       const days = preset === 'yesterday' ? 1 : Number(preset.replace('d', '')) || 7;
       setFilterValue('dateStart', formatDate(shiftDate(latest, -(days - 1))));
       setFilterValue('dateEnd', formatDate(latest));
     }
 
-    async function getLatestCollectionDate() {
+    async function getLatestCollectionDate(source = state.source) {
       try {
-        const res = await fetch(`/api/products/latest-date?source=${state.source}`);
+        const res = await fetch(`/api/products/latest-date?source=${source}`);
         const json = await res.json();
         if (json.ok && json.data.latest_date) return new Date(json.data.latest_date.slice(0, 10));
       } catch (error) {
@@ -903,7 +1074,9 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadDefaultDateAndData() {
-      const latest = await getLatestCollectionDate();
+      const source = state.source;
+      const latest = await getLatestCollectionDate(source);
+      if (state.mode !== 'products' || state.source !== source) return;
       activeFilterKeys.add('dateRecord');
       setFilterValue('dateStart', formatDate(latest));
       setFilterValue('dateEnd', formatDate(latest));
@@ -935,7 +1108,10 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       return `${start || '开始日期'} → ${end || '结束日期'}`;
     }
 
-    async function loadAll() { await Promise.all([loadStats(), loadProducts()]); }
+    async function loadAll() {
+      if (state.mode !== 'products') return;
+      await Promise.all([loadStats(), loadProducts()]);
+    }
     function buildParams() {
       const derivedPeriod = derivePeriodFromCollectionDates();
       $('period').value = derivedPeriod;
@@ -948,10 +1124,14 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadProducts() {
+      if (state.mode !== 'products') return;
+      const token = nextRequestToken('products');
+      const source = state.source;
       $('content').innerHTML = '<div style="text-align: center; padding: 100px;"><div style="border: 4px solid #f3f3f3; border-top: 4px solid #007bff; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto;"></div><p style="margin-top:15px; color: #666; font-size: 14px;">数据加载中，请稍候...</p></div><style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>';
       try {
         const res = await fetch(`/api/products?${buildParams()}`);
         const json = await res.json();
+        if (!isCurrentProductView(token, source)) return;
         if (!json.ok) {
           $('content').innerHTML = '<div class="empty">加载失败</div>';
           return showToast(json.error || '加载失败');
@@ -964,6 +1144,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
         renderItems();
         renderPager();
       } catch (error) {
+        if (!isCurrentProductView(token, source)) return;
         $('content').innerHTML = '<div class="empty">网络请求失败，请稍后重试</div>';
         showToast('网络请求失败');
       }
@@ -989,6 +1170,9 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
     }
 
     async function loadStats() {
+      if (state.mode !== 'products') return;
+      const token = nextRequestToken('stats');
+      const source = state.source;
       const params = buildParams();
       params.delete('page');
       params.delete('page_size');
@@ -997,6 +1181,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       params.delete('sort_order');
       const res = await fetch(`/api/products/stats?${params}`);
       const json = await res.json();
+      if (!isCurrentStatsView(token, source)) return;
       if (!json.ok) return;
       const data = json.data;
       if (state.source === 'pod_cross_category') {
@@ -1032,7 +1217,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
         renderPodTable();
         return;
       }
-      $('content').innerHTML = `<div class="table-wrap"><table><thead><tr>
+      $('content').innerHTML = `<div class="table-wrap"><table class="pod-table"><thead><tr>
         <th>商品图</th><th>商品标题</th><th>${sortHeader('score', '选品分')}</th><th>${sortHeader('product_card_sales', '商品卡销量')}</th><th>近7天销量占比</th><th>近28天销量占比</th>
         <th>${sortHeader('total_sold', '总销量')}</th><th class="metric-header">${sortHeader('sales_growth', '销售环比')}<span class="metric-hint" title="销售环比 = ((当前销量 / 上期销量) - 1) * 100%。当前销量按所选采集日期范围求和，上期销量取前一段同等数量的采集日期；上期销量为0时展示N/A。">?</span></th>
         <th>${sortHeader('product_card_ratio', '商品卡占比')}</th><th>${sortHeader('launch_time', '上架时间')}</th><th>${sortHeader('rating', '评分')}</th><th>${sortHeader('ip_grade', 'IP等级')}</th>
@@ -1067,7 +1252,7 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
         <td>${escapeHtml(item.aweme_count || '0')}</td>
         <td>${escapeHtml(item.launch_time)}</td>
         <td>${illustrationStatusBadge(item.illustration_status ?? item.pod_status, item.illustration_result_url, item.illustration_extractable)}${illustrationExtractabilityBadge(item)}${illustrationCheckButton(item)}</td>
-        <td>${platformLinks(item)}</td>
+        <td class="pod-links-cell">${platformLinks(item)}</td>
         <td class="pod-actions"><button data-detail="${item.product_id}" data-date="${item.date_record}">站内详情</button>${podExtractButton(item)}</td>
       </tr>`;
     }
@@ -1690,7 +1875,26 @@ D:\\choice_product\\static\\styles.css">${escapeHtml(state.expertBaseFiles)}</te
       const value = fields[`distribution_${period}`]
         || (period === '30d' ? raw.content_ratio : raw.distribution_7d)
         || raw[`distribution_${period}`];
-      return parseMaybeJson(value) || [];
+      return parseDistributionValue(value);
+    }
+
+    function parseDistributionValue(value) {
+      const parsed = parseMaybeJson(value);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && typeof parsed === 'object') return Object.entries(parsed).map(([name, item]) => (
+        item && typeof item === 'object' ? { name, ...item } : { name, percentage: item }
+      ));
+      const text = String(value || '').trim();
+      if (!text) return [];
+      return text.split('||').map(part => {
+        const pieces = part.split('&&').map(item => item.trim()).filter(Boolean);
+        if (!pieces.length) return null;
+        return {
+          name: pieces[0],
+          percentage: pieces[1] || '',
+          sales: pieces[2] || pieces[1] || 0,
+        };
+      }).filter(Boolean);
     }
 
     function distributionPanel(title, distribution) {

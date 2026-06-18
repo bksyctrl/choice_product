@@ -17,12 +17,14 @@ from pathlib import Path
 
 import pymysql
 import requests
+import cv2
+import numpy as np
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session
 from flask_cors import CORS
 from openai import OpenAI
 from openpyxl import Workbook
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -83,9 +85,9 @@ SCORE_RECALC_MAX_ATTEMPTS = max(1, int(os.getenv("SCORE_RECALC_MAX_ATTEMPTS", "3
 SCORE_RECALC_LATEST_ONLY = os.getenv("SCORE_RECALC_LATEST_ONLY", "false").strip().lower() == "true"
 SCORE_AUTO_CREATE_INDEXES = os.getenv("SCORE_AUTO_CREATE_INDEXES", "false").strip().lower() == "true"
 ILLUSTRATION_DAEMON_ENABLED = os.getenv("ILLUSTRATION_DAEMON_ENABLED", "true").strip().lower() != "false"
-ILLUSTRATION_DAEMON_INTERVAL_SECONDS = int(os.getenv("ILLUSTRATION_DAEMON_INTERVAL_SECONDS", "120"))
-ILLUSTRATION_DAEMON_BATCH_SIZE = max(20, int(os.getenv("ILLUSTRATION_DAEMON_BATCH_SIZE", "120")))
-ILLUSTRATION_DAEMON_CONCURRENCY = max(1, min(8, int(os.getenv("ILLUSTRATION_DAEMON_CONCURRENCY", "4"))))
+ILLUSTRATION_DAEMON_INTERVAL_SECONDS = int(os.getenv("ILLUSTRATION_DAEMON_INTERVAL_SECONDS", "180"))
+ILLUSTRATION_DAEMON_BATCH_SIZE = max(20, int(os.getenv("ILLUSTRATION_DAEMON_BATCH_SIZE", "40")))
+ILLUSTRATION_DAEMON_CONCURRENCY = max(1, min(8, int(os.getenv("ILLUSTRATION_DAEMON_CONCURRENCY", "2"))))
 ILLUSTRATION_DAEMON_SOURCES = [
     item.strip()
     for item in os.getenv("ILLUSTRATION_DAEMON_SOURCES", "pod_cross_category").split(",")
@@ -95,8 +97,49 @@ ILLUSTRATION_DAEMON_LATEST_ONLY = os.getenv("ILLUSTRATION_DAEMON_LATEST_ONLY", "
 MINIMAX_IMAGE_GENERATION_URL = os.getenv("MINIMAX_IMAGE_GENERATION_URL", "https://api.minimax.io/v1/image_generation")
 MINIMAX_IMAGE_MODEL = os.getenv("MINIMAX_IMAGE_MODEL", "image-01")
 MINIMAX_IMAGE_SUBJECT_TYPE = os.getenv("MINIMAX_IMAGE_SUBJECT_TYPE", "character")
+POD_IMAGE_PROVIDER = os.getenv("POD_IMAGE_PROVIDER", "kie").strip().lower()
+KIE_API_KEY = os.getenv("KIE_API_KEY", "").strip()
+KIE_CREATE_TASK_URL = os.getenv("KIE_CREATE_TASK_URL", "https://api.kie.ai/api/v1/jobs/createTask")
+KIE_RECORD_INFO_URL = os.getenv("KIE_RECORD_INFO_URL", "https://api.kie.ai/api/v1/jobs/recordInfo")
+KIE_FILE_UPLOAD_URL = os.getenv("KIE_FILE_UPLOAD_URL", "https://kieai.redpandaai.co/api/file-base64-upload")
+KIE_IMAGE_MODEL = os.getenv("KIE_IMAGE_MODEL", "nano-banana-2")
+KIE_IMAGE_ASPECT_RATIO = os.getenv("KIE_IMAGE_ASPECT_RATIO", "auto")
+KIE_IMAGE_RESOLUTION = os.getenv("KIE_IMAGE_RESOLUTION", "1K")
+KIE_IMAGE_OUTPUT_FORMAT = os.getenv("KIE_IMAGE_OUTPUT_FORMAT", "png")
+KIE_USE_IMAGE_INPUT = os.getenv("KIE_USE_IMAGE_INPUT", "false").strip().lower() == "true"
+KIE_POLL_TIMEOUT_SECONDS = max(30, int(os.getenv("KIE_POLL_TIMEOUT_SECONDS", "300")))
+KIE_POLL_INTERVAL_SECONDS = max(1, int(os.getenv("KIE_POLL_INTERVAL_SECONDS", "5")))
+POD_USE_IMAGE_DESCRIPTION = os.getenv("POD_USE_IMAGE_DESCRIPTION", "false").strip().lower() == "true"
+POD_DIRECT_IMAGE_PROMPT = os.getenv(
+        "POD_DIRECT_IMAGE_PROMPT",
+        (
+            "[SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]\n"
+            "You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.\n"
+            "[CORE DIRECTIVE]\n"
+            "Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.\n"
+            "[EXECUTION RULES]\n"
+            "Focus: Zoom in exclusively on the core motif, illustration, or text.\n"
+            "Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.\n"
+            "Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.\n"
+            "Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.\n"
+            "STRICT STYLE AND COLOR FIDELITY: Follow the reference image exactly. Preserve the original typography family and stroke style. If the source text is handwritten script/cursive, keep it handwritten script/cursive; do not convert it into bold block letters, slab serif, varsity lettering, bubble letters, or heavy outlined text. Preserve soft watercolor or pastel color mood. Do not replace pale blue, dusty blue, coral, pink, muted red, or soft ink colors with saturated navy, royal blue, black outlines, or high-contrast comic colors. Do not add thick dark outlines unless explicitly described."
+        ),
+).strip()
+PHONE_CASE_IMAGE_PROMPT = os.getenv(
+    "PHONE_CASE_IMAGE_PROMPT",
+    (
+        "将参考图中的插画完整贴到一台苹果17手机壳背面。只展示手机壳背面，不要手机屏幕，不要手，不要人物。"
+        "插画必须清晰覆盖在手机壳背面的可印刷区域，不能是空白手机壳，不能省略插画，不能把插画放在手机壳旁边。"
+    ),
+).strip()
+PHONE_CASE_IMAGE_PROVIDER = os.getenv("PHONE_CASE_IMAGE_PROVIDER", "kie").strip().lower()
+PHONE_CASE_USE_LOCAL_FALLBACK = os.getenv("PHONE_CASE_USE_LOCAL_FALLBACK", "true").strip().lower() != "false"
+KIE_PHONE_CASE_ASPECT_RATIO = os.getenv("KIE_PHONE_CASE_ASPECT_RATIO", "1:1")
+KIE_PHONE_CASE_RESOLUTION = os.getenv("KIE_PHONE_CASE_RESOLUTION", KIE_IMAGE_RESOLUTION)
+KIE_PHONE_CASE_OUTPUT_FORMAT = os.getenv("KIE_PHONE_CASE_OUTPUT_FORMAT", KIE_IMAGE_OUTPUT_FORMAT)
 MINIMAX_ILLUSTRATION_MAX_ATTEMPTS = max(1, min(5, int(os.getenv("MINIMAX_ILLUSTRATION_MAX_ATTEMPTS", "3"))))
 MINIMAX_ILLUSTRATION_PASS_SCORE = max(0, min(100, int(os.getenv("MINIMAX_ILLUSTRATION_PASS_SCORE", "85"))))
+POD_ILLUSTRATION_QC_ENABLED = os.getenv("POD_ILLUSTRATION_QC_ENABLED", "false").strip().lower() == "true"
 POD_ILLUSTRATION_STALE_MINUTES = max(1, int(os.getenv("POD_ILLUSTRATION_STALE_MINUTES", "10")))
 DETAIL_ANALYSIS_TABLE = "cp_user_detail_analysis"
 EXPERT_TEAM_SESSION_TABLE = "cp_expert_team_session"
@@ -418,14 +461,14 @@ SOURCES = {
         "transport_fee": "transport_fee",
         "video_ratio": None,
         "product_card_ratio": None,
-        "distribution_30d": None,
-        "distribution_7d": None,
-        "distribution_90d": None,
-        "distribution_180d": None,
-        "overview_30d": None,
-        "overview_7d": None,
-        "overview_90d": None,
-        "overview_180d": None,
+        "distribution_30d": "content_ratio",
+        "distribution_7d": "distribution_7d",
+        "distribution_90d": "distribution_90d",
+        "distribution_180d": "distribution_180d",
+        "overview_30d": "sales_overview",
+        "overview_7d": "overview_7d",
+        "overview_90d": "overview_90d",
+        "overview_180d": "overview_180d",
         "sku_analysis_7d": "sku_analysis_7d",
         "sku_analysis_28d": "sku_analysis_28d",
         "detail_url": "detail_url",
@@ -836,7 +879,7 @@ def create_app():
             )
             conn.commit()
         try:
-            print(f"[POD_EXTRACT] calling minimax task_id={task_id}", flush=True)
+            print(f"[POD_EXTRACT] calling cutout extraction task_id={task_id}", flush=True)
             result_url = call_minimax_illustration_generation(
                 product.get("image_value"),
                 product.get("title") or "",
@@ -863,6 +906,13 @@ def create_app():
                     (result_url, product_id, task_date),
                 )
                 conn.commit()
+            try:
+                generate_and_store_phone_case_asset(product, image_url, result_url, task_id)
+            except Exception as asset_exc:
+                print(
+                    f"[POD_ASSET] side effect failed task_id={task_id} error={stringify(asset_exc)[:500]}",
+                    flush=True,
+                )
             print(f"[POD_EXTRACT] success task_id={task_id} result_url={result_url}", flush=True)
             return api_ok({
                 "task_id": task_id,
@@ -873,24 +923,51 @@ def create_app():
         except Exception as exc:
             error_msg = stringify(exc)[:1000]
             print(f"[POD_EXTRACT] failed task_id={task_id} error={error_msg}", flush=True)
+            existing_result_url = stringify(product.get("illustration_result_url")).strip()
             with db() as conn, conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE pod_illustration_task
-                    SET status = 3, error_msg = %s
-                    WHERE task_id = %s
-                    """,
-                    (error_msg, task_id),
-                )
-                cursor.execute(
-                    """
-                    UPDATE pod_cross_category_product
-                    SET illustration_status = 3
-                    WHERE product_id = %s AND date_record = %s
-                    """,
-                    (product_id, task_date),
-                )
+                if existing_result_url:
+                    cursor.execute(
+                        """
+                        UPDATE pod_illustration_task
+                        SET status = 2, result_image_url = %s, error_msg = %s
+                        WHERE task_id = %s
+                        """,
+                        (existing_result_url, f"重新提取失败，保留已有结果：{error_msg}", task_id),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE pod_cross_category_product
+                        SET illustration_status = 2,
+                            illustration_result_url = %s
+                        WHERE product_id = %s AND date_record = %s
+                        """,
+                        (existing_result_url, product_id, task_date),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE pod_illustration_task
+                        SET status = 3, error_msg = %s
+                        WHERE task_id = %s
+                        """,
+                        (error_msg, task_id),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE pod_cross_category_product
+                        SET illustration_status = 3
+                        WHERE product_id = %s AND date_record = %s
+                        """,
+                        (product_id, task_date),
+                    )
                 conn.commit()
+            if existing_result_url:
+                return api_ok({
+                    "task_id": task_id,
+                    "status": 2,
+                    "result_image_url": existing_result_url,
+                    "message": f"重新提取失败，已保留已有结果：{error_msg}",
+                })
             return api_error(f"插画生成失败：{error_msg}", 502)
 
     @app.get("/api/products/pod_cross_category/extract-tasks/<task_id>")
@@ -910,6 +987,71 @@ def create_app():
         if not task:
             return api_error("任务不存在", 404)
         return api_ok({key: serialize_value(value) for key, value in task.items()})
+
+    @app.get("/api/pod-illustration-assets")
+    def list_pod_illustration_assets():
+        require_current_user()
+        page = max(1, parse_int(request.args.get("page"), 1) or 1)
+        page_size = max(1, min(100, parse_int(request.args.get("page_size"), 30) or 30))
+        offset = (page - 1) * page_size
+        keyword = stringify(request.args.get("keyword")).strip()
+        where = []
+        params = []
+        if keyword:
+            where.append("(product_title LIKE %s OR CAST(product_id AS CHAR) LIKE %s)")
+            like = f"%{keyword}%"
+            params.extend([like, like])
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(f"SELECT COUNT(*) AS total FROM pod_illustration_asset {where_sql}", params)
+            total = int((cursor.fetchone() or {}).get("total") or 0)
+            cursor.execute(
+                f"""
+                SELECT id, source, product_id, date_record, product_title, product_image_url,
+                       illustration_image_url, phone_case_image_url, extract_status,
+                       phone_case_status, extract_task_id, phone_case_task_id, error_msg,
+                       created_at, updated_at
+                FROM pod_illustration_asset
+                {where_sql}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [page_size, offset],
+            )
+            items = cursor.fetchall()
+        return api_ok({"items": items, "total": total, "page": page, "page_size": page_size})
+
+    @app.post("/api/pod-illustration-assets/<int:asset_id>/phone-case")
+    def regenerate_pod_asset_phone_case(asset_id):
+        require_current_user()
+        with db() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, source, product_id, date_record, product_title, product_image_url,
+                       illustration_image_url, extract_task_id
+                FROM pod_illustration_asset
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (asset_id,),
+            )
+            asset = cursor.fetchone()
+        if not asset:
+            return api_error("插画资产不存在", 404)
+        if not stringify(asset.get("illustration_image_url")).strip():
+            return api_error("插画图为空，无法生成手机壳图", 400)
+        product = {
+            "product_id": asset.get("product_id"),
+            "date_record": asset.get("date_record"),
+            "title": asset.get("product_title"),
+        }
+        phone_case_url = generate_and_store_phone_case_asset(
+            product,
+            stringify(asset.get("product_image_url")),
+            stringify(asset.get("illustration_image_url")),
+            stringify(asset.get("extract_task_id") or f"asset_{asset_id}"),
+        )
+        return api_ok({"phone_case_image_url": phone_case_url})
 
     @app.post("/api/products/<source>/<product_id>/illustration-check")
     def check_product_illustration_extractable(source, product_id):
@@ -1522,9 +1664,20 @@ def normalize_vision_image_url(image_value):
     value = stringify(image_value).strip()
     if not value:
         return ""
-    if value.startswith("data:image/") or value.startswith("http://") or value.startswith("https://"):
+    if value.startswith("http://") or value.startswith("https://"):
         return value
-    return "data:image/jpeg;base64," + value
+    raw_value = value
+    if value.startswith("data:image/") and "," in value:
+        raw_value = value.split(",", 1)[1]
+    try:
+        image = Image.open(io.BytesIO(base64.b64decode(raw_value, validate=False))).convert("RGB")
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=92)
+        return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+    except Exception:
+        if value.startswith("data:image/"):
+            return value
+        return "data:image/jpeg;base64," + value
 
 
 def decode_image_value(image_value):
@@ -1592,6 +1745,44 @@ def parse_llm_json_object(raw_text):
         return json.loads(text)
     except Exception:
         return {}
+
+
+def sanitize_artwork_description(raw_text):
+    text = strip_llm_think_blocks(raw_text)
+    text = re.sub(r"```(?:[a-zA-Z]+)?", "", text).replace("```", "").strip()
+    markers = (
+        "A perfectly flat 2D printable artwork asset",
+        "A perfectly flat 2D print pattern asset",
+        "A detailed, high-resolution photo",
+    )
+    marker_positions = [text.find(marker) for marker in markers if text.find(marker) >= 0]
+    if marker_positions:
+        text = text[min(marker_positions):]
+    text = re.sub(r"\s+--(?:v|ar|style|s|q|chaos|seed)\s+\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1200]
+
+
+def is_missing_image_response(raw_text):
+    text = stringify(raw_text).lower()
+    markers = (
+        "don't see an image",
+        "do not see an image",
+        "no image attached",
+        "image is not attached",
+        "please upload",
+        "try uploading",
+        "provide the reference image",
+        "cannot view the image",
+        "can't view the image",
+        "无法看到图片",
+        "没有看到图片",
+        "未检测到图像数据",
+        "未提供图片",
+        "请上传",
+        "请提供图片",
+    )
+    return any(marker in text for marker in markers)
 
 
 def call_minimax_api_with_retry(url, api_key, payload, timeout=90, max_retries=3):
@@ -1697,55 +1888,570 @@ def analyze_illustration_extractability(image_value, title=""):
 
 def generate_artwork_description(api_key, image_url):
     system_prompt = '''角色设定 (Role):
-你现在是一位顶级的数字资产提取专家和高级纹理艺术家。你的任务是敏锐地观察用户上传的产品参考图，并为图像生成模型（如 Midjourney, DALL-E, 或 Stable Diffusion）撰写极其精确的英文提示词（Prompt），目的是将附着在 3D 物品上的平面图案完美剥离出来。
+你现在是一位顶级的数字资产提取专家和高级纹理艺术家。你的任务是观察用户上传的产品参考图，并为图像生成模型撰写极其精确的英文提示词（Prompt），目标是将商品表面的可印刷图案剥离为纯二维平面素材。
 
 工作流 (Workflow):
-视觉解构： 忽略所有 3D 结构（包的形状、衣服的褶皱、人物、背景、光影）。只盯住“印刷图案”本身。
-细节提取： 准确识别图案的风格、核心元素（如花朵、几何体、Logo）、排列方式（单图居中还是无缝平铺铺满）、精确的颜色组成以及底色。
-排除干扰： 敏锐识别出必须去除的元素（如水印、品牌 Logo、缝线、拉链、反光）。
-输出提示词： 根据以上分析，输出一段用于生成平面资产的英文提示词。
+视觉解构：忽略所有 3D 结构（包型、背包/手提包轮廓、衣服版型、人物、背景、光影、透视）。只盯住“可印刷的二维图案”本身。
+细节提取：准确识别图案的风格、核心元素、排列方式（单图居中或无缝平铺）、颜色组成和底色。只能描述图片中真实可见的元素，不能根据品类或示例自行补花朵、动物、植物、几何等不存在的内容。
+排除干扰：必须去除商品本体和所有三维元素，例如包、背包、手提包、衣服、手柄、肩带、拉链、纽扣、金属扣、缝线、口袋、皮革高光、布料褶皱、阴影、透视、模特、背景、水印、品牌 Logo、商标文字。
+输出提示词：输出一段用于生成纯二维平面图案资产的英文提示词。
 
 提示词撰写规则 (Rules for Prompt Writing):
-首句定调： 必须以 "A detailed, high-resolution photo of a flat, seamless textile pattern swatch..." 开头。
-详尽描述图案： 用专业的视觉词汇描述提取出的图案细节。
-强化否定指令： 明确指出“不要什么”。
-格式要求： 只输出最终的英文提示词本身，不需要任何解释。'''.strip()
+首句定调：必须以 "A perfectly flat 2D printable artwork asset..." 开头；不要默认写 seamless/repeating，只有原图确实是满版循环纹样时才描述为 seamless/repeating。
+详尽描述图案：用专业视觉词汇描述可剥离的图案细节。
+排布规则：必须保留原图的图案排布类型；如果原图是单个胸前图案、背后大图、徽章、单句文字或局部小图标，就描述为 single centered/front/back graphic 或 isolated motif，不要改成循环平铺；只有原图本身是满版重复印花时才描述为 seamless repeating pattern。
+强化否定指令：明确禁止任何商品照片、包、背包、衣服、手柄、肩带、拉链、硬件、透视、阴影、3D体积。
+真实性规则：不要猜测、不要套模板、不要把示例元素写成图中元素；如果没有看到图片或无法识别图案，只输出 NEED_RETRY_IMAGE_NOT_VISIBLE。
+格式要求：只输出最终的英文提示词本身，不需要任何解释。'''.strip()
 
     prompt = {
         "system": system_prompt,
-        "user_text": "请观察这张图片并直接输出英文提示词（Prompt）。",
+        "user_text": (
+            "请观察这张图片并直接输出英文提示词（Prompt）。"
+            "只能描述图片里真实可见的可印刷二维图案元素；不要发散、不要补其他未出现的元素。"
+            "如果没有收到图片或看不清图案，只输出 NEED_RETRY_IMAGE_NOT_VISIBLE。"
+        ),
     }
 
-    print(f"[MINIMAX_VISION] Requesting artwork description for image...", flush=True)
-    try:
-        raw_answer = call_product_vision_minimax(prompt, image_url)
-        return stringify(raw_answer).strip()
-    except Exception as exc:
-        print(f"[MINIMAX_VISION] Artwork description error: {exc}", flush=True)
-        raise RuntimeError("无法获取原图的插画描述") from exc
+    last_answer = ""
+    last_error = None
+    for attempt in range(1, 4):
+        print(f"[MINIMAX_VISION] Requesting artwork description for image attempt={attempt}...", flush=True)
+        try:
+            raw_answer = call_product_vision_minimax(prompt, image_url)
+            last_answer = stringify(raw_answer)
+            if is_missing_image_response(last_answer) or "NEED_RETRY_IMAGE_NOT_VISIBLE" in last_answer:
+                print(
+                    f"[MINIMAX_VISION] artwork description missing image attempt={attempt} "
+                    f"raw={last_answer[:220]}",
+                    flush=True,
+                )
+                time.sleep(attempt)
+                continue
+            description = sanitize_artwork_description(raw_answer)
+            if not description:
+                raise RuntimeError(f"图片描述为空，raw={last_answer[:300]}")
+            if is_missing_image_response(description):
+                time.sleep(attempt)
+                continue
+            return description
+        except Exception as exc:
+            last_error = exc
+            print(f"[MINIMAX_VISION] Artwork description error attempt={attempt}: {exc}", flush=True)
+            time.sleep(attempt)
+    if last_error:
+        raise RuntimeError(f"无法获取原图的插画描述: {last_error}") from last_error
+    raise RuntimeError(f"无法获取原图的插画描述，视觉接口未识别到图片: {last_answer[:300]}")
 
-def build_illustration_generation_prompt(artwork_description="", retry_feedback=""):
+def generate_artwork_description(api_key, image_url):
+    system_prompt = """
+You are a product print description assistant.
+Your task is simple: observe the product image and describe the visible printed design as a precise but compact structure specification for a later image generation step.
+
+Focus only on these aspects:
+1. exact visible text content, especially line breaks
+2. visible graphic or illustration content
+3. number of motifs or symbols when clear
+4. pixel-level bounding boxes and normalized positions
+5. design size relative to the product
+6. design layout, spacing, alignment, and ordering
+7. typography or visual style
+8. design colors
+9. flat presentation background color needed to preserve the source print contrast
+
+Rules:
+- Preserve visible text exactly as seen. Do not rewrite, translate, correct, or invent text.
+- Preserve every visible word. Do not abbreviate, summarize, merge lines, drop small words, or replace words with similar-looking fake text.
+- If text has multiple lines, list each line separately.
+- If text is partially unreadable, say partially unreadable.
+- Describe the graphic elements plainly and concretely.
+- Count visible motifs when the count is clear, such as one flag, five icons, two stars, four flowers.
+- Estimate pixel bounding boxes for the whole print, the main graphic symbol, and the text block. Use source image coordinates with origin at top-left.
+- For each bbox use the format x,y,w,h in pixels. If pixel dimensions are provided in the user message, estimate against that canvas size.
+- State whether the design is tiny, small, medium, or large relative to the product, and estimate its relative width or area when possible.
+- State exact relative placement: centered, top-centered, upper chest, lower chest, left, right, above text, below text, around text, etc.
+- Preserve the ordering of elements, such as "small flag above four text lines" or "five icons in one horizontal row above one text line".
+- State if the design is sparse and has large empty space around it.
+- Judge alignment by the printed design itself, not by the model pose or garment wrinkles. If the text block is visually centered under a symbol, say centered, never left-aligned.
+- For a flag-and-text chest print: describe the flag as small if it is narrower than the text block; describe its exact position above the text; estimate flag width relative to the text block; describe every text line separately.
+- Describe text block position and spacing: where the text block sits relative to the flag, whether it is directly below, the approximate vertical gap, whether each line is centered, and whether line spacing is tight/normal/wide.
+- For a sparse chest print occupying roughly one quarter to one third of the product width, call it a small compact chest print, not medium or large.
+- When a symbol sits above text, compare the symbol size with the text block, such as "the flag is much smaller than the text block" or "the icon row is slightly wider than the text".
+- If there are multiple visible motifs, mention their count when clear.
+- If the printed design uses white or light text on a dark carrier, estimate the carrier color directly behind the print and provide it as a flat presentation background color. Use clean color names and approximate hex when possible, such as faded dark charcoal gray #3f3d36, washed black gray #34332f, or muted blue gray #6f8796.
+- Do not describe the carrier as a product. Describe only "flat presentation background color" with no fabric, no shirt, no texture, no folds.
+- Do not invent new elements.
+- If the design is not clearly visible, output only NEED_RETRY_IMAGE_NOT_VISIBLE.
+
+Output format:
+T: ...
+G: ...
+P: ...
+C: ...
+BG: ...
+LOCK: ...
+
+Line requirements:
+- T must preserve exact text lines using L1/L2/L3/L4 labels. Include "4 lines, no omissions".
+- G must describe motif count, symbol-to-text order, symbol width, alignment, and compact scale in one short line.
+- P must estimate pixel bboxes for print, flag/icon, and text block: print_bbox=x,y,w,h; flag_bbox=x,y,w,h; text_bbox=x,y,w,h. Include source image size if known.
+- C must list exact printed colors and typography in one short line. Include "pure white text, not gray" when visible.
+- C must preserve typography style and color mood, not only color names. If the source is thin handwritten script, watercolor, pastel, muted, dusty, faded, or low-saturation, say so explicitly. If the source has no heavy outline, say no heavy outline.
+- BG must state the flat presentation background color needed for contrast. If the source behind the print is faded charcoal gray, washed black, dusty blue, etc., give an approximate hex. Do not say shirt, clothing, fabric, or product.
+- LOCK must include no fake/missing text, no clothing/mockup/source surface/photo background. Also include no font style change, no block/slab font, no heavy outline, and no oversaturated colors when relevant.
+- Keep the complete output under 1100 characters. Do not omit text, pixel boxes, layout, typography style, color mood, background color, or locks.
+
+No markdown. No explanations. Output only the 6 short lines above.
+""".strip()
+
+    image_size_hint = ""
+    source_image = image_value_to_pil(image_url)
+    if source_image is not None:
+        image_size_hint = f" Source image size is {source_image.width}x{source_image.height} pixels; estimate all bboxes in this pixel coordinate system."
+
+    prompt = {
+        "system": system_prompt,
+        "user_text": (
+            "Observe the product image and describe the printed design only. "
+            "Return exactly 6 short lines: T, G, P, C, BG, LOCK. "
+            "Keep text exact with L1/L2/L3 labels. Include line count, no omitted words, graphic count, size, layout, estimated pixel bboxes, exact printed colors, and locks. "
+            f"{image_size_hint} "
+            "T must include the total text line count and warn that no words may be omitted. "
+            "P must include print_bbox, flag_bbox/icon_bbox, and text_bbox using x,y,w,h pixel estimates. "
+            "C must state whether text is pure white, light gray, black, or another exact visible color. "
+            "For script text, describe it as handwritten script/cursive, thin or medium stroke, watercolor/soft ink if visible, and explicitly say not block font, not slab serif, not bold outline. "
+            "For pastel red/blue designs, describe colors as muted/pastel/dusty/watercolor red and pale blue, not saturated navy unless actually visible. "
+            "BG must state the flat presentation background color behind the print with a clean color name and approximate hex. For faded dark gray, do not simplify to pure black. "
+            "For text graphics, state centered or left-aligned based on the print itself. "
+            "If a small flag or icon sits above text, state that it is small, above the text, smaller than the text block, and estimate its relative width. "
+            "State text block position, vertical gap from graphic to text, line alignment, and line spacing. "
+            "TYPOGRAPHY_LINES must mention every visible text line separately, including serif/sans/script, uppercase/mixed case, italic, regular/bold, and relative text size. "
+            "In BG, never write shirt, t-shirt, clothing, garment, fabric, product, or photo background; write only flat presentation background color. "
+            "In LOCK, explicitly include no clothing, no product mockup, no source surface, no source-color background. "
+            "In LOCK, explicitly include no missing words, no fake letters, no text abbreviation, no font-style change, no heavy dark outline, no block/slab font, no oversaturated navy, and no gray text if the source text is white. "
+            "Make the description detailed enough to reconstruct the same printed design rather than a new poster or product mockup. "
+            "If the design is unclear, output only NEED_RETRY_IMAGE_NOT_VISIBLE."
+        ),
+    }
+
+    last_answer = ""
+    last_error = None
+    for attempt in range(1, 4):
+        print(f"[MINIMAX_VISION] Requesting artwork description for image attempt={attempt}...", flush=True)
+        try:
+            raw_answer = call_product_vision_minimax(prompt, image_url)
+            last_answer = stringify(raw_answer)
+            if is_missing_image_response(last_answer) or "NEED_RETRY_IMAGE_NOT_VISIBLE" in last_answer:
+                print(
+                    f"[MINIMAX_VISION] artwork description missing image attempt={attempt} "
+                    f"raw={last_answer[:220]}",
+                    flush=True,
+                )
+                time.sleep(attempt)
+                continue
+            description = sanitize_artwork_description(raw_answer)
+            if not description:
+                raise RuntimeError(f"鍥剧墖鎻忚堪涓虹┖锛宺aw={last_answer[:300]}")
+            if is_missing_image_response(description):
+                time.sleep(attempt)
+                continue
+            return description
+        except Exception as exc:
+            last_error = exc
+            print(f"[MINIMAX_VISION] Artwork description error attempt={attempt}: {exc}", flush=True)
+            time.sleep(attempt)
+    if last_error:
+        raise RuntimeError(f"鏃犳硶鑾峰彇鍘熷浘鐨勬彃鐢绘弿杩? {last_error}") from last_error
+    raise RuntimeError(f"鏃犳硶鑾峰彇鍘熷浘鐨勬彃鐢绘弿杩帮紝瑙嗚鎺ュ彛鏈瘑鍒埌鍥剧墖: {last_answer[:300]}")
+
+
+def build_illustration_generation_prompt(artwork_description="", retry_feedback="", title=""):
     feedback_text = stringify(retry_feedback).strip()
     feedback_part = f"\nPrevious failed because: {feedback_text[:260]}. Fix this exactly in this attempt." if feedback_text else ""
-    
-    if artwork_description:
-        prompt = artwork_description
+    title_text = stringify(title).strip()
+    description_text = stringify(artwork_description).strip()
+    exclude_clause = ""
+    if "Exclude:" in description_text:
+        description_text, exclude_clause = description_text.split("Exclude:", 1)
+        description_text = description_text.strip().rstrip(" ,;")
+        exclude_clause = exclude_clause.strip().rstrip(".")
+
+    flat_rules = (
+        """[SYSTEM ROLE: VECTOR CLIPART EXTRACTOR]
+You are a pure 2D Vector Graphic Extraction AI. Your single, absolute purpose is to isolate and recreate the central typography, logo, or illustration from the reference image.
+[CORE DIRECTIVE]
+Output ONLY the flat digital artwork. You must output a pristine, production-ready 2D printable graphic asset on a PURE SOLID WHITE background.
+[EXECUTION RULES]
+Focus: Zoom in exclusively on the core motif, illustration, or text.
+Render Type: Reconstruct it strictly as flat digital vector art (like an Adobe Illustrator workspace file). Use clean lines, crisp edges, and flat solid colors.
+Crop & Scale: Tightly crop the canvas so the extracted graphic fills 90% of the image area. It must float completely isolated in the center.
+Zero Context: The final output must look like a standalone, flat clipart or digital print source file. If the reference is a repeating motif, output a 100% seamless flat pattern.
+STRICT STYLE AND COLOR FIDELITY: Follow ARTWORK TO RECREATE exactly. Preserve the original typography family and stroke style. If the source text is handwritten script/cursive, keep it handwritten script/cursive; do not convert it into bold block letters, slab serif, varsity lettering, bubble letters, or heavy outlined text. Preserve soft watercolor or pastel color mood. Do not replace pale blue, dusty blue, coral, pink, muted red, or soft ink colors with saturated navy, royal blue, black outlines, or high-contrast comic colors. Do not add thick dark outlines unless explicitly described."""
+    )
+
+
+    if description_text:
+        max_prompt_len = 4800 if POD_IMAGE_PROVIDER in ("kie", "nano", "nano-banana", "nano-banana-2") else 1450
+        description_budget = max(260, max_prompt_len - len(flat_rules) - len(feedback_part) - 25)
+        prompt = f"{flat_rules}\nARTWORK TO RECREATE: {description_text[:description_budget]}"
+        lowered_description = description_text.lower()
+        if "bg:" not in lowered_description and ("white text" in lowered_description or "pure white text" in lowered_description):
+            prompt += (
+                "\nCOLOR BACKGROUND FALLBACK: use a flat faded dark charcoal gray presentation background, "
+                "approximately #3f3d36, not pure black, not fabric, not clothing."
+            )
     else:
         # 这是一个兜底的极简提示词，防止由于某种原因视觉模型没返回内容
-        prompt = "A detailed, high-resolution photo of a flat, seamless textile pattern swatch, precisely extracted from the printed design on the product in the reference image. The output must be a single, flat, repeating tile asset filling the entire square canvas. The texture is that of a scanned fabric sample, completely smooth and devoid of any three-dimensional product contours, creases, hardware, or the product shape itself. Do not generate a new product, model, or scene."
-    
-    # 强制加上基础铁律，防止视觉模型生成的提示词遗漏了“扁平化”和“去产品特征”的要求
-    base_rules = "\nCRITICAL INSTRUCTIONS: The output MUST be a flat 2D asset. It must be completely devoid of 3D contours, creases, hardware, handles, straps, models, shadows, and watermarks. Do NOT generate the product shape (e.g. do not generate a bag or a shirt)."
-    
-    if base_rules not in prompt:
-        prompt += base_rules
+        fallback_text = (
+            "Use the reference image as the primary source and extract the most visible printable decoration, illustration, patch, emblem, character, text graphic, isolated motif, or repeated surface pattern. "
+            f"Product title for secondary context only: {title_text[:180]}. "
+            "Use a single clean isolated artwork when the reference shows a single motif or phrase; use a repeating tile only when the reference is already a repeating print."
+        )
+        max_prompt_len = 4800 if POD_IMAGE_PROVIDER in ("kie", "nano", "nano-banana", "nano-banana-2") else 1450
+        description_budget = max(260, max_prompt_len - len(flat_rules) - len(feedback_part) - 22)
+        prompt = (
+            f"{flat_rules}\n"
+            f"ARTWORK TO EXTRACT: {fallback_text[:description_budget]}"
+        )
+
+    if exclude_clause:
+        prompt += f"\nDO NOT INCLUDE: {exclude_clause[:320]}."
         
     prompt += feedback_part
-    return prompt[:1450]
+    max_prompt_len = 4800 if POD_IMAGE_PROVIDER in ("kie", "nano", "nano-banana", "nano-banana-2") else 1450
+    return prompt[:max_prompt_len]
 
 
 def image_bytes_to_data_url(image_bytes, mime_type="image/jpeg"):
     return f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+
+
+def image_value_to_pil(image_value):
+    if isinstance(image_value, (bytes, bytearray)):
+        try:
+            return Image.open(io.BytesIO(image_value)).convert("RGB")
+        except Exception:
+            return None
+    value = stringify(image_value).strip()
+    if not value:
+        return None
+    try:
+        if value.startswith(("http://", "https://")):
+            session = requests.Session()
+            session.trust_env = False
+            response = session.get(value, timeout=30)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content)).convert("RGB")
+        if value.startswith("data:image/") and "," in value:
+            value = value.split(",", 1)[1]
+        return Image.open(io.BytesIO(base64.b64decode(value, validate=False))).convert("RGB")
+    except Exception:
+        return None
+
+
+def retain_dominant_artwork_cluster(mask):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    components = []
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        if area <= 0:
+            continue
+        components.append({"label": label, "x": x, "y": y, "w": w, "h": h, "area": area})
+    if len(components) <= 1:
+        return mask
+
+    padding = max(18, int(max(mask.shape) * 0.04))
+
+    def overlaps(a, b):
+        ax0, ay0 = a["x"] - padding, a["y"] - padding
+        ax1, ay1 = a["x"] + a["w"] + padding, a["y"] + a["h"] + padding
+        bx0, by0 = b["x"] - padding, b["y"] - padding
+        bx1, by1 = b["x"] + b["w"] + padding, b["y"] + b["h"] + padding
+        return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
+
+    clusters = []
+    for component in components:
+        placed = False
+        for cluster in clusters:
+            if any(overlaps(component, existing) for existing in cluster):
+                cluster.append(component)
+                placed = True
+                break
+        if not placed:
+            clusters.append([component])
+
+    if len(clusters) <= 1:
+        return mask
+
+    total_area = sum(component["area"] for component in components) or 1
+    best_cluster = max(clusters, key=lambda cluster: sum(item["area"] for item in cluster))
+    best_area = sum(item["area"] for item in best_cluster)
+    if best_area / float(total_area) < 0.55:
+        return mask
+
+    cleaned = np.zeros_like(mask)
+    keep_labels = {item["label"] for item in best_cluster}
+    for label in keep_labels:
+        cleaned[labels == label] = 255
+    return cleaned
+
+
+def local_cutout_print_artwork(image_value, task_id="illustration"):
+    image = image_value_to_pil(image_value)
+    if image is None:
+        image = image_value_to_pil(normalize_vision_image_url(image_value))
+    if image is None:
+        return None, "无法读取商品图"
+
+    original_width, original_height = image.size
+    max_side = 1400
+    scale = min(1.0, max_side / max(original_width, original_height))
+    if scale < 1.0:
+        image = image.resize((int(original_width * scale), int(original_height * scale)), Image.LANCZOS)
+
+    rgb = np.array(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    height, width = gray.shape
+
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    colored_ink = (saturation > 82) & (value < 230)
+    dark_ink = value < 58
+    # This is cutout, not product segmentation: avoid using garment fold edges as artwork.
+    mask = (colored_ink | dark_ink)
+    mask = mask.astype(np.uint8) * 255
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    kept = np.zeros_like(mask)
+    min_area = max(12, int(width * height * 0.000015))
+    max_area = int(width * height * 0.12)
+    center_left, center_right = width * 0.08, width * 0.92
+    center_top, center_bottom = height * 0.08, height * 0.92
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        cx, cy = centroids[label]
+        if area < min_area or area > max_area:
+            continue
+        if x <= 2 or y <= 2 or x + w >= width - 2 or y + h >= height - 2:
+            continue
+        if not (center_left <= cx <= center_right and center_top <= cy <= center_bottom):
+            continue
+        kept[labels == label] = 255
+
+    kept = cv2.dilate(kept, kernel, iterations=1)
+    kept = cv2.morphologyEx(kept, cv2.MORPH_CLOSE, kernel, iterations=1)
+    kept = retain_dominant_artwork_cluster(kept)
+    contours, _ = cv2.findContours(kept, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, "本地抠图未检测到可提取印花"
+
+    all_points = np.vstack(contours)
+    x, y, w, h = cv2.boundingRect(all_points)
+    coverage = int(np.count_nonzero(kept)) / float(width * height)
+    component_areas = sorted((cv2.contourArea(contour) for contour in contours), reverse=True)
+    total_component_area = sum(component_areas) or 1.0
+    largest_component_ratio = component_areas[0] / total_component_area if component_areas else 0.0
+    meaningful_components = sum(1 for area in component_areas if area >= max(8, width * height * 0.00001))
+    if meaningful_components > 80 and largest_component_ratio < 0.18:
+        return None, (
+            "本地抠图结果过于碎片化，疑似只剩文字/五金点/边缘残渣 "
+            f"components={meaningful_components} largest_ratio={largest_component_ratio:.3f}"
+        )
+    if coverage < 0.012 and meaningful_components > 35 and largest_component_ratio < 0.25:
+        return None, (
+            "本地抠图缺少连续主体，疑似碎片残渣 "
+            f"coverage={coverage:.4f} components={meaningful_components} largest_ratio={largest_component_ratio:.3f}"
+        )
+    if coverage < 0.002:
+        return None, f"本地抠图图案像素过少 coverage={coverage:.4f}"
+    if w > width * 0.94 or h > height * 0.94:
+        return None, f"本地抠图疑似选中商品本体 bbox={w}x{h}"
+    if w > width * 0.48 or h > height * 0.48:
+        large_print_confident = (
+            (
+                0.045 <= coverage <= 0.14
+                and meaningful_components <= 30
+                and largest_component_ratio >= 0.35
+            )
+            or (
+                0.0015 <= coverage <= 0.03
+                and meaningful_components <= 15
+                and largest_component_ratio >= 0.45
+            )
+        )
+        if not large_print_confident:
+            return None, (
+                "本地抠图大面积图案置信不足，交给AI/已有结果兜底 "
+                f"bbox={w}x{h} coverage={coverage:.4f} "
+                f"components={meaningful_components} largest_ratio={largest_component_ratio:.3f}"
+            )
+    if coverage > 0.18:
+        return None, f"本地抠图覆盖率过高，疑似选中商品本体 coverage={coverage:.4f}"
+
+    pad = max(18, int(max(w, h) * 0.08))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(width, x + w + pad), min(height, y + h + pad)
+
+    alpha = cv2.GaussianBlur(kept, (5, 5), 0)
+    rgba = np.dstack([rgb, alpha])
+    crop = rgba[y0:y1, x0:x1]
+
+    # Put the cutout on a square transparent canvas so downstream previews are stable.
+    crop_h, crop_w = crop.shape[:2]
+    side = max(crop_w, crop_h)
+    canvas = np.zeros((side, side, 4), dtype=np.uint8)
+    offset_x = (side - crop_w) // 2
+    offset_y = (side - crop_h) // 2
+    canvas[offset_y:offset_y + crop_h, offset_x:offset_x + crop_w] = crop
+
+    output = io.BytesIO()
+    Image.fromarray(canvas, "RGBA").save(output, format="PNG")
+    reason = f"本地代码抠图成功 coverage={coverage:.4f} bbox={w}x{h}"
+    print(f"[POD_CUTOUT] task_id={task_id} {reason}", flush=True)
+    return output.getvalue(), reason
+
+
+def build_qc_comparison_image(source_image_file, generated_bytes):
+    source_image = image_value_to_pil(source_image_file)
+    generated_image = Image.open(io.BytesIO(generated_bytes)).convert("RGB")
+    if source_image is None:
+        raise RuntimeError("质检无法读取原商品图")
+
+    target_size = 512
+    label_height = 44
+    canvas = Image.new("RGB", (target_size * 2, target_size + label_height), "white")
+    for index, image in enumerate((source_image, generated_image)):
+        image.thumbnail((target_size, target_size), Image.LANCZOS)
+        x = index * target_size + (target_size - image.width) // 2
+        y = label_height + (target_size - image.height) // 2
+        canvas.paste(image, (x, y))
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=92)
+    return image_bytes_to_data_url(output.getvalue(), "image/jpeg")
+
+
+def detect_generated_3d_artifacts(api_key, generated_bytes, task_id="illustration"):
+    generated_image_url = image_bytes_to_data_url(generated_bytes)
+    prompt = {
+        "system": (
+            "你是POD平面素材审查员。你只检查输入图片本身是否是纯二维平面图案素材。"
+            "如果图片里出现任何三维商品形态或与商品结构有关的元素，必须判定 forbidden_3d=true。"
+            "三维/商品结构元素包括但不限于：背包、书包、手提包、包体轮廓、衣服、手机壳样机、手柄、书包带子、肩带、背带、拉链、拉链头、口袋、缝线、五金、扣具、厚度、折痕、褶皱、透视、阴影、摄影棚光影、桌面、背景场景。"
+            "只有完全平铺的二维印花/图案/插画/纹样，没有任何商品形体和三维体积，才可以 forbidden_3d=false。"
+            "必须只输出JSON，不要输出Markdown，不要解释。"
+        ),
+        "user_text": json.dumps(
+            {
+                "task": "判断这张生成图是否含有任何三维商品形态或商品结构元素。",
+                "required_json": {
+                    "forbidden_3d": "true/false",
+                    "reason": "一句话指出是否出现三维商品形态；如果出现，点名具体元素",
+                },
+            },
+            ensure_ascii=False,
+        ),
+    }
+    last_content = ""
+    for artifact_attempt in range(1, 4):
+        content = call_product_vision_minimax(prompt, generated_image_url)
+        last_content = stringify(content)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} artifact_attempt={artifact_attempt} "
+            f"artifact_raw={last_content[:500]}",
+            flush=True,
+        )
+        if is_missing_image_response(last_content):
+            time.sleep(artifact_attempt)
+            continue
+        parsed = parse_llm_json_object(content)
+        if "forbidden_3d" in parsed:
+            forbidden = parsed.get("forbidden_3d")
+            if isinstance(forbidden, str):
+                forbidden = forbidden.strip().lower() in {"1", "true", "yes", "是", "有"}
+            return {
+                "forbidden_3d": bool(forbidden),
+                "reason": stringify(parsed.get("reason")),
+            }
+        time.sleep(artifact_attempt)
+    return {
+        "forbidden_3d": True,
+        "reason": f"三维审查未能识别生成图，按不合格处理: {last_content[:160]}",
+    }
+
+
+def detect_low_value_flat_artifact(generated_bytes):
+    try:
+        image = Image.open(io.BytesIO(generated_bytes)).convert("RGBA")
+    except Exception as exc:
+        return True, f"无法读取生成图: {exc}"
+    
+    max_side = 900
+    if max(image.size) > max_side:
+        scale = max_side / max(image.size)
+        image = image.resize((int(image.width * scale), int(image.height * scale)), Image.LANCZOS)
+
+    arr = np.array(image)
+    rgb = arr[:, :, :3]
+    alpha = arr[:, :, 3]
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    height, width = value.shape
+
+    if np.count_nonzero(alpha < 250) > 0:
+        mask = alpha > 24
+    else:
+        # Generated low-value failures often sit on white/gray canvas as tiny scattered marks.
+        border = np.concatenate([rgb[:8].reshape(-1, 3), rgb[-8:].reshape(-1, 3), rgb[:, :8].reshape(-1, 3), rgb[:, -8:].reshape(-1, 3)])
+        bg = np.median(border, axis=0)
+        diff = np.linalg.norm(rgb.astype(np.float32) - bg.astype(np.float32), axis=2)
+        bg_value = float(np.median(border.max(axis=1)))
+        mask = (diff > 22) & ((saturation > 20) | (value < bg_value - 18) | (value < 170))
+
+    mask = mask.astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    cleaned = np.zeros_like(mask)
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        touches_edge = x <= 2 or y <= 2 or x + w >= width - 2 or y + h >= height - 2
+        # Ignore screenshot frames and canvas edges; a valid extracted artwork should not rely on border pixels.
+        if touches_edge and area > width * height * 0.001:
+            continue
+        cleaned[labels == label] = 255
+    mask = cleaned
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    coverage = int(np.count_nonzero(mask)) / float(width * height)
+    if not contours:
+        return True, "生成图没有检测到有效平面图案"
+
+    points = np.vstack(contours)
+    x, y, w, h = cv2.boundingRect(points)
+    bbox_area_ratio = (w * h) / float(width * height)
+    areas = sorted((cv2.contourArea(contour) for contour in contours), reverse=True)
+    total_area = sum(areas) or 1.0
+    largest_ratio = areas[0] / total_area if areas else 0.0
+    meaningful_components = sum(1 for area in areas if area >= max(6, width * height * 0.000008))
+    center_x = x + w / 2
+    center_y = y + h / 2
+    off_center = center_x < width * 0.18 or center_x > width * 0.82 or center_y < height * 0.18 or center_y > height * 0.82
+
+    if coverage < 0.015:
+        return True, f"生成图有效图案面积过小 coverage={coverage:.4f}"
+    if bbox_area_ratio < 0.08:
+        return True, f"生成图主体占画布太小 bbox_ratio={bbox_area_ratio:.4f}"
+    if off_center and coverage < 0.05:
+        return True, f"生成图主体明显偏角且面积不足 coverage={coverage:.4f} bbox={w}x{h}"
+    if meaningful_components > 60 and largest_ratio < 0.18:
+        return True, f"生成图过于碎片化 components={meaningful_components} largest_ratio={largest_ratio:.3f}"
+    if coverage < 0.035 and meaningful_components > 25 and largest_ratio < 0.28:
+        return True, f"生成图像碎片残渣而非完整图案 coverage={coverage:.4f} components={meaningful_components}"
+    return False, f"平面图案有效 coverage={coverage:.4f} bbox_ratio={bbox_area_ratio:.4f}"
 
 
 def save_generated_illustration_bytes(image_bytes, task_id):
@@ -1758,7 +2464,514 @@ def save_generated_illustration_bytes(image_bytes, task_id):
     return f"{GENERATED_ILLUSTRATION_URL_PREFIX}/{filename}"
 
 
+def save_extracted_artwork_png_bytes(image_bytes, task_id):
+    safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", stringify(task_id))[:80] or f"cutout_{int(time.time())}"
+    filename = f"{safe_task_id}.png"
+    GENERATED_ILLUSTRATION_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = GENERATED_ILLUSTRATION_DIR / filename
+    with output_path.open("wb") as handle:
+        handle.write(image_bytes)
+    return f"{GENERATED_ILLUSTRATION_URL_PREFIX}/{filename}"
+
+
+def generated_url_to_data_url(image_url):
+    value = stringify(image_url).strip()
+    if not value:
+        return ""
+    if value.startswith(("data:image/", "http://", "https://")):
+        return normalize_vision_image_url(value)
+    if value.startswith(GENERATED_ILLUSTRATION_URL_PREFIX):
+        relative_path = value.lstrip("/").replace("/", os.sep)
+        image_path = PROJECT_ROOT / relative_path
+        if image_path.exists():
+            suffix = image_path.suffix.lower()
+            mime_type = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+            return image_bytes_to_data_url(image_path.read_bytes(), mime_type)
+    return normalize_vision_image_url(value)
+
+
+def call_minimax_phone_case_mockup(illustration_image_url, task_id="phone_case"):
+    provider = PHONE_CASE_IMAGE_PROVIDER
+    if provider in ("kie", "nano", "nano-banana", "nano-banana-2"):
+        try:
+            return call_kie_phone_case_mockup(illustration_image_url, task_id=task_id)
+        except Exception as exc:
+            if not PHONE_CASE_USE_LOCAL_FALLBACK:
+                raise
+            print(
+                f"[PHONE_CASE] kie failed task_id={task_id}, using local fallback error={stringify(exc)[:500]}",
+                flush=True,
+            )
+            return render_phone_case_mockup_bytes(illustration_image_url)
+    if provider in ("local", "composite"):
+        return render_phone_case_mockup_bytes(illustration_image_url)
+    if provider == "minimax":
+        return call_minimax_phone_case_mockup_legacy(illustration_image_url, task_id=task_id)
+    raise RuntimeError(f"Unsupported PHONE_CASE_IMAGE_PROVIDER={provider}")
+
+
+def rounded_rectangle_mask(size, radius):
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255)
+    return mask
+
+
+def render_phone_case_mockup_bytes(illustration_image_url):
+    source = generated_url_to_data_url(illustration_image_url)
+    artwork = image_value_to_pil(source)
+    if artwork is None:
+        raise RuntimeError("无法读取插画图，无法生成手机壳图")
+    artwork = artwork.convert("RGBA")
+    artwork_arr = np.array(artwork)
+    rgb = artwork_arr[:, :, :3]
+    alpha = artwork_arr[:, :, 3]
+    near_white = (rgb[:, :, 0] > 245) & (rgb[:, :, 1] > 245) & (rgb[:, :, 2] > 245)
+    alpha[near_white] = 0
+    artwork_arr[:, :, 3] = alpha
+    artwork = Image.fromarray(artwork_arr, "RGBA")
+
+    canvas_size = 1024
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (246, 247, 249, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    case_box = (325, 82, 725, 942)
+    case_w = case_box[2] - case_box[0]
+    case_h = case_box[3] - case_box[1]
+
+    shadow = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle((case_box[0] + 18, case_box[1] + 20, case_box[2] + 18, case_box[3] + 20), radius=72, fill=(0, 0, 0, 45))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(22))
+    canvas.alpha_composite(shadow)
+
+    case_layer = Image.new("RGBA", (case_w, case_h), (255, 255, 255, 0))
+    case_draw = ImageDraw.Draw(case_layer)
+    case_draw.rounded_rectangle((0, 0, case_w - 1, case_h - 1), radius=72, fill=(248, 249, 248, 255), outline=(210, 214, 216, 255), width=5)
+
+    printable = (38, 176, case_w - 38, case_h - 70)
+    printable_w = printable[2] - printable[0]
+    printable_h = printable[3] - printable[1]
+    art_ratio = min(printable_w / artwork.width, printable_h / artwork.height)
+    art_size = (max(1, int(artwork.width * art_ratio)), max(1, int(artwork.height * art_ratio)))
+    artwork_resized = artwork.resize(art_size, Image.LANCZOS)
+    art_x = printable[0] + (printable_w - art_size[0]) // 2
+    art_y = printable[1] + (printable_h - art_size[1]) // 2
+    case_layer.alpha_composite(artwork_resized, (art_x, art_y))
+
+    case_mask = rounded_rectangle_mask((case_w, case_h), 72)
+    canvas.alpha_composite(case_layer, (case_box[0], case_box[1]))
+
+    # Camera island and holes drawn after the artwork, so the print never covers the cutouts.
+    camera_box = (case_box[0] + 34, case_box[1] + 34, case_box[0] + 160, case_box[1] + 170)
+    draw.rounded_rectangle(camera_box, radius=34, fill=(245, 246, 245, 255), outline=(205, 210, 212, 255), width=4)
+    for cx, cy in ((camera_box[0] + 42, camera_box[1] + 43), (camera_box[0] + 42, camera_box[1] + 96)):
+        draw.ellipse((cx - 23, cy - 23, cx + 23, cy + 23), fill=(18, 23, 29, 255))
+        draw.ellipse((cx - 13, cy - 13, cx + 13, cy + 13), fill=(42, 48, 57, 255))
+        draw.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=(110, 130, 150, 255))
+    draw.ellipse((camera_box[0] + 88, camera_box[1] + 50, camera_box[0] + 108, camera_box[1] + 70), fill=(25, 27, 29, 255))
+    draw.ellipse((camera_box[0] + 88, camera_box[1] + 95, camera_box[0] + 110, camera_box[1] + 117), fill=(224, 210, 188, 255), outline=(190, 178, 160, 255), width=2)
+
+    highlight = Image.new("RGBA", (case_w, case_h), (255, 255, 255, 0))
+    highlight_draw = ImageDraw.Draw(highlight)
+    highlight_draw.rounded_rectangle((14, 12, case_w - 16, case_h - 18), radius=64, outline=(255, 255, 255, 125), width=3)
+    canvas.alpha_composite(highlight, (case_box[0], case_box[1]))
+
+    output = io.BytesIO()
+    canvas.convert("RGB").save(output, format="JPEG", quality=94)
+    return output.getvalue()
+
+
+def call_minimax_phone_case_mockup_legacy(illustration_image_url, task_id="phone_case"):
+    api_key = stringify(resolve_minimax_api_key()).strip().removeprefix("Bearer ").strip()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY，无法生成手机壳图")
+    image_file = generated_url_to_data_url(illustration_image_url)
+    if not image_file:
+        raise RuntimeError("插画图为空，无法生成手机壳图")
+    prompts = [
+        PHONE_CASE_IMAGE_PROMPT,
+        (
+            PHONE_CASE_IMAGE_PROMPT
+            + " Mandatory correction: the phone case back must visibly contain the input artwork as a large print. "
+              "A blank case is unacceptable. The artwork should be the main visible content on the case, not a small decoration."
+        ),
+    ]
+    last_data = None
+    for prompt_index, prompt in enumerate(prompts, 1):
+        payload = {
+            "model": MINIMAX_IMAGE_MODEL,
+            "prompt": prompt,
+            "aspect_ratio": "1:1",
+            "subject_reference": [
+                {
+                    "type": MINIMAX_IMAGE_SUBJECT_TYPE,
+                    "image_file": image_file,
+                }
+            ],
+            "response_format": "base64",
+            "n": 1,
+        }
+        print(
+            f"[PHONE_CASE] minimax request task_id={task_id} prompt_attempt={prompt_index} "
+            f"model={MINIMAX_IMAGE_MODEL} prompt_len={len(prompt)}",
+            flush=True,
+        )
+        data = call_minimax_api_with_retry(MINIMAX_IMAGE_GENERATION_URL, api_key, payload, timeout=180)
+        last_data = data
+        response_data = data.get("data") or {}
+        base64_images = response_data.get("image_base64") or response_data.get("image_base64s") or []
+        url_images = (
+            response_data.get("image_urls")
+            or response_data.get("image_url")
+            or response_data.get("images")
+            or response_data.get("urls")
+            or []
+        )
+        if isinstance(base64_images, str):
+            base64_images = [base64_images]
+        if isinstance(url_images, str):
+            url_images = [url_images]
+        if base64_images:
+            image_bytes = base64.b64decode(base64_images[0], validate=False)
+        elif url_images:
+            first_url = url_images[0]
+            if isinstance(first_url, dict):
+                first_url = first_url.get("url") or first_url.get("image_url") or first_url.get("image")
+            first_url = stringify(first_url).strip()
+            image_bytes = download_image_url(first_url) if first_url else b""
+        else:
+            image_bytes = b""
+        if image_bytes:
+            low_value, low_value_reason = detect_low_value_flat_artifact(image_bytes)
+            if not low_value:
+                return image_bytes
+            print(
+                f"[PHONE_CASE] prompt_attempt={prompt_index} low_value_result task_id={task_id} "
+                f"reason={low_value_reason}",
+                flush=True,
+            )
+    raise RuntimeError(f"MiniMax 手机壳图未返回有效图片数据：{stringify(last_data)[:500]}")
+
+
+def upsert_pod_illustration_asset(cursor, *, product, product_image_url, illustration_url, task_id, phone_case_status=0, phone_case_url=None, phone_case_task_id=None, error_msg=None):
+    cursor.execute(
+        """
+        INSERT INTO pod_illustration_asset
+          (source, product_id, date_record, product_title, product_image_url,
+           illustration_image_url, phone_case_image_url, extract_status, phone_case_status,
+           extract_task_id, phone_case_task_id, error_msg)
+        VALUES ('pod_cross_category', %s, %s, %s, %s, %s, %s, 2, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          product_title = VALUES(product_title),
+          product_image_url = VALUES(product_image_url),
+          illustration_image_url = VALUES(illustration_image_url),
+          extract_status = VALUES(extract_status),
+          phone_case_status = VALUES(phone_case_status),
+          phone_case_image_url = COALESCE(VALUES(phone_case_image_url), phone_case_image_url),
+          extract_task_id = VALUES(extract_task_id),
+          phone_case_task_id = COALESCE(VALUES(phone_case_task_id), phone_case_task_id),
+          error_msg = VALUES(error_msg),
+          updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            product.get("product_id"),
+            stringify(product.get("date_record")),
+            stringify(product.get("title"))[:500],
+            product_image_url,
+            illustration_url,
+            phone_case_url,
+            phone_case_status,
+            task_id,
+            phone_case_task_id,
+            error_msg,
+        ),
+    )
+
+
+def generate_and_store_phone_case_asset(product, product_image_url, illustration_url, extract_task_id):
+    phone_task_id = f"phone_{product.get('product_id')}_{int(datetime.now().timestamp() * 1000)}"
+    with db() as conn, conn.cursor() as cursor:
+        upsert_pod_illustration_asset(
+            cursor,
+            product=product,
+            product_image_url=product_image_url,
+            illustration_url=illustration_url,
+            task_id=extract_task_id,
+            phone_case_status=1,
+            phone_case_task_id=phone_task_id,
+        )
+        conn.commit()
+    try:
+        image_bytes = call_minimax_phone_case_mockup(illustration_url, phone_task_id)
+        phone_case_url = save_generated_illustration_bytes(image_bytes, phone_task_id)
+        with db() as conn, conn.cursor() as cursor:
+            upsert_pod_illustration_asset(
+                cursor,
+                product=product,
+                product_image_url=product_image_url,
+                illustration_url=illustration_url,
+                task_id=extract_task_id,
+                phone_case_status=2,
+                phone_case_url=phone_case_url,
+                phone_case_task_id=phone_task_id,
+            )
+            conn.commit()
+        print(f"[PHONE_CASE] success task_id={phone_task_id} url={phone_case_url}", flush=True)
+        return phone_case_url
+    except Exception as exc:
+        error_msg = stringify(exc)[:1000]
+        print(f"[PHONE_CASE] failed task_id={phone_task_id} error={error_msg}", flush=True)
+        with db() as conn, conn.cursor() as cursor:
+            upsert_pod_illustration_asset(
+                cursor,
+                product=product,
+                product_image_url=product_image_url,
+                illustration_url=illustration_url,
+                task_id=extract_task_id,
+                phone_case_status=3,
+                phone_case_task_id=phone_task_id,
+                error_msg=error_msg,
+            )
+            conn.commit()
+        return None
+
+
+def get_kie_api_key():
+    api_key = KIE_API_KEY or os.getenv("KIE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("KIE_API_KEY 未配置，无法调用 nano-banana-2 图生图接口")
+    return api_key
+
+
+def find_first_http_url(value):
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("http://", "https://")):
+            return stripped
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return find_first_http_url(json.loads(stripped))
+            except Exception:
+                return ""
+        return ""
+    if isinstance(value, dict):
+        preferred_keys = ("url", "image_url", "imageUrl", "downloadUrl", "fileUrl", "resultUrl", "originUrl")
+        for key in preferred_keys:
+            found = find_first_http_url(value.get(key))
+            if found:
+                return found
+        for item in value.values():
+            found = find_first_http_url(item)
+            if found:
+                return found
+    if isinstance(value, list):
+        for item in value:
+            found = find_first_http_url(item)
+            if found:
+                return found
+    return ""
+
+
+def kie_json_request(method, url, api_key, payload=None, params=None, timeout=90):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    session = requests.Session()
+    session.trust_env = False
+    response = session.request(method, url, headers=headers, json=payload, params=params, timeout=timeout)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code != 200:
+        raise RuntimeError(f"KIE API {url} HTTP {response.status_code}: {response.text[:500]}")
+    if isinstance(data, dict) and data.get("code") not in (None, 200):
+        raise RuntimeError(f"KIE API {url} code={data.get('code')} msg={stringify(data.get('msg') or data)[:500]}")
+    return data
+
+
+def kie_upload_reference_image(api_key, image_file, task_id="illustration"):
+    image_file = normalize_vision_image_url(image_file)
+    if not image_file:
+        raise RuntimeError("商品主图为空，无法上传给 KIE 图生图接口")
+    if image_file.startswith(("http://", "https://")):
+        return image_file
+
+    if image_file.startswith("data:image/") and "," in image_file:
+        data_url = image_file
+        mime_type = image_file.split(";", 1)[0].replace("data:", "") or "image/jpeg"
+    else:
+        mime_type = "image/jpeg"
+        data_url = f"data:{mime_type};base64,{image_file}"
+
+    ext = "png" if "png" in mime_type else "webp" if "webp" in mime_type else "jpg"
+    safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", stringify(task_id))[:70] or "illustration"
+    upload_payloads = [
+        {
+            "base64Data": data_url,
+            "uploadPath": "choice_product/pod_reference",
+            "fileName": f"{safe_task_id}_{int(time.time())}.{ext}",
+        },
+        {
+            "base64Data": data_url.split(",", 1)[-1],
+            "uploadPath": "choice_product/pod_reference",
+            "fileName": f"{safe_task_id}_{int(time.time())}.{ext}",
+        },
+    ]
+    last_error = None
+    for upload_payload in upload_payloads:
+        try:
+            data = kie_json_request("POST", KIE_FILE_UPLOAD_URL, api_key, payload=upload_payload, timeout=120)
+            uploaded_url = find_first_http_url(data)
+            if uploaded_url:
+                print(f"[KIE_UPLOAD] task_id={task_id} uploaded reference=url", flush=True)
+                return uploaded_url
+            last_error = RuntimeError(f"KIE 上传未返回图片 URL：{stringify(data)[:500]}")
+        except Exception as exc:
+            last_error = exc
+            print(f"[KIE_UPLOAD] task_id={task_id} upload attempt failed error={exc}", flush=True)
+    raise last_error or RuntimeError("KIE 上传图片失败")
+
+
+def parse_kie_task_result_url(data):
+    if not isinstance(data, dict):
+        return ""
+    response_data = data.get("data") if isinstance(data.get("data"), dict) else data
+    for key in ("resultJson", "response", "output", "result", "taskResult"):
+        found = find_first_http_url(response_data.get(key))
+        if found:
+            return found
+    return ""
+
+
+def is_kie_task_failed(data):
+    response_data = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    if not isinstance(response_data, dict):
+        return False
+    status_text = " ".join(
+        stringify(response_data.get(key)).lower()
+        for key in ("status", "state", "taskStatus", "successFlag", "failReason", "errorCode")
+    )
+    return any(marker in status_text for marker in ("fail", "failed", "error", "exception", "canceled", "cancelled"))
+
+
+def query_kie_task(api_key, kie_task_id):
+    try:
+        return kie_json_request("GET", KIE_RECORD_INFO_URL, api_key, params={"taskId": kie_task_id}, timeout=60)
+    except Exception as get_exc:
+        print(f"[KIE_IMAGE] query get failed kie_task_id={kie_task_id} error={get_exc}", flush=True)
+        return kie_json_request("POST", KIE_RECORD_INFO_URL, api_key, payload={"taskId": kie_task_id}, timeout=60)
+
+
+def download_image_url(image_url):
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(image_url, timeout=180)
+    response.raise_for_status()
+    return response.content
+
+
+def call_kie_nano_banana_generation_once(image_file, prompt, task_id="illustration", attempt=1):
+    api_key = get_kie_api_key()
+    image_inputs = []
+    if KIE_USE_IMAGE_INPUT:
+        image_inputs = [kie_upload_reference_image(api_key, image_file, task_id=task_id)]
+    payload = {
+        "model": KIE_IMAGE_MODEL,
+        "input": {
+            "prompt": prompt[:5000],
+            "image_input": image_inputs,
+            "aspect_ratio": KIE_IMAGE_ASPECT_RATIO,
+            "resolution": KIE_IMAGE_RESOLUTION,
+            "output_format": KIE_IMAGE_OUTPUT_FORMAT,
+        },
+    }
+    print(
+        f"[KIE_IMAGE] create task task_id={task_id} attempt={attempt} model={KIE_IMAGE_MODEL} "
+        f"prompt_len={len(payload['input']['prompt'])} image_input={len(image_inputs)}",
+        flush=True,
+    )
+    print(f"image_generation_prompt task_id={task_id}: {payload['input']['prompt']}", flush=True)
+    create_data = kie_json_request("POST", KIE_CREATE_TASK_URL, api_key, payload=payload, timeout=90)
+    kie_task_id = stringify(((create_data.get("data") or {}).get("taskId") if isinstance(create_data, dict) else "")).strip()
+    if not kie_task_id:
+        raise RuntimeError(f"KIE 创建任务未返回 taskId：{stringify(create_data)[:500]}")
+
+    deadline = time.time() + KIE_POLL_TIMEOUT_SECONDS
+    poll_count = 0
+    while time.time() < deadline:
+        poll_count += 1
+        time.sleep(KIE_POLL_INTERVAL_SECONDS)
+        status_data = query_kie_task(api_key, kie_task_id)
+        result_url = parse_kie_task_result_url(status_data)
+        if result_url:
+            print(
+                f"[KIE_IMAGE] result task_id={task_id} kie_task_id={kie_task_id} "
+                f"polls={poll_count} result_url={result_url}",
+                flush=True,
+            )
+            return download_image_url(result_url)
+        if is_kie_task_failed(status_data):
+            raise RuntimeError(f"KIE 生成任务失败：{stringify(status_data)[:800]}")
+        if poll_count == 1 or poll_count % 6 == 0:
+            print(f"[KIE_IMAGE] polling task_id={task_id} kie_task_id={kie_task_id} poll={poll_count}", flush=True)
+    raise RuntimeError(f"KIE 生成任务超时：taskId={kie_task_id}")
+
+
+def call_kie_phone_case_mockup(illustration_image_url, task_id="phone_case"):
+    api_key = get_kie_api_key()
+    image_file = generated_url_to_data_url(illustration_image_url)
+    if not image_file:
+        raise RuntimeError("插画图为空，无法生成手机壳图")
+    image_inputs = [kie_upload_reference_image(api_key, image_file, task_id=task_id)]
+    prompt = "Place my illustration on the back of an iPhone 17 case. The entire surface of the case, excluding the illustration area, must be entirely plain and feature no other patterns. Absolutely do not include the text 'iPhone Case' or 'DESIGNED BY CELIA' anywhere on the case"
+    payload = {
+        "model": KIE_IMAGE_MODEL,
+        "input": {
+            "prompt": prompt[:5000],
+            "image_input": image_inputs,
+            "aspect_ratio": KIE_PHONE_CASE_ASPECT_RATIO,
+            "resolution": KIE_PHONE_CASE_RESOLUTION,
+            "output_format": KIE_PHONE_CASE_OUTPUT_FORMAT,
+        },
+    }
+    print(
+        f"[PHONE_CASE] kie create task_id={task_id} model={KIE_IMAGE_MODEL} "
+        f"prompt_len={len(payload['input']['prompt'])} image_input={len(image_inputs)}",
+        flush=True,
+    )
+    create_data = kie_json_request("POST", KIE_CREATE_TASK_URL, api_key, payload=payload, timeout=90)
+    kie_task_id = stringify(((create_data.get("data") or {}).get("taskId") if isinstance(create_data, dict) else "")).strip()
+    if not kie_task_id:
+        raise RuntimeError(f"KIE 手机壳任务未返回 taskId：{stringify(create_data)[:500]}")
+
+    deadline = time.time() + KIE_POLL_TIMEOUT_SECONDS
+    poll_count = 0
+    last_status = None
+    while time.time() < deadline:
+        poll_count += 1
+        time.sleep(KIE_POLL_INTERVAL_SECONDS)
+        status_data = query_kie_task(api_key, kie_task_id)
+        last_status = status_data
+        result_url = parse_kie_task_result_url(status_data)
+        if result_url:
+            print(
+                f"[PHONE_CASE] kie result task_id={task_id} kie_task_id={kie_task_id} "
+                f"polls={poll_count} result_url={result_url}",
+                flush=True,
+            )
+            return download_image_url(result_url)
+        if is_kie_task_failed(status_data):
+            raise RuntimeError(f"KIE 手机壳任务失败：{stringify(status_data)[:800]}")
+        if poll_count == 1 or poll_count % 6 == 0:
+            print(f"[PHONE_CASE] kie polling task_id={task_id} kie_task_id={kie_task_id} poll={poll_count}", flush=True)
+    raise RuntimeError(f"KIE 手机壳任务超时：taskId={kie_task_id} status={stringify(last_status)[:500]}")
+
+
+
 def call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id="illustration", attempt=1):
+    if POD_IMAGE_PROVIDER in ("kie", "nano", "nano-banana", "nano-banana-2"):
+        return call_kie_nano_banana_generation_once(image_file, prompt, task_id=task_id, attempt=attempt)
+
     image_file = normalize_vision_image_url(image_file)
     if not image_file:
         raise RuntimeError("商品主图为空，无法生成插画")
@@ -1780,7 +2993,6 @@ def call_minimax_illustration_generation_once(api_key, image_file, prompt, task_
         f"prompt_len={len(prompt)} reference={'url' if image_file.startswith(('http://', 'https://')) else 'base64'}",
         flush=True,
     )
-    
     data = call_minimax_api_with_retry(MINIMAX_IMAGE_GENERATION_URL, api_key, payload, timeout=180)
     response_data = data.get("data") or {}
     print(
@@ -1823,33 +3035,88 @@ def call_minimax_illustration_generation_once(api_key, image_file, prompt, task_
 
 
 def evaluate_generated_illustration(api_key, source_image_file, generated_bytes, task_id="illustration"):
-    generated_image_url = image_bytes_to_data_url(generated_bytes)
-    user_text = "Compare the artwork in Image 2 with the original in Image 1. Return JSON with 'match_score' (0-100) and 'reason'."
-    
-    payload = {
-        "model": MINIMAX_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": source_image_file}},
-                    {"type": "image_url", "image_url": {"url": generated_image_url}}
-                ]
-            }
-        ]
-    }
-    
+    if not POD_ILLUSTRATION_QC_ENABLED:
+        return {
+            "pass": True,
+            "is_same": True,
+            "score": 100.0,
+            "feedback": "QC disabled by POD_ILLUSTRATION_QC_ENABLED=false",
+        }
+
     try:
-        data = call_minimax_api_with_retry("https://api.minimax.io/v1/text/chatcompletion_v2", api_key, payload)
-        content = data["choices"][0]["message"]["content"]
-        parsed = parse_llm_json_object(content)
-    except (KeyError, IndexError, TypeError, Exception) as e:
-        print(f"[MINIMAX_V2] Eval Error: {e}", flush=True)
-        # 质检失败时，默认给 0 分
+        low_value, low_value_reason = detect_low_value_flat_artifact(generated_bytes)
+        if low_value:
+            return {
+                "pass": False,
+                "is_same": False,
+                "score": 20.0,
+                "feedback": f"生成图缺少有效图案主体，按规则不得超过80分：{low_value_reason}",
+            }
+
+        artifact_result = detect_generated_3d_artifacts(api_key, generated_bytes, task_id)
+        if artifact_result["forbidden_3d"]:
+            return {
+                "pass": False,
+                "is_same": False,
+                "score": 20.0,
+                "feedback": f"生成图包含三维商品形态或结构元素，按规则不得超过80分：{artifact_result['reason']}",
+            }
+
+        comparison_image = build_qc_comparison_image(source_image_file, generated_bytes)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} comparison_image_len={len(comparison_image)}",
+            flush=True,
+        )
+        prompt = {
+            "system": (
+                "你是POD图案提取质检员。你会看到一张左右对比图：左侧是原商品图，右侧是生成的平面图案素材。"
+                "请只评估右侧是否准确保留左侧商品表面的主要可提取装饰图案、颜色、构图和风格。"
+                "不要因为右侧去除了商品本体、包型、衣服版型、褶皱、阴影、背景而扣分。"
+                "但如果右侧仍然生成了包、背包、手提包、衣服、手机壳样机、手柄、肩带、拉链、口袋、五金、商品轮廓、透视、阴影或任何3D体积，必须判为不合格，match_score最高不超过20。"
+                "右侧必须是纯二维平面图案/印花素材；只有平面图案相似且无商品形态时才能给85分以上。"
+                "必须只输出JSON，不要输出Markdown，不要输出解释文本。"
+            ),
+            "user_text": json.dumps(
+                {
+                    "task": "比较左侧原图和右侧生成图的图案匹配度。",
+                    "score_rule": "0表示完全看不到对应关系；50表示主题相近但细节或颜色明显偏离；85表示主要图案、配色和风格基本一致，可作为合格素材；95以上表示高度一致。",
+                    "required_json": {
+                        "match_score": "0-100数字",
+                        "reason": "一句话说明主要相似点和主要问题",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+        parsed = {}
+        last_content = ""
+        for qc_attempt in range(1, 4):
+            content = call_product_vision_minimax(prompt, comparison_image)
+            last_content = stringify(content)
+            print(
+                f"[MINIMAX_IMAGE_QC] task_id={task_id} qc_attempt={qc_attempt} "
+                f"qc_raw={last_content[:500]}",
+                flush=True,
+            )
+            if is_missing_image_response(last_content):
+                time.sleep(qc_attempt)
+                continue
+            parsed = parse_llm_json_object(content)
+            reason = stringify(parsed.get("reason"))
+            if "match_score" in parsed and not is_missing_image_response(reason):
+                break
+            time.sleep(qc_attempt)
+        if "match_score" not in parsed:
+            parsed = {"match_score": 0, "reason": f"质检返回未包含match_score或未识别到图片: {last_content[:200]}"}
+    except Exception as e:
+        print(f"[MINIMAX_IMAGE_QC] Eval Error: {e}", flush=True)
         parsed = {"match_score": 0, "reason": f"质检接口调用失败: {e}"}
         
-    score = float(parsed.get("match_score", 0))
+    try:
+        score = float(parsed.get("match_score", 0))
+    except (TypeError, ValueError):
+        score = 0.0
+        parsed["reason"] = stringify(parsed.get("reason")) or f"质检返回非数字match_score: {stringify(parsed.get('match_score'))[:80]}"
     return {
         "pass": score >= MINIMAX_ILLUSTRATION_PASS_SCORE,
         "is_same": score >= 80,
@@ -1857,7 +3124,149 @@ def evaluate_generated_illustration(api_key, source_image_file, generated_bytes,
         "feedback": parsed.get("reason", ""),
     }
 
-def call_minimax_illustration_generation(image_value, title="", style_prompt="", task_id="illustration"):
+def detect_generated_3d_artifacts(api_key, generated_bytes, task_id="illustration"):
+    generated_image_url = image_bytes_to_data_url(generated_bytes)
+    prompt = {
+        "system": (
+            "You are a strict POD flat-art QC inspector. "
+            "Hard fail rule: if the generated image contains any person, face, hair, skin, hand, arm, leg, neck, torso, jewelry, clothing body, shirt, hoodie, tote, bag, backpack, purse, phone case, mannequin, hanger, strap, handle, zipper, seam, pocket, hardware, folds, wrinkles, fabric texture, background, wall, table, room, photo lighting, glow, shadow, perspective, or any other 3D product or scene evidence, you must return forbidden_3d=true. "
+            "Only a pure flat 2D artwork asset on a plain clean background may return forbidden_3d=false. "
+            "Return JSON only."
+        ),
+        "user_text": json.dumps(
+            {
+                "task": "Determine whether this generated image still contains any forbidden person, product, clothing, or 3D scene content.",
+                "required_json": {
+                    "forbidden_3d": "true/false",
+                    "reason": "one short sentence naming the forbidden content if present",
+                },
+            },
+            ensure_ascii=False,
+        ),
+    }
+    last_content = ""
+    for artifact_attempt in range(1, 4):
+        content = call_product_vision_minimax(prompt, generated_image_url)
+        last_content = stringify(content)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} artifact_attempt={artifact_attempt} "
+            f"artifact_raw={last_content[:500]}",
+            flush=True,
+        )
+        if is_missing_image_response(last_content):
+            time.sleep(artifact_attempt)
+            continue
+        parsed = parse_llm_json_object(content)
+        if "forbidden_3d" in parsed:
+            forbidden = parsed.get("forbidden_3d")
+            if isinstance(forbidden, str):
+                forbidden = forbidden.strip().lower() in {"1", "true", "yes"}
+            return {
+                "forbidden_3d": bool(forbidden),
+                "reason": stringify(parsed.get("reason")),
+            }
+        time.sleep(artifact_attempt)
+    return {
+        "forbidden_3d": True,
+        "reason": f"3D QC could not confidently clear the image, fail closed: {last_content[:160]}",
+    }
+
+
+def evaluate_generated_illustration(api_key, source_image_file, generated_bytes, task_id="illustration"):
+    if not POD_ILLUSTRATION_QC_ENABLED:
+        return {
+            "pass": True,
+            "is_same": True,
+            "score": 100.0,
+            "feedback": "QC disabled by POD_ILLUSTRATION_QC_ENABLED=false",
+        }
+
+    try:
+        low_value, low_value_reason = detect_low_value_flat_artifact(generated_bytes)
+        if low_value:
+            return {
+                "pass": False,
+                "is_same": False,
+                "score": 20.0,
+                "feedback": f"生成图缺少有效图案主体，按规则不得超过20分：{low_value_reason}",
+            }
+
+        artifact_result = detect_generated_3d_artifacts(api_key, generated_bytes, task_id)
+        if artifact_result["forbidden_3d"]:
+            return {
+                "pass": False,
+                "is_same": False,
+                "score": 20.0,
+                "feedback": f"生成图触发人物/服装/三维场景硬性底线，按规则不得超过20分：{artifact_result['reason']}",
+            }
+
+        comparison_image = build_qc_comparison_image(source_image_file, generated_bytes)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} comparison_image_len={len(comparison_image)}",
+            flush=True,
+        )
+        prompt = {
+            "system": (
+                "You are a strict POD artwork extraction QC inspector comparing an original product image on the left and a generated flat artwork result on the right. "
+                "Score only the right image. "
+                "Hard fail rule: if the right image contains any person, face, hair, skin, hand, arm, leg, neck, torso, jewelry, clothing body, shirt, hoodie, tote, bag, backpack, purse, phone case, mannequin, hanger, strap, handle, zipper, seam, pocket, hardware, folds, wrinkles, fabric texture, wall, room, table, shadow, lighting glow, perspective, or any other 3D or product-scene evidence, match_score must be 20 or lower. "
+                "Also score very low if colors are materially wrong, if relative size is wrong, if top/center/bottom placement is wrong, or if a small symbol becomes dominant. "
+                "Reward only accurate flat artwork extraction: correct text, correct colors, correct relative scale, correct relative placement, correct composition, and no forbidden scene content. "
+                "Return JSON only."
+            ),
+            "user_text": json.dumps(
+                {
+                    "task": "Compare the artwork in the original image and the generated flat result.",
+                    "score_rule": "0 means unrelated; 20 or lower means forbidden 3D/person/product content or major layout/color/scale failure; 85 means acceptable extraction; 95+ means highly faithful extraction.",
+                    "required_json": {
+                        "match_score": "0-100 number",
+                        "reason": "one short sentence naming the main match or main failure",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+        parsed = {}
+        last_content = ""
+        for qc_attempt in range(1, 4):
+            content = call_product_vision_minimax(prompt, comparison_image)
+            last_content = stringify(content)
+            print(
+                f"[MINIMAX_IMAGE_QC] task_id={task_id} qc_attempt={qc_attempt} "
+                f"qc_raw={last_content[:500]}",
+                flush=True,
+            )
+            if is_missing_image_response(last_content):
+                time.sleep(qc_attempt)
+                continue
+            parsed = parse_llm_json_object(content)
+            reason = stringify(parsed.get("reason"))
+            if "match_score" in parsed and not is_missing_image_response(reason):
+                break
+            time.sleep(qc_attempt)
+        if "match_score" not in parsed:
+            parsed = {"match_score": 0, "reason": f"质检返回未包含match_score或未识别到图片: {last_content[:200]}"}
+    except Exception as e:
+        print(f"[MINIMAX_IMAGE_QC] Eval Error: {e}", flush=True)
+        parsed = {"match_score": 0, "reason": f"质检接口调用失败: {e}"}
+
+    try:
+        score = float(parsed.get("match_score", 0))
+    except (TypeError, ValueError):
+        score = 0.0
+        parsed["reason"] = stringify(parsed.get("reason")) or f"质检返回非数字match_score: {stringify(parsed.get('match_score'))[:80]}"
+    return {
+        "pass": score >= MINIMAX_ILLUSTRATION_PASS_SCORE,
+        "is_same": score >= 80,
+        "score": score,
+        "feedback": parsed.get("reason", ""),
+    }
+
+
+POD_EXTRACT_FLOW_MAX_ATTEMPTS = max(1, min(5, int(os.getenv("POD_EXTRACT_FLOW_MAX_ATTEMPTS", "3"))))
+
+
+def call_minimax_illustration_generation_once_flow(image_value, title="", style_prompt="", task_id="illustration", flow_attempt=1):
     api_key = resolve_minimax_api_key()
     if not api_key:
         raise RuntimeError("缺少 MINIMAX_API_KEY，无法调用 MiniMax 图生图")
@@ -1866,22 +3275,59 @@ def call_minimax_illustration_generation(image_value, title="", style_prompt="",
     if not image_file:
         raise RuntimeError("商品主图为空，无法生成插画")
 
+    print(
+        f"[POD_EXTRACT_FLOW] task_id={task_id} flow_attempt={flow_attempt}/{POD_EXTRACT_FLOW_MAX_ATTEMPTS} start",
+        flush=True,
+    )
+    print(f"[POD_EXTRACT_FLOW] task_id={task_id} local_cutout_disabled use_ai_only=true", flush=True)
+
     # 阶段一：用大模型查看原图，生成详细描述
-    print(f"[MINIMAX_IMAGE_QC] task_id={task_id} generating artwork description...", flush=True)
-    try:
-        artwork_description = generate_artwork_description(api_key, image_file)
-        print(f"image_description task_id={task_id}: {artwork_description}", flush=True)
-    except Exception as e:
-        print(f"[MINIMAX_IMAGE_QC] task_id={task_id} failed to get description: {e}", flush=True)
-        artwork_description = ""
+    artwork_description = ""
+    if POD_USE_IMAGE_DESCRIPTION:
+        print(f"[MINIMAX_IMAGE_QC] task_id={task_id} generating artwork description...", flush=True)
+        try:
+            artwork_description = generate_artwork_description(api_key, image_file)
+            print(f"image_description task_id={task_id}: {artwork_description}", flush=True)
+        except Exception as e:
+            print(
+                f"[MINIMAX_IMAGE_QC] task_id={task_id} failed to get description after retries, "
+                f"will use direct image-to-image fallback: {e}",
+                flush=True,
+            )
+            artwork_description = ""
+    else:
+        print(
+            f"[POD_EXTRACT_FLOW] task_id={task_id} skip_image_description=true direct_prompt={POD_DIRECT_IMAGE_PROMPT}",
+            flush=True,
+        )
 
     best_bytes = b""
     best_score = -1.0
     best_feedback = ""
     retry_feedback = ""
+    generation_errors = []
     for attempt in range(1, MINIMAX_ILLUSTRATION_MAX_ATTEMPTS + 1):
-        prompt = build_illustration_generation_prompt(artwork_description, retry_feedback)
-        image_bytes = call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id, attempt)
+        if POD_USE_IMAGE_DESCRIPTION:
+            prompt = build_illustration_generation_prompt(artwork_description, retry_feedback, title)
+        else:
+            prompt = POD_DIRECT_IMAGE_PROMPT
+            if retry_feedback:
+                prompt += f"\n上一次失败原因：{retry_feedback[:260]}。请重新读取商品图，只提取其中的插画。"
+        try:
+            image_bytes = call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id, attempt)
+        except Exception as exc:
+            error_text = stringify(exc)
+            generation_errors.append(f"attempt {attempt}: {error_text}")
+            retry_feedback = (
+                "The previous image generation request returned no image data or a provider system error. "
+                "Retry with the same reference image and generate only the flat 2D printable pattern."
+            )
+            print(
+                f"[MINIMAX_IMAGE] task_id={task_id} attempt={attempt} failed_no_image retrying error={error_text}",
+                flush=True,
+            )
+            time.sleep(attempt)
+            continue
         evaluation = evaluate_generated_illustration(api_key, image_file, image_bytes, task_id)
         print(
             f"[MINIMAX_IMAGE_QC] task_id={task_id} attempt={attempt} "
@@ -1902,7 +3348,181 @@ def call_minimax_illustration_generation(image_value, title="", style_prompt="",
             flush=True,
         )
         raise RuntimeError(f"插画生成质检未通过，最佳得分 {best_score:.0f}：{best_feedback}")
-    raise RuntimeError("MiniMax 图生图未生成可保存的图片")
+    raise RuntimeError(f"MiniMax 图生图未生成可保存的图片；已重试 {MINIMAX_ILLUSTRATION_MAX_ATTEMPTS} 次；{' | '.join(generation_errors)}")
+
+
+def call_minimax_illustration_generation(image_value, title="", style_prompt="", task_id="illustration"):
+    flow_errors = []
+    for flow_attempt in range(1, POD_EXTRACT_FLOW_MAX_ATTEMPTS + 1):
+        try:
+            return call_minimax_illustration_generation_once_flow(
+                image_value,
+                title,
+                style_prompt,
+                task_id,
+                flow_attempt,
+            )
+        except Exception as exc:
+            error_text = stringify(exc)
+            flow_errors.append(f"flow {flow_attempt}: {error_text}")
+            print(
+                f"[POD_EXTRACT_FLOW] task_id={task_id} flow_attempt={flow_attempt}/"
+                f"{POD_EXTRACT_FLOW_MAX_ATTEMPTS} failed error={error_text}",
+                flush=True,
+            )
+            if flow_attempt >= POD_EXTRACT_FLOW_MAX_ATTEMPTS:
+                break
+            time.sleep(flow_attempt)
+    raise RuntimeError(
+        f"POD提取完整流程失败；已重跑 {POD_EXTRACT_FLOW_MAX_ATTEMPTS} 轮；"
+        + " | ".join(flow_errors)
+    )
+
+
+def call_minimax_illustration_generation_once_flow(image_value, title="", style_prompt="", task_id="illustration", flow_attempt=1):
+    image_file = normalize_vision_image_url(image_value)
+    if not image_file:
+        raise RuntimeError("商品主图为空，无法提取插画")
+
+    print(
+        f"[POD_EXTRACT_FLOW] task_id={task_id} flow_attempt={flow_attempt}/1 start",
+        flush=True,
+    )
+    print(f"[POD_EXTRACT_FLOW] task_id={task_id} use_local_cutout_only=true", flush=True)
+
+    cutout_bytes, cutout_reason = local_cutout_print_artwork(image_value, task_id)
+    if not cutout_bytes:
+        raise RuntimeError(f"本地抠图失败：{cutout_reason}")
+
+    api_key = stringify(resolve_minimax_api_key()).strip().removeprefix("Bearer ").strip()
+    if api_key:
+        evaluation = evaluate_generated_illustration(api_key, image_file, cutout_bytes, task_id)
+        print(
+            f"[POD_CUTOUT_QC] task_id={task_id} pass={evaluation['pass']} "
+            f"score={evaluation['score']} feedback={evaluation['feedback']}",
+            flush=True,
+        )
+        if not evaluation["pass"]:
+            raise RuntimeError(
+                f"本地抠图质检未通过，得分 {evaluation['score']:.0f}：{evaluation['feedback']}"
+            )
+    else:
+        print(f"[POD_CUTOUT_QC] task_id={task_id} skip_ai_qc_no_api_key=true", flush=True)
+
+    print(f"[POD_CUTOUT] task_id={task_id} save_png reason={cutout_reason}", flush=True)
+    return save_extracted_artwork_png_bytes(cutout_bytes, task_id)
+
+
+def call_minimax_illustration_generation(image_value, title="", style_prompt="", task_id="illustration"):
+    return call_minimax_illustration_generation_once_flow(
+        image_value,
+        title,
+        style_prompt,
+        task_id,
+        1,
+    )
+
+def call_minimax_illustration_generation_once_flow(image_value, title="", style_prompt="", task_id="illustration", flow_attempt=1):
+    api_key = resolve_minimax_api_key()
+    if not api_key:
+        raise RuntimeError("缺少 MINIMAX_API_KEY，无法调用 MiniMax 图生图")
+    api_key = stringify(api_key).strip().removeprefix("Bearer ").strip()
+    image_file = normalize_vision_image_url(image_value)
+    if not image_file:
+        raise RuntimeError("商品主图为空，无法生成插画")
+
+    print(
+        f"[POD_EXTRACT_FLOW] task_id={task_id} flow_attempt={flow_attempt}/{POD_EXTRACT_FLOW_MAX_ATTEMPTS} start",
+        flush=True,
+    )
+    print(f"[POD_EXTRACT_FLOW] task_id={task_id} local_cutout_disabled use_ai_only=true", flush=True)
+
+    print(f"[MINIMAX_IMAGE_QC] task_id={task_id} generating artwork description...", flush=True)
+    try:
+        artwork_description = generate_artwork_description(api_key, image_file)
+        print(f"image_description task_id={task_id}: {artwork_description}", flush=True)
+    except Exception as e:
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} failed to get description after retries, "
+            f"will use direct image-to-image fallback: {e}",
+            flush=True,
+        )
+        artwork_description = ""
+
+    best_bytes = b""
+    best_score = -1.0
+    best_feedback = ""
+    retry_feedback = ""
+    generation_errors = []
+    for attempt in range(1, MINIMAX_ILLUSTRATION_MAX_ATTEMPTS + 1):
+        prompt = build_illustration_generation_prompt(artwork_description, retry_feedback, title)
+        try:
+            image_bytes = call_minimax_illustration_generation_once(api_key, image_file, prompt, task_id, attempt)
+        except Exception as exc:
+            error_text = stringify(exc)
+            generation_errors.append(f"attempt {attempt}: {error_text}")
+            retry_feedback = (
+                "The previous image generation request returned no image data or a provider system error. "
+                "Retry with the same reference image and generate only the flat 2D printable pattern."
+            )
+            print(
+                f"[MINIMAX_IMAGE] task_id={task_id} attempt={attempt} failed_no_image retrying error={error_text}",
+                flush=True,
+            )
+            time.sleep(attempt)
+            continue
+        evaluation = evaluate_generated_illustration(api_key, image_file, image_bytes, task_id)
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} attempt={attempt} "
+            f"pass={evaluation['pass']} score={evaluation['score']} feedback={evaluation['feedback']}",
+            flush=True,
+        )
+        if evaluation["score"] > best_score:
+            best_score = evaluation["score"]
+            best_bytes = image_bytes
+            best_feedback = evaluation["feedback"]
+        if evaluation["pass"]:
+            return save_generated_illustration_bytes(image_bytes, task_id)
+        retry_feedback = evaluation["feedback"]
+    if best_bytes:
+        print(
+            f"[MINIMAX_IMAGE_QC] task_id={task_id} all attempts failed, best_score={best_score} "
+            f"feedback={best_feedback}",
+            flush=True,
+        )
+        raise RuntimeError(f"插画生成质检未通过，最佳得分 {best_score:.0f}：{best_feedback}")
+    raise RuntimeError(
+        f"MiniMax 图生图未生成可保存的图片；已重试 {MINIMAX_ILLUSTRATION_MAX_ATTEMPTS} 次；"
+        + " | ".join(generation_errors)
+    )
+
+
+def call_minimax_illustration_generation(image_value, title="", style_prompt="", task_id="illustration"):
+    flow_errors = []
+    for flow_attempt in range(1, POD_EXTRACT_FLOW_MAX_ATTEMPTS + 1):
+        try:
+            return call_minimax_illustration_generation_once_flow(
+                image_value,
+                title,
+                style_prompt,
+                task_id,
+                flow_attempt,
+            )
+        except Exception as exc:
+            error_text = stringify(exc)
+            flow_errors.append(f"flow {flow_attempt}: {error_text}")
+            print(
+                f"[POD_EXTRACT_FLOW] task_id={task_id} flow_attempt={flow_attempt}/"
+                f"{POD_EXTRACT_FLOW_MAX_ATTEMPTS} failed error={error_text}",
+                flush=True,
+            )
+            if flow_attempt >= POD_EXTRACT_FLOW_MAX_ATTEMPTS:
+                break
+            time.sleep(flow_attempt)
+    raise RuntimeError(
+        f"POD提取完整流程失败；已重跑 {POD_EXTRACT_FLOW_MAX_ATTEMPTS} 轮；"
+        + " | ".join(flow_errors)
+    )
 
 
 TITLE_TRANSLATION_PHRASES = [
@@ -2126,6 +3746,31 @@ def ensure_pod_cross_category_tables():
               KEY idx_pod_task_product (product_id, date_record),
               KEY idx_pod_task_status (status, updated_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='POD插画提取任务表'
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pod_illustration_asset (
+              id BIGINT NOT NULL AUTO_INCREMENT,
+              source VARCHAR(50) NOT NULL DEFAULT 'pod_cross_category',
+              product_id BIGINT NOT NULL,
+              date_record VARCHAR(10) NOT NULL DEFAULT '',
+              product_title VARCHAR(500) DEFAULT NULL,
+              product_image_url VARCHAR(512) DEFAULT NULL,
+              illustration_image_url VARCHAR(512) DEFAULT NULL,
+              phone_case_image_url VARCHAR(512) DEFAULT NULL,
+              extract_status TINYINT NOT NULL DEFAULT 0,
+              phone_case_status TINYINT NOT NULL DEFAULT 0,
+              extract_task_id VARCHAR(64) DEFAULT NULL,
+              phone_case_task_id VARCHAR(64) DEFAULT NULL,
+              error_msg TEXT DEFAULT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              UNIQUE KEY uk_pod_asset_product_date (source, product_id, date_record),
+              KEY idx_pod_asset_updated (updated_at),
+              KEY idx_pod_asset_phone_status (phone_case_status, updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='POD illustration asset library'
             """
         )
         cursor.execute("SHOW INDEX FROM pod_cross_category_product")
@@ -5863,9 +7508,9 @@ def normalize_product_row(source, row, sales_period):
     tags = parse_json(row.get("ip_tags")) or {}
     field_period = sales_period["period"] if sales_period["period"] != "custom" else "7d"
     overview = parse_json(row.get(f"overview_{field_period}")) or {}
-    distribution = parse_json(row.get(f"distribution_{field_period}")) or []
-    distribution_7d = parse_json(row.get("distribution_7d")) or []
-    distribution_28d = parse_json(row.get("distribution_30d")) or []
+    distribution = parse_distribution_value(row.get(f"distribution_{field_period}"))
+    distribution_7d = parse_distribution_value(row.get("distribution_7d"))
+    distribution_28d = parse_distribution_value(row.get("distribution_30d"))
     sold_count = row.get("runtime_sold_count") if row.get("runtime_sold_count") is not None else overview.get("销量") or row.get("sold_count_view")
     total_sold = row.get("total_sold_count_view") or row.get("sold_count_view")
     sale_amount = overview.get("销售额") or row.get("sale_amount_view")
@@ -6441,6 +8086,39 @@ def format_runtime_sales_result(result):
     return {"current_sum": current_sum, "growth": f"{growth * 100:.2f}%"}
 
 
+def parse_distribution_value(value):
+    parsed = parse_json(value)
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        items = []
+        for key, item in parsed.items():
+            if isinstance(item, dict):
+                merged = {"name": key}
+                merged.update(item)
+                items.append(merged)
+            else:
+                items.append({"name": key, "percentage": item})
+        return items
+
+    text = stringify(value).strip()
+    if not text:
+        return []
+    items = []
+    for part in text.split("||"):
+        pieces = [piece.strip() for piece in part.split("&&") if piece.strip()]
+        if not pieces:
+            continue
+        items.append(
+            {
+                "name": pieces[0],
+                "percentage": pieces[1] if len(pieces) > 1 else "",
+                "sales": pieces[2] if len(pieces) > 2 else (pieces[1] if len(pieces) > 1 else 0),
+            }
+        )
+    return items
+
+
 def ratio_from_distribution(distribution, name):
     if not isinstance(distribution, list):
         return ""
@@ -6687,12 +8365,14 @@ def sales_from_distribution(distribution, name, total_fallback=None):
 
 
 def percent_to_number(value):
-    text = stringify(value).replace("%", "").replace(",", "").strip()
+    raw_text = stringify(value)
+    has_percent = "%" in raw_text
+    text = raw_text.replace("%", "").replace(",", "").strip()
     try:
         number = float(text)
     except ValueError:
         return 0
-    return number * 100 if 0 < number <= 1 else number
+    return number if has_percent else (number * 100 if 0 < number <= 1 else number)
 
 
 def normalize_distribution_chart(distribution, total_fallback=None, direct_ratios=None):
@@ -7092,27 +8772,35 @@ def run_illustration_daemon_once():
 
 def fetch_illustration_daemon_product_keys(source, limit):
     meta = SOURCES[source]
-    image_field = meta.get("image")
     where = [
         "illustration_extractable IS NULL",
-        f"`{image_field}` IS NOT NULL",
-        f"`{image_field}` <> ''",
     ]
     params = []
     if ILLUSTRATION_DAEMON_LATEST_ONLY:
-        where.append(f"`{meta['date']}` = (SELECT MAX(t2.`{meta['date']}`) FROM `{meta['table']}` t2)")
+        latest_date = fetch_source_latest_date(meta)
+        if not latest_date:
+            return []
+        where.append(f"`{meta['date']}` = %s")
+        params.append(latest_date)
     with db() as conn, conn.cursor() as cursor:
         cursor.execute(
             f"""
             SELECT `{meta['id']}` AS product_id, `{meta['date']}` AS date_record
-            FROM `{meta['table']}`
+            FROM `{meta['table']}` FORCE INDEX (idx_pod_illustration_queue)
             WHERE {" AND ".join(where)}
-            ORDER BY `{meta['date']}` DESC, id ASC
+            ORDER BY id ASC
             LIMIT %s
             """,
             [*params, limit],
         )
         return list(cursor.fetchall())
+
+
+def fetch_source_latest_date(meta):
+    with db() as conn, conn.cursor() as cursor:
+        cursor.execute(f"SELECT MAX(`{meta['date']}`) AS latest_date FROM `{meta['table']}`")
+        row = cursor.fetchone() or {}
+        return row.get("latest_date")
 
 
 def process_single_illustration_check(source, key):
@@ -7134,6 +8822,17 @@ def process_single_illustration_check(source, key):
             )
             product = cursor.fetchone()
             if not product or not product.get("image_value"):
+                cursor.execute(
+                    f"""
+                    UPDATE `{meta['table']}`
+                    SET illustration_extractable = 0,
+                        illustration_extract_reason = %s
+                    WHERE `{meta['id']}` = %s AND `{meta['date']}` = %s
+                      AND illustration_extractable IS NULL
+                    """,
+                    ("商品主图为空，无法判断插画可提取性", product_id, date_record),
+                )
+                conn.commit()
                 return False
             result = analyze_illustration_extractability(product.get("image_value"), product.get("title") or "")
             extractable = 1 if result.get("can_extract_illustration") else 0
